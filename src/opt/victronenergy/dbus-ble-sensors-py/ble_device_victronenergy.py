@@ -1,5 +1,6 @@
 from ve_types import *
 from ble_device import BleDevice
+from dbus_role_service import DbusRoleService
 
 class BleDeviceVictronEnergy(BleDevice):
     """
@@ -16,7 +17,8 @@ class BleDeviceVictronEnergy(BleDevice):
         self.info.update({
             'manufacturer_id': BleDeviceVictronEnergy.MANUFACTURER_ID,
             'product_id': 0xC050,
-            'product_name': 'SolarSense',
+            'product_name': 'SolarSense sensor',
+            'device_name': 'SolarSense',
             'dev_prefix': 'solarsense',
             'roles': {'meteo': {}},
             'regs': [
@@ -142,6 +144,6 @@ class BleDeviceVictronEnergy(BleDevice):
             return 720 + 30 * (value - 96)
         return value
 
-    def _get_low_battery_state(self, role_service) -> int:
+    def _get_low_battery_state(self, role_service: DbusRoleService) -> int:
         level = 3.6 if role_service['/Alarms/LowBattery'] is True else 3.2
         return int(role_service['BatteryVoltage'] < level)
