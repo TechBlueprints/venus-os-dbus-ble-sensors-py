@@ -1,9 +1,8 @@
-from ve_types import *
-from ble_device import BleDevice
+from seelevel_common import BleDeviceSeeLevel
 import logging
 
 
-class BleDeviceSeeLevelBTP3(BleDevice):
+class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
     """
     SeeLevel 709-BTP3 (Cypress) tank/temperature/battery monitor.
 
@@ -33,10 +32,10 @@ class BleDeviceSeeLevelBTP3(BleDevice):
     """
 
     MANUFACTURER_ID = 0x0131  # 305
-    CUSTOM_PARSING = True
+    PRODUCT_NAME = 'SeeLevel 709-BTP3'
+    ROLES = {'tank': {}, 'temperature': {}}
 
     # (name, role_type, default_fluid_type)
-    # role_type None = unsupported in this framework
     SENSORS = {
         0:  ("Fresh Water", "tank", 1),
         1:  ("Toilet Water", "tank", 5),
@@ -53,16 +52,6 @@ class BleDeviceSeeLevelBTP3(BleDevice):
         12: ("Chemical 2", "tank", 0),
         13: ("Battery", None, None),
     }
-
-    def configure(self, manufacturer_data: bytes):
-        self.info.update({
-            'product_id': 0xA142,
-            'product_name': 'SeeLevel 709-BTP3',
-            'device_name': 'SeeLevel',
-            'dev_prefix': 'seelevel',
-            'roles': {'tank': {}, 'temperature': {}},
-            'regs': [],
-        })
 
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
         if len(manufacturer_data) < 7:
@@ -104,8 +93,7 @@ class BleDeviceSeeLevelBTP3(BleDevice):
         if data_str == "OPN":
             return
         if data_str == "ERR":
-            role_service['Status'] = 5
-            role_service.connect()
+            self._set_error_status(role_service)
             return
 
         try:
@@ -122,15 +110,7 @@ class BleDeviceSeeLevelBTP3(BleDevice):
 
         if role_type == 'tank':
             level = max(0, min(100, sensor_value))
-            capacity = float(role_service['Capacity'] or 0)
-            remaining = round(capacity * level / 100.0, 3) if capacity else 0.0
-
-            sensor_data = {
-                'RawValue': float(level),
-                'Level': level,
-                'Remaining': remaining,
-                'Status': 0,
-            }
+            sensor_data = self._build_tank_sensor_data(level, role_service)
 
             if alarm_state is not None:
                 sensor_data['/Alarms/Low/State'] = int(alarm_state > 0)
