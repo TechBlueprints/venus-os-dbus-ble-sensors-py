@@ -1,9 +1,8 @@
-from ve_types import *
-from ble_device import BleDevice
+from seelevel_common import BleDeviceSeeLevel
 import logging
 
 
-class BleDeviceSeeLevelBTP7(BleDevice):
+class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
     """
     SeeLevel 709-BTP7 tank monitor.
 
@@ -21,7 +20,8 @@ class BleDeviceSeeLevelBTP7(BleDevice):
     """
 
     MANUFACTURER_ID = 0x0CC0  # 3264
-    CUSTOM_PARSING = True
+    PRODUCT_NAME = 'SeeLevel 709-BTP7'
+    ROLES = {'tank': {}}
 
     TANK_SLOTS = [
         ("Fresh Water", 1),      # slot 0: FluidType = Fresh water
@@ -33,28 +33,6 @@ class BleDeviceSeeLevelBTP7(BleDevice):
         ("Wash Water 3", 2),     # slot 6
         ("LPG", 8),             # slot 7: FluidType = LPG
     ]
-
-    STATUS_CODES = {
-        101: "Short Circuit",
-        102: "Open",
-        103: "Bitcount error",
-        104: "Non-stacked config with stacked data",
-        105: "Stacked, missing bottom sender",
-        106: "Stacked, missing top sender",
-        108: "Bad Checksum",
-        110: "Tank disabled",
-        111: "Tank init",
-    }
-
-    def configure(self, manufacturer_data: bytes):
-        self.info.update({
-            'product_id': 0xA142,
-            'product_name': 'SeeLevel 709-BTP7',
-            'device_name': 'SeeLevel',
-            'dev_prefix': 'seelevel',
-            'roles': {'tank': {}},
-            'regs': [],
-        })
 
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
         return len(manufacturer_data) >= 12
@@ -82,21 +60,9 @@ class BleDeviceSeeLevelBTP7(BleDevice):
             level = manufacturer_data[slot + 3]
 
             if level > 100:
-                status_msg = self.STATUS_CODES.get(level, f"Unknown ({level})")
-                logging.debug(f"{self._plog} slot {slot}: error {status_msg}")
-                role_service['Status'] = 5
-                role_service.connect()
+                self._set_error_status(role_service, level)
                 continue
 
-            capacity = float(role_service['Capacity'] or 0)
-            remaining = round(capacity * level / 100.0, 3) if capacity else 0.0
-
-            sensor_data = {
-                'RawValue': float(level),
-                'Level': level,
-                'Remaining': remaining,
-                'Status': 0,
-            }
-
+            sensor_data = self._build_tank_sensor_data(level, role_service)
             self._update_dbus_data(role_service, sensor_data)
             role_service.connect()
