@@ -25,7 +25,7 @@ class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
         3: LPG (tank)            10: Temp 4 (temperature)
         4: LPG 2 (tank)          11: Chemical (tank)
         5: Galley Water (tank)   12: Chemical 2 (tank)
-        6: Galley Water 2 (tank) 13: Battery (unsupported, no role)
+        6: Galley Water 2 (tank) 13: Battery (battery)
 
     Cf.
     - https://github.com/TechBlueprints/victron-seelevel-python
@@ -33,7 +33,7 @@ class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
 
     MANUFACTURER_ID = 0x0131  # 305
     PRODUCT_NAME = 'SeeLevel 709-BTP3'
-    ROLES = {'tank': {}, 'temperature': {}}
+    ROLES = {'tank': {}, 'temperature': {}, 'battery': {}}
 
     # (name, role_type, default_fluid_type)
     SENSORS = {
@@ -50,7 +50,7 @@ class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
         10: ("Temp 4", "temperature", None),
         11: ("Chemical", "tank", 0),
         12: ("Chemical 2", "tank", 0),
-        13: ("Battery", None, None),
+        13: ("Voltage", "battery", None),
     }
 
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
@@ -124,6 +124,14 @@ class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
             temp_c = round((sensor_value - 32.0) * 5.0 / 9.0, 1)
             sensor_data = {
                 'Temperature': temp_c,
+                'Status': 0,
+            }
+            self._update_dbus_data(role_service, sensor_data)
+
+        elif role_type == 'battery':
+            voltage = sensor_value / 10.0
+            sensor_data = {
+                '/Dc/0/Voltage': voltage,
                 'Status': 0,
             }
             self._update_dbus_data(role_service, sensor_data)
