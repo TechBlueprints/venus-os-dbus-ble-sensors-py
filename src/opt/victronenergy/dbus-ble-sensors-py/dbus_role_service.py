@@ -220,8 +220,8 @@ class DbusRoleService(object):
             f"/Settings/Devices/{self._dbus_id}{name}",
             name,
             props['def'],
-            props['min'],
-            props['max'],
+            props.get('min', 0),
+            props.get('max', 0),
             callback=callback
         )
 
