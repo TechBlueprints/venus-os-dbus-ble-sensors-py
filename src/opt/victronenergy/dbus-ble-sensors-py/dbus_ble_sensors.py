@@ -190,12 +190,18 @@ class DbusBleSensors(object):
         calls (DeviceFound) from bluetoothd to the client.  Bleak handles these
         via dbus-fast, but the callbacks are never delivered when the process
         uses a gbulb GLib event loop.  Running the scanner in its own thread
-        with asyncio.run() gives dbus-fast a clean event loop."""
+        with asyncio.run() gives dbus-fast a clean event loop.
+
+        IMPORTANT: The main process sets GLibEventLoopPolicy as the global
+        asyncio policy. asyncio.run() in a thread would inherit that policy,
+        creating another gbulb loop.  We override to DefaultEventLoopPolicy
+        in the worker thread so dbus-fast gets a real selector-based loop."""
         results = []
         scan_error = None
 
         def _worker():
             nonlocal scan_error
+            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
             async def _do_scan():
                 async with bleak.BleakScanner(
                     detection_callback=lambda d, a: results.append((d, a)),
