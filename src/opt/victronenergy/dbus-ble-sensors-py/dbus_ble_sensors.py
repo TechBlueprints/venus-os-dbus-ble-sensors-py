@@ -33,18 +33,27 @@ SCANNER_ACTIVE_CYCLE_DURATION = 15
 # OrPattern tuples for passive scanning via BlueZ AdvertisementMonitor1.
 # Passive scanning avoids calling StartDiscovery, which eliminates scan
 # contention (InProgress errors) when multiple BLE services share the
-# adapter.  Each tuple is (offset, AD_type, value) matching common LE
-# Flags byte values so virtually all advertising devices are captured.
+# adapter.  Each tuple is (offset, AD_type, value) where AD_type is the
+# BLE AD type code and value is a prefix to match.
 # Requires BlueZ >= 5.56 with --experimental and kernel >= 5.10.
+#
+# Only Flags-based patterns are used here.  Manufacturer-data patterns
+# (AD type 0xFF) crash BlueZ 5.72 / kernel 6.12 with heap corruption
+# (free(): invalid next size).  To catch devices that omit Flags entirely
+# (e.g. Mopeka sensors), a periodic active scan with DuplicateData=True
+# is run alongside the passive scanner — see _run_nondiscoverable_scan().
 PASSIVE_SCAN_OR_PATTERNS = [
     (0, AdvertisementDataType.FLAGS, bytes([0x02])),
-    (0, AdvertisementDataType.FLAGS, bytes([0x06])),
-    (0, AdvertisementDataType.FLAGS, bytes([0x1a])),
     (0, AdvertisementDataType.FLAGS, bytes([0x04])),
     (0, AdvertisementDataType.FLAGS, bytes([0x05])),
+    (0, AdvertisementDataType.FLAGS, bytes([0x06])),
     (0, AdvertisementDataType.FLAGS, bytes([0x0e])),
+    (0, AdvertisementDataType.FLAGS, bytes([0x1a])),
     (0, AdvertisementDataType.FLAGS, bytes([0x1e])),
 ]
+
+NONDISCOVERABLE_SCAN_INTERVAL = 30
+NONDISCOVERABLE_SCAN_DURATION = 15
 
 class DbusBleSensors(object):
     """
@@ -155,6 +164,7 @@ class DbusBleSensors(object):
                     self._known_mac[dev_mac] = dev_instance
                 except Exception as e:
                     logging.exception(f"{plog} ignoring data {man_data!r}, an error occurred during device initialization:")
+                    self._ignored_mac[dev_mac] = True
                     continue
             else:
                 dev_instance = self._known_mac[dev_mac]
@@ -185,7 +195,10 @@ class DbusBleSensors(object):
             loop = policy.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(self._run_scanners())
+                loop.run_until_complete(asyncio.gather(
+                    self._run_scanners(),
+                    self._run_nondiscoverable_scans(),
+                ))
             except Exception:
                 logging.exception("Scanner thread error")
 
@@ -356,6 +369,56 @@ class DbusBleSensors(object):
                     logging.info(f"{adapter}: scanner stopped")
                 except Exception:
                     pass
+
+    async def _run_nondiscoverable_scans(self):
+        """Periodic active scans with DuplicateData=True to detect devices
+        that omit the Flags AD type (e.g. Mopeka sensors advertise only
+        manufacturer data under Nordic's company ID 0x0059 with no Flags).
+
+        These scans run alongside the persistent passive scanners.  If the
+        adapter is busy (InProgress), the scan is silently skipped."""
+        while not self._scanner_stop.is_set():
+            await asyncio.sleep(NONDISCOVERABLE_SCAN_INTERVAL)
+            for adapter in list(self._adapters):
+                try:
+                    nd_results = []
+
+                    def _nd_callback(device, adv_data, _buf=nd_results):
+                        _buf.append((device, adv_data))
+
+                    scanner = bleak.BleakScanner(
+                        detection_callback=_nd_callback,
+                        bluez=dict(
+                            adapter=adapter,
+                            filters={"DuplicateData": True},
+                        ),
+                    )
+                    await scanner.start()
+                    for _ in range(NONDISCOVERABLE_SCAN_DURATION):
+                        if self._scanner_stop.is_set():
+                            break
+                        await asyncio.sleep(1)
+                    await scanner.stop()
+
+                    with self._scan_buffer_lock:
+                        self._scan_buffer.extend(nd_results)
+                    logging.info(
+                        f"{adapter}: nondiscoverable scan finished "
+                        f"({len(nd_results)} advertisements)"
+                    )
+                except bleak.exc.BleakDBusError as e:
+                    if "InProgress" in str(e):
+                        logging.debug(
+                            f"{adapter}: nondiscoverable scan skipped (InProgress)"
+                        )
+                    else:
+                        logging.warning(
+                            f"{adapter}: nondiscoverable scan error: {e}"
+                        )
+                except Exception as e:
+                    logging.warning(
+                        f"{adapter}: nondiscoverable scan error: {e}"
+                    )
 
     async def scan_loop(self):
         DRAIN_INTERVAL = 5

@@ -287,7 +287,11 @@ class BleDeviceMopeka(BleDevice):
 
     def _get_low_battery_state(self, role_service: DbusRoleService) -> int:
         # Percentage based on 3 volt CR2032 battery
-        if (battery_voltage := role_service.get('BatteryVoltage', None)) is None:
+        try:
+            battery_voltage = role_service['BatteryVoltage']
+        except (KeyError, TypeError):
+            return 0
+        if battery_voltage is None:
             return 0
         battery_percentage = max(0, min(100, ((battery_voltage - 2.2) / 0.65) * 100))
         return int(battery_percentage < 15)
