@@ -17,6 +17,7 @@ from bleak.assigned_numbers import AdvertisementDataType
 import gbulb
 from logger import setup_logging
 from collections.abc import MutableMapping
+import threading
 import time
 from conf import SCAN_TIMEOUT, SCAN_SLEEP, IGNORED_DEVICES_TIMEOUT, DEVICE_SERVICES_TIMEOUT, PROCESS_VERSION
 from man_id import MAN_NAMES
@@ -167,13 +168,10 @@ class DbusBleSensors(object):
 
         logging.debug(f"{adapter}: Scanning ...")
         try:
-            async with bleak.BleakScanner(
-                detection_callback=_scan_callback,
-                scanning_mode='passive',
-                bluez=dict(or_patterns=PASSIVE_SCAN_OR_PATTERNS, adapter=adapter),
-            ) as scanner:
-                await asyncio.sleep(SCAN_TIMEOUT)
-            logging.debug(f"{adapter}: Scan finished (passive)")
+            results = await self._run_passive_scan(adapter)
+            for device, ad_data in results:
+                _scan_callback(device, ad_data)
+            logging.debug(f"{adapter}: Scan finished (passive, {len(results)} advertisements)")
         except Exception as e_passive:
             logging.warning(f"{adapter}: Passive scan failed ({e_passive}), falling back to active scan")
             try:
@@ -185,6 +183,35 @@ class DbusBleSensors(object):
                 logging.debug(f"{adapter}: Scan finished (active fallback)")
             except Exception:
                 logging.exception(f"{adapter}: Scan error")
+
+    async def _run_passive_scan(self, adapter: str):
+        """Run passive BleakScanner in a dedicated thread with a standard asyncio
+        event loop.  BlueZ AdvertisementMonitor1 requires incoming D-Bus method
+        calls (DeviceFound) from bluetoothd to the client.  Bleak handles these
+        via dbus-fast, but the callbacks are never delivered when the process
+        uses a gbulb GLib event loop.  Running the scanner in its own thread
+        with asyncio.run() gives dbus-fast a clean event loop."""
+        results = []
+        scan_error = None
+
+        def _worker():
+            nonlocal scan_error
+            async def _do_scan():
+                async with bleak.BleakScanner(
+                    detection_callback=lambda d, a: results.append((d, a)),
+                    scanning_mode='passive',
+                    bluez=dict(or_patterns=PASSIVE_SCAN_OR_PATTERNS, adapter=adapter),
+                ) as scanner:
+                    await asyncio.sleep(SCAN_TIMEOUT)
+            try:
+                asyncio.run(_do_scan())
+            except Exception as exc:
+                scan_error = exc
+
+        await asyncio.get_event_loop().run_in_executor(None, _worker)
+        if scan_error is not None:
+            raise scan_error
+        return results
 
     async def scan_loop(self):
         while True:
