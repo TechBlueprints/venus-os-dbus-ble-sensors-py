@@ -23,6 +23,13 @@ from man_id import MAN_NAMES
 SNIF_LOGGER = logging.getLogger("sniffer")
 SNIF_LOGGER.propagate = False
 
+# Some BLE devices (e.g. Mopeka sensors) advertise without the standard
+# Flags AD type (0x01).  BlueZ's default active scan with DuplicateData=False
+# treats these as "non-discoverable" and silently drops them.  A supplementary
+# scan with DuplicateData=True catches all advertisements regardless of
+# discoverability flags.
+NONDISCOVERABLE_SCAN_TIMEOUT = 15
+
 class DbusBleSensors(object):
     """
     Main class for the D-bus BLE Sensors python service.
@@ -137,6 +144,7 @@ class DbusBleSensors(object):
                         self._known_mac[dev_mac] = dev_instance
                     except Exception as e:
                         logging.exception(f"{plog} ignoring data {man_data!r}, an error occurred during device initialization:")
+                        self._ignored_mac[dev_mac] = True
                         continue
                 else:
                     dev_instance = self._known_mac[dev_mac]
@@ -155,6 +163,22 @@ class DbusBleSensors(object):
             logging.debug(f"{adapter}: Scan finished")
         except Exception:
             logging.exception(f"{adapter}: Scan error")
+
+        try:
+            async with bleak.BleakScanner(
+                adapter=adapter,
+                detection_callback=_scan_callback,
+                bluez=dict(filters={"DuplicateData": True}),
+            ) as scanner:
+                await asyncio.sleep(NONDISCOVERABLE_SCAN_TIMEOUT)
+            logging.debug(f"{adapter}: Nondiscoverable scan finished")
+        except bleak.exc.BleakDBusError as e:
+            if "InProgress" in str(e):
+                logging.debug(f"{adapter}: nondiscoverable scan skipped (InProgress)")
+            else:
+                logging.warning(f"{adapter}: nondiscoverable scan error: {e}")
+        except Exception:
+            logging.warning(f"{adapter}: nondiscoverable scan error", exc_info=True)
 
     async def scan_loop(self):
         while True:
