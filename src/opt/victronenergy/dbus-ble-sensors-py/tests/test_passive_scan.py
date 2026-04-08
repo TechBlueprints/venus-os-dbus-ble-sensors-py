@@ -1,4 +1,4 @@
-"""Tests for passive BLE scanning with AdvertisementMonitor1 fallback."""
+"""Tests for passive BLE scanning with threaded AdvertisementMonitor1."""
 import sys
 import os
 import types
@@ -73,8 +73,8 @@ class TestPassiveScanOrPatterns(unittest.TestCase):
         self.assertIn(0x02, flag_bytes, "LE General Discoverable")
         self.assertIn(0x1a, flag_bytes, "LE General + BR/EDR Not Supported + Dual-Mode")
 
-class TestScanMethodPassiveMode(unittest.TestCase):
-    """Verify _scan() uses passive mode with fallback to active."""
+class TestRunPassiveScan(unittest.TestCase):
+    """Verify _run_passive_scan runs BleakScanner in a thread."""
 
     def _run(self, coro):
         loop = asyncio.new_event_loop()
@@ -90,82 +90,115 @@ class TestScanMethodPassiveMode(unittest.TestCase):
         obj._known_mac = {}
         return obj
 
-    @patch('dbus_ble_sensors.asyncio.sleep', new_callable=AsyncMock)
     @patch('dbus_ble_sensors.bleak.BleakScanner')
-    def test_scan_uses_passive_mode(self, mock_scanner_cls, mock_sleep):
-        """BleakScanner should be created with scanning_mode='passive'."""
+    def test_passive_scan_uses_correct_params(self, mock_scanner_cls):
+        """BleakScanner in the worker thread should get passive mode + or_patterns."""
         scanner_instance = AsyncMock()
         mock_scanner_cls.return_value = scanner_instance
         scanner_instance.__aenter__ = AsyncMock(return_value=scanner_instance)
         scanner_instance.__aexit__ = AsyncMock(return_value=False)
 
-        self._run(self._make_obj()._scan('hci0'))
+        results = self._run(self._make_obj()._run_passive_scan('hci0'))
 
         mock_scanner_cls.assert_called_once()
         kwargs = mock_scanner_cls.call_args.kwargs
         self.assertEqual(kwargs.get('scanning_mode'), 'passive')
         self.assertEqual(kwargs['bluez']['adapter'], 'hci0')
         self.assertEqual(kwargs['bluez']['or_patterns'], PASSIVE_SCAN_OR_PATTERNS)
+        self.assertIsInstance(results, list)
+
+    @patch('dbus_ble_sensors.bleak.BleakScanner')
+    def test_passive_scan_collects_results(self, mock_scanner_cls):
+        """Results from detection_callback should be returned."""
+        scanner_instance = AsyncMock()
+        mock_scanner_cls.return_value = scanner_instance
+        scanner_instance.__aenter__ = AsyncMock(return_value=scanner_instance)
+        scanner_instance.__aexit__ = AsyncMock(return_value=False)
+
+        fake_device = MagicMock()
+        fake_ad = MagicMock()
+
+        def simulate_callback(*args, **kwargs):
+            cb = mock_scanner_cls.call_args.kwargs.get('detection_callback')
+            if cb:
+                cb(fake_device, fake_ad)
+            return scanner_instance
+
+        scanner_instance.__aenter__ = AsyncMock(side_effect=simulate_callback)
+
+        results = self._run(self._make_obj()._run_passive_scan('hci0'))
+
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0][0], fake_device)
+        self.assertIs(results[0][1], fake_ad)
+
+    @patch('dbus_ble_sensors.bleak.BleakScanner')
+    def test_passive_scan_propagates_error(self, mock_scanner_cls):
+        """If BleakScanner raises, _run_passive_scan should re-raise."""
+        scanner_instance = AsyncMock()
+        mock_scanner_cls.return_value = scanner_instance
+        scanner_instance.__aenter__ = AsyncMock(
+            side_effect=Exception("passive scanning mode requires bluez or_patterns")
+        )
+        scanner_instance.__aexit__ = AsyncMock(return_value=False)
+
+        with self.assertRaises(Exception) as ctx:
+            self._run(self._make_obj()._run_passive_scan('hci0'))
+        self.assertIn("or_patterns", str(ctx.exception))
+
+class TestScanMethodFallback(unittest.TestCase):
+    """Verify _scan() falls back to active when passive fails."""
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def _make_obj(self):
+        obj = object.__new__(DbusBleSensors)
+        obj._ignored_mac = {}
+        obj._known_mac = {}
+        return obj
 
     @patch('dbus_ble_sensors.asyncio.sleep', new_callable=AsyncMock)
     @patch('dbus_ble_sensors.bleak.BleakScanner')
-    def test_scan_falls_back_to_active_on_passive_failure(self, mock_scanner_cls, mock_sleep):
-        """If passive scan raises, should fall back to active scan."""
-        passive_scanner = AsyncMock()
-        passive_scanner.__aenter__ = AsyncMock(
-            side_effect=Exception("passive scanning mode requires bluez or_patterns")
-        )
-        passive_scanner.__aexit__ = AsyncMock(return_value=False)
-
+    def test_falls_back_to_active_on_passive_failure(self, mock_scanner_cls, mock_sleep):
+        """If _run_passive_scan raises, should fall back to active BleakScanner."""
         active_scanner = AsyncMock()
         active_scanner.__aenter__ = AsyncMock(return_value=active_scanner)
         active_scanner.__aexit__ = AsyncMock(return_value=False)
+        mock_scanner_cls.return_value = active_scanner
 
-        mock_scanner_cls.side_effect = [passive_scanner, active_scanner]
+        obj = self._make_obj()
+        with patch.object(obj, '_run_passive_scan', new_callable=AsyncMock,
+                          side_effect=Exception("passive failed")):
+            self._run(obj._scan('hci0'))
 
-        self._run(self._make_obj()._scan('hci0'))
-
-        self.assertEqual(mock_scanner_cls.call_count, 2,
-                         "Should create two scanners: passive attempt then active fallback")
-
-        first_kwargs = mock_scanner_cls.call_args_list[0].kwargs
-        self.assertEqual(first_kwargs.get('scanning_mode'), 'passive')
-
-        second_kwargs = mock_scanner_cls.call_args_list[1].kwargs
-        self.assertNotIn('scanning_mode', second_kwargs,
-                         "Active fallback should not set scanning_mode")
-        self.assertEqual(second_kwargs['bluez']['adapter'], 'hci0')
-
-    @patch('dbus_ble_sensors.asyncio.sleep', new_callable=AsyncMock)
-    @patch('dbus_ble_sensors.bleak.BleakScanner')
-    def test_scan_passes_detection_callback(self, mock_scanner_cls, mock_sleep):
-        """BleakScanner should receive a callable detection_callback."""
-        scanner_instance = AsyncMock()
-        mock_scanner_cls.return_value = scanner_instance
-        scanner_instance.__aenter__ = AsyncMock(return_value=scanner_instance)
-        scanner_instance.__aexit__ = AsyncMock(return_value=False)
-
-        self._run(self._make_obj()._scan('hci0'))
-
-        callback = mock_scanner_cls.call_args.kwargs.get('detection_callback')
-        self.assertIsNotNone(callback)
-        self.assertTrue(callable(callback))
-
-    @patch('dbus_ble_sensors.asyncio.sleep', new_callable=AsyncMock)
-    @patch('dbus_ble_sensors.bleak.BleakScanner')
-    def test_scan_adapter_passed_in_bluez_dict(self, mock_scanner_cls, mock_sleep):
-        """Adapter name should be in bluez dict, not as a top-level kwarg."""
-        scanner_instance = AsyncMock()
-        mock_scanner_cls.return_value = scanner_instance
-        scanner_instance.__aenter__ = AsyncMock(return_value=scanner_instance)
-        scanner_instance.__aexit__ = AsyncMock(return_value=False)
-
-        self._run(self._make_obj()._scan('hci1'))
-
+        mock_scanner_cls.assert_called_once()
         kwargs = mock_scanner_cls.call_args.kwargs
-        self.assertNotIn('adapter', kwargs,
-                         "adapter should be inside bluez dict, not top-level")
-        self.assertEqual(kwargs['bluez']['adapter'], 'hci1')
+        self.assertNotIn('scanning_mode', kwargs,
+                         "Active fallback should not set scanning_mode")
+        self.assertEqual(kwargs['bluez']['adapter'], 'hci0')
+
+    @patch('dbus_ble_sensors.asyncio.sleep', new_callable=AsyncMock)
+    @patch('dbus_ble_sensors.bleak.BleakScanner')
+    def test_passive_results_processed_by_callback(self, mock_scanner_cls, mock_sleep):
+        """Passive scan results should be fed through _scan_callback."""
+        fake_device = MagicMock()
+        fake_device.address = 'AA:BB:CC:DD:EE:FF'
+        fake_device.name = 'TestDevice'
+        fake_ad = MagicMock()
+        fake_ad.manufacturer_data = None
+
+        obj = self._make_obj()
+        with patch.object(obj, '_run_passive_scan', new_callable=AsyncMock,
+                          return_value=[(fake_device, fake_ad)]):
+            self._run(obj._scan('hci0'))
+
+        self.assertIn('aabbccddeeff', obj._ignored_mac,
+                       "Device without manufacturer data should be ignored")
 
 if __name__ == '__main__':
     unittest.main()
