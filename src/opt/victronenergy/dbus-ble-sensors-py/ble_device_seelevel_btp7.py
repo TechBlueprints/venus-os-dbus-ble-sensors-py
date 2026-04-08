@@ -3,7 +3,7 @@ import logging
 
 class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
     """
-    SeeLevel 709-BTP7 tank monitor.
+    SeeLevel 709-BTP7 tank/battery monitor.
 
     Broadcasts 8 tank levels (0-100%) and battery voltage in a single
     14-byte manufacturer data advertisement.
@@ -12,7 +12,7 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
         0-2: Coach ID (24-bit, little-endian)
         3-10: Tank levels (1 byte each, 0-100 = %, >100 = error code)
               Slots: Fresh, Wash, Toilet, Fresh2, Wash2, Toilet2, Wash3, LPG
-        11:  Battery voltage * 100
+        11:  Battery voltage * 10 (e.g. 120 = 12.0V)
 
     Cf.
     - https://github.com/TechBlueprints/victron-seelevel-python
@@ -20,7 +20,7 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
 
     MANUFACTURER_ID = 0x0CC0  # 3264
     PRODUCT_NAME = 'SeeLevel 709-BTP7'
-    ROLES = {'tank': {}}
+    ROLES = {'tank': {}, 'battery': {}}
 
     TANK_SLOTS = [
         ("Fresh Water", 1),      # slot 0: FluidType = Fresh water
@@ -48,7 +48,10 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
                 if role_service['Capacity'] == 0.2:
                     role_service['Capacity'] = 0.0
 
-        logging.debug(f"{self._plog} initialized {len(self._role_services)} tank slots")
+        self._create_indexed_role_service(
+            'battery', 8, device_name="SeeLevel Voltage")
+
+        logging.debug(f"{self._plog} initialized {len(self._role_services)} service slots")
 
     def handle_manufacturer_data(self, manufacturer_data: bytes):
         for slot in range(8):
@@ -68,3 +71,13 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
             sensor_data = self._build_tank_sensor_data(level, role_service)
             self._update_dbus_data(role_service, sensor_data)
             role_service.connect()
+
+        if self._is_indexed_role_enabled('battery', 8):
+            battery_service = self._role_services.get('battery_08')
+            if battery_service and len(manufacturer_data) >= 12:
+                voltage = manufacturer_data[11] / 10.0
+                self._update_dbus_data(battery_service, {
+                    '/Dc/0/Voltage': voltage,
+                    'Status': 0,
+                })
+                battery_service.connect()
