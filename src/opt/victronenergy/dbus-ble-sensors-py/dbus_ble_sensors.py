@@ -21,6 +21,8 @@ from collections.abc import MutableMapping
 import threading
 import time
 from conf import IGNORED_DEVICES_TIMEOUT, DEVICE_SERVICES_TIMEOUT, PROCESS_VERSION
+
+ADV_LOG_QUIET_PERIOD = 1800  # seconds before re-logging a known device's advertisements
 from man_id import MAN_NAMES
 
 SNIF_LOGGER = logging.getLogger("sniffer")
@@ -81,6 +83,7 @@ class DbusBleSensors(object):
         # Known device lists
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
+        self._last_adv_seen: dict[str, float] = {}
 
         # Load definition classes
         BleRole.load_classes(os.path.abspath(__file__))
@@ -140,7 +143,10 @@ class DbusBleSensors(object):
         plog = f"{dev_mac} - {device.name}:"
         logging.debug(f"{plog} received advertisement {advertisement_data!r}")
         if advertisement_data.manufacturer_data is None or len(advertisement_data.manufacturer_data) < 1:
-            logging.info(f"{plog} ignoring, device without manufacturer data")
+            now = time.monotonic()
+            if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+                logging.info(f"{plog} ignoring, device without manufacturer data")
+            self._last_adv_seen[dev_mac] = now
             self._ignored_mac[dev_mac] = True
             return
 
@@ -150,7 +156,10 @@ class DbusBleSensors(object):
 
                 device_class = BleDevice.DEVICE_CLASSES.get(man_id, None)
                 if device_class is None:
-                    logging.info(f"{plog} ignoring data {man_data!r}, no device configuration class for manufacturer {man_id!r}")
+                    now = time.monotonic()
+                    if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+                        logging.info(f"{plog} ignoring data {man_data!r}, no device configuration class for manufacturer {man_id!r}")
+                    self._last_adv_seen[dev_mac] = now
                     self._ignored_mac[dev_mac] = True
                     continue
 
@@ -169,7 +178,12 @@ class DbusBleSensors(object):
             else:
                 dev_instance = self._known_mac[dev_mac]
 
-            logging.info(f"{plog} received manufacturer data: {man_data!r}")
+            now = time.monotonic()
+            if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+                logging.info(f"{plog} received manufacturer data: {man_data!r}")
+            else:
+                logging.debug(f"{plog} received manufacturer data: {man_data!r}")
+            self._last_adv_seen[dev_mac] = now
             if dev_instance.check_manufacturer_data(man_data):
                 dev_instance.handle_manufacturer_data(man_data)
             else:
