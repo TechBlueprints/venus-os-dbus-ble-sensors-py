@@ -35,15 +35,15 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {}}
         },
         4: {
             'device_name': 'Mopeka Pro200',
-            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}}
         },
         5: {
             'device_name': 'Mopeka H20',
-            'roles': {'tank': {}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {}}
         },
         8: {
             'device_name': 'Mopeka PPB',
@@ -58,7 +58,7 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {}}
         },
         9: {
             'device_name': 'Mopeka PPC',
@@ -73,15 +73,15 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {}}
         },
         10: {
             'device_name': 'Mopeka TDB',
-            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}}
         },
         11: {
             'device_name': 'Mopeka TDC',
-            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}}
         },
         12: {
             'device_name': 'Mopeka Univ',
@@ -96,7 +96,7 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}, 'temperature': {}, 'movement': {}}
+            'roles': {'tank': {}}
         }
     }
 
@@ -156,7 +156,7 @@ class BleDeviceMopeka(BleDevice):
                     'bits': 7,
                     'scale': 1,
                     'bias': -40,
-                    'roles': ['temperature'],
+                    'roles': ['tank'],
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {
@@ -190,7 +190,7 @@ class BleDeviceMopeka(BleDevice):
                     'type': VE_SN8,
                     'offset': 8,
                     'scale': 1024,
-                    'roles': ['movement'],
+                    'roles': [None],
                     # .format	= &veUnitG2Dec,
                 },
                 {
@@ -198,7 +198,7 @@ class BleDeviceMopeka(BleDevice):
                     'type': VE_SN8,
                     'offset': 9,
                     'scale': 1024,
-                    'roles': ['movement'],
+                    'roles': [None],
                     # .format	= &veUnitG2Dec,
                 }
             ],
@@ -226,16 +226,20 @@ class BleDeviceMopeka(BleDevice):
     def _get_scale_butane(self, butane_ratio: int, temperature: float) -> float:
         """
         Calculate the butane scale factor based on temperature and user-defined ratio.
+        Matches C: mopeka_coefs_butane[0] * r + mopeka_coefs_butane[1] * r * temp
         """
-        return self._COEFS_BUTANE[0] + self._COEFS_BUTANE[1] * temperature * (butane_ratio / 100.0)
+        r = butane_ratio / 100.0
+        return self._COEFS_BUTANE[0] * r + self._COEFS_BUTANE[1] * r * temperature
 
     def update_data(self, role_service: DbusRoleService, sensor_data: dict):
         """
-        Check for presence of extension bit on certain hardware/firmware saturates at 16383.
-        When extension bit is set, the raw_value resolution changes to 4us with 16384 us offset.
-        Thus old sensors and firmware still have 0 to 16383 us range with 1us, and new
-        versions add the range 16384 us to 81916 us with 4 us resolution.
+        Scale the ultrasonic RawValue into centimetres using temperature-dependent
+        polynomial coefficients.  Mirrors the C implementation's mopeka_xlate_level
+        which is an xlate callback on the RawValue register (tank role only).
         """
+        if role_service.ble_role.NAME != 'tank':
+            return
+
         if (temperature := sensor_data.get('Temperature', None)) is None:
             logging.warning(f"{self._plog} can not update sensor data, missing temperature value")
             return
