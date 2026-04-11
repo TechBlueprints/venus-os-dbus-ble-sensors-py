@@ -23,10 +23,10 @@ class BleRoleTank(BleRole):
     FLUID_TYPES = {
         0: 'Fuel',
         1: 'Fresh water',
-        2: 'Waste water',
+        2: 'Wash water',
         3: 'Live well',
         4: 'Oil',
-        5: 'Black water (sewage)',
+        5: 'Toilet water',
         6: 'Gasoline',
         7: 'Diesel',
         8: 'LPG',

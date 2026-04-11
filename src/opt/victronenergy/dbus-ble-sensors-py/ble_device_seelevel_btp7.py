@@ -25,8 +25,8 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
 
     TANK_SLOTS = [
         ("Fresh Water", 1),      # slot 0: FluidType = Fresh water
-        ("Wash Water", 2),       # slot 1: FluidType = Waste water
-        ("Toilet Water", 5),     # slot 2: FluidType = Black water
+        ("Wash Water", 2),       # slot 1: FluidType = Wash water
+        ("Toilet Water", 5),     # slot 2: FluidType = Toilet water
         ("Fresh Water 2", 1),    # slot 3
         ("Wash Water 2", 2),     # slot 4
         ("Toilet Water 2", 5),   # slot 5
