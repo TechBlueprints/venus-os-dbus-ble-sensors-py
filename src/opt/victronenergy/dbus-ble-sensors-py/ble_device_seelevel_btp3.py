@@ -33,6 +33,7 @@ class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
 
     MANUFACTURER_ID = 0x0131  # 305
     PRODUCT_NAME = 'SeeLevel 709-BTP3'
+    DEV_PREFIX = 'seelevel_btp3'
     ROLES = {'tank': {}, 'temperature': {}, 'battery': {}}
 
     # (name, role_type, default_fluid_type)

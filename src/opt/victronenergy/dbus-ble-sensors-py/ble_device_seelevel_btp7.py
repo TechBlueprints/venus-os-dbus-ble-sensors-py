@@ -21,6 +21,7 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
 
     MANUFACTURER_ID = 0x0CC0  # 3264
     PRODUCT_NAME = 'SeeLevel 709-BTP7'
+    DEV_PREFIX = 'seelevel_btp7'
     ROLES = {'tank': {}, 'battery': {}}
 
     TANK_SLOTS = [
