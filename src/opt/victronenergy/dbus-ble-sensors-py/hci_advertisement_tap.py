@@ -146,7 +146,8 @@ def _walk_ad_structures(data: bytes,
     return result
 
 def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
-                          mfg_filter: frozenset[int] | None = None) -> list[TappedAdvertisement]:
+                          mfg_filter: frozenset[int] | None = None,
+                          ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
     """Parse LE Advertising Report (subevent 0x02).
 
     Per-report layout (Bluetooth Core Spec Vol 4, Part E, §7.7.65.2):
@@ -180,11 +181,15 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
         offset += 1
         rssi = rssi_raw - 256 if rssi_raw > 127 else rssi_raw
 
+        mac = _format_mac(addr_bytes)
+        if ignored_macs is not None and mac in ignored_macs:
+            continue
+
         mfg = _walk_ad_structures(ad_data, mfg_filter)
         if mfg:
             results.append(TappedAdvertisement(
                 adapter_index=adapter_idx,
-                mac=_format_mac(addr_bytes),
+                mac=mac,
                 address_type=addr_type,
                 rssi=rssi,
                 manufacturer_data=mfg,
@@ -192,7 +197,8 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
     return results
 
 def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
-                            mfg_filter: frozenset[int] | None = None) -> list[TappedAdvertisement]:
+                            mfg_filter: frozenset[int] | None = None,
+                            ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
     """Parse LE Extended Advertising Report (subevent 0x0D).
 
     Per-report layout (Bluetooth Core Spec Vol 4, Part E, §7.7.65.13):
@@ -242,11 +248,15 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
         if data_status != 0:
             continue
 
+        mac = _format_mac(addr_bytes)
+        if ignored_macs is not None and mac in ignored_macs:
+            continue
+
         mfg = _walk_ad_structures(ad_data, mfg_filter)
         if mfg:
             results.append(TappedAdvertisement(
                 adapter_index=adapter_idx,
-                mac=_format_mac(addr_bytes),
+                mac=mac,
                 address_type=addr_type,
                 rssi=rssi,
                 manufacturer_data=mfg,
@@ -254,7 +264,8 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
     return results
 
 def parse_monitor_frame(raw: bytes,
-                        mfg_filter: frozenset[int] | None = None) -> list[TappedAdvertisement]:
+                        mfg_filter: frozenset[int] | None = None,
+                        ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
     """Parse one monitor channel datagram into advertisement(s).
 
     Each datagram has a 6-byte header followed by the HCI payload.
@@ -263,6 +274,9 @@ def parse_monitor_frame(raw: bytes,
 
     When *mfg_filter* is provided, only advertisements containing a
     matching manufacturer company ID are returned.
+
+    When *ignored_macs* is provided, advertisements from those MACs are
+    dropped before AD structure parsing.
     """
     if len(raw) < _FRAME_HDR_SIZE + 3:
         return []
@@ -280,14 +294,15 @@ def parse_monitor_frame(raw: bytes,
     payload = raw[_FRAME_HDR_SIZE:]
 
     if subevent == _SUB_ADV_REPORT:
-        return _parse_legacy_reports(payload, 3, adapter_idx, mfg_filter)
+        return _parse_legacy_reports(payload, 3, adapter_idx, mfg_filter, ignored_macs)
     elif subevent == _SUB_EXT_ADV_REPORT:
-        return _parse_extended_reports(payload, 3, adapter_idx, mfg_filter)
+        return _parse_extended_reports(payload, 3, adapter_idx, mfg_filter, ignored_macs)
 
     return []
 
 def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
-                 mfg_filter: frozenset[int] | None = None):
+                 mfg_filter: frozenset[int] | None = None,
+                 ignored_macs: set[str] | None = None):
     """Read monitor frames and invoke callback for each parsed advertisement.
 
     Blocks until stop_event is set.  The callback receives a single
@@ -296,6 +311,9 @@ def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
 
     When *mfg_filter* is provided, only advertisements with matching
     manufacturer company IDs are forwarded to the callback.
+
+    When *ignored_macs* is provided, advertisements from those MACs are
+    dropped before AD structure parsing.
     """
     while not stop_event.is_set():
         try:
@@ -312,7 +330,7 @@ def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
             break
         if not raw:
             break
-        for adv in parse_monitor_frame(raw, mfg_filter):
+        for adv in parse_monitor_frame(raw, mfg_filter, ignored_macs):
             try:
                 callback(adv)
             except Exception:
