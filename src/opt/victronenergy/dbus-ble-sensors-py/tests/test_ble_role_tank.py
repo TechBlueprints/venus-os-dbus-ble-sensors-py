@@ -152,6 +152,47 @@ class TestBleRoleTank(unittest.TestCase):
         self.dbus_role_service['Level'] = 16
         self.assertEqual(self.tank.get_alarm_low_state(self.dbus_role_service), 0)
 
+    def test_capacity_default_is_0_2(self):
+        """Capacity defaults to 0.2 m³ — a placeholder until the user configures it."""
+        tank = BleRoleTank(config={})
+        cap_setting = next(
+            s for s in tank.info['settings'] if s['name'] == 'Capacity')
+        self.assertEqual(cap_setting['props']['def'], 0.2)
+
+    def test_level_is_percentage_regardless_of_capacity(self):
+        """Level is always 0-100% independent of the Capacity value."""
+        self.tank._shape_map = []
+        for capacity in (0.2, 1.0, 53.0, 200.0):
+            level, remaining, status = self.tank._compute_level(
+                rawValue=50.0, empty=0.0, full=100.0, capacity=capacity)
+            self.assertEqual(level, 50, f"Level should be 50% at capacity={capacity}")
+            self.assertEqual(status, 0)
+
+    def test_remaining_scales_with_capacity(self):
+        """Remaining volume is proportional to capacity — meaningless until user sets it."""
+        self.tank._shape_map = []
+        level, remaining, _ = self.tank._compute_level(
+            rawValue=50.0, empty=0.0, full=100.0, capacity=0.2)
+        self.assertAlmostEqual(remaining, 0.1, places=6)
+
+        level, remaining, _ = self.tank._compute_level(
+            rawValue=50.0, empty=0.0, full=100.0, capacity=100.0)
+        self.assertAlmostEqual(remaining, 50.0, places=6)
+
+    def test_fluid_type_default_from_config(self):
+        """Config fluid_type sets the FluidType setting default."""
+        tank = BleRoleTank(config={'fluid_type': 5})
+        fluid_setting = next(
+            s for s in tank.info['settings'] if s['name'] == 'FluidType')
+        self.assertEqual(fluid_setting['props']['def'], 5)
+
+    def test_fluid_type_default_without_config(self):
+        """No fluid_type in config leaves FluidType default at 0."""
+        tank = BleRoleTank(config={})
+        fluid_setting = next(
+            s for s in tank.info['settings'] if s['name'] == 'FluidType')
+        self.assertEqual(fluid_setting['props']['def'], 0)
+
     def test_topdown_behavior(self):
         topdown = BleRoleTank(config={'flags': ['TANK_FLAG_TOPDOWN']})
         topdown._shape_map = [(0, 0), (1.0, 1.0)]
