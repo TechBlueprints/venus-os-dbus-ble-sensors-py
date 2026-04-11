@@ -15,50 +15,6 @@ BTP7 capture — btmon, MAC D8:3B:DA:F8:24:06 (@atillack, GitHub issue
     battery 13.0 V.  Confirmed by @atillack: "hex value is 82 which is 130
     decimal - divide by 10.0 and you get the actual voltage of 13.0 V".
 """
-import sys
-import os
-import types
-
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), '..', 'ext'))
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), '..', 'ext', 'velib_python'))
-
-# Stub modules that require system D-Bus (not available off-device).
-# Import chain: seelevel_common -> ble_device -> dbus_ble_service ->
-# dbus_settings_service -> vedbus -> dbus.
-_stub_names = (
-    'dbus', 'dbus.mainloop', 'dbus.mainloop.glib',
-    'dbus.service', 'dbus.exceptions',
-    'vedbus', 'settingsdevice',
-    'dbus_settings_service', 'dbus_ble_service', 'dbus_role_service',
-)
-for _name in _stub_names:
-    if _name not in sys.modules:
-        sys.modules[_name] = types.ModuleType(_name)
-
-import dbus as _dbus_stub
-_dbus_stub.SystemBus = lambda **kw: None
-_dbus_stub.SessionBus = lambda **kw: None
-_dbus_stub.Interface = lambda *a, **kw: None
-_dbus_stub.String = str
-_dbus_stub.Bus = type('Bus', (), {})
-
-import dbus_ble_service as _dbs_stub
-_fake_ble_svc = type('FakeBleService', (), {
-    'register_role_service': lambda self, *a: None,
-    'unregister_role_service': lambda self, *a: None,
-    '_get_value': lambda self, *a: 1,
-})()
-_dbs_stub.DbusBleService = type('DbusBleService', (), {'get': staticmethod(lambda: _fake_ble_svc)})
-
-import dbus_role_service as _drs_stub
-_drs_stub.DbusRoleService = type('DbusRoleService', (), {})
-
-import vedbus as _vedbus_stub
-_vedbus_stub.VeDbusService = type('VeDbusService', (), {})
-_vedbus_stub.VeDbusItemImport = type('VeDbusItemImport', (), {})
-_vedbus_stub.VeDbusItemExport = type('VeDbusItemExport', (), {})
-
 import unittest
 from ble_device_seelevel_btp3 import BleDeviceSeeLevelBTP3
 from ble_device_seelevel_btp7 import BleDeviceSeeLevelBTP7
