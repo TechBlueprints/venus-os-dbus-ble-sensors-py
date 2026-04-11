@@ -87,8 +87,8 @@ Product IDs:
 
 Fluid Types:
     Fresh Water  1  (FLUID_TYPE_FRESH_WATER)
-    Waste Water  2  (FLUID_TYPE_WASTE_WATER)
-    Black Water  5  (FLUID_TYPE_BLACK_WATER)
+    Wash Water   2  (FLUID_TYPE_WASTE_WATER)
+    Toilet Water 5  (FLUID_TYPE_BLACK_WATER)
     LPG          8  (FLUID_TYPE_LPG)
     Chemical     0  (custom)
 

@@ -552,7 +552,7 @@ class TestBTP3ServiceCreation(unittest.TestCase):
         self.assertEqual(self.configs['tank_00'], {'custom_name': 'Fresh Water', 'fluid_type': 1})
 
     def test_toilet_water_creates_tank_with_fluid_type_5(self):
-        """Sensor 1 (Toilet Water) -> tank service, fluid_type=5 (Black water)."""
+        """Sensor 1 (Toilet Water) -> tank service, fluid_type=5 (Toilet water)."""
         self.dev.handle_manufacturer_data(BTP3_TOILET_WATER_0PCT)
 
         self.assertIn('tank_01', self.created)
@@ -560,7 +560,7 @@ class TestBTP3ServiceCreation(unittest.TestCase):
         self.assertEqual(self.configs['tank_01'], {'custom_name': 'Toilet Water', 'fluid_type': 5})
 
     def test_wash_water_creates_tank_with_fluid_type_2(self):
-        """Sensor 2 (Wash Water) -> tank service, fluid_type=2 (Waste water)."""
+        """Sensor 2 (Wash Water) -> tank service, fluid_type=2 (Wash water)."""
         self.dev.handle_manufacturer_data(BTP3_WASH_WATER_0PCT)
 
         self.assertIn('tank_02', self.created)
