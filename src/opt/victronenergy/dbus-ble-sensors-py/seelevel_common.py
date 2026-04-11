@@ -135,7 +135,7 @@ class BleDeviceSeeLevel(BleDevice):
             'product_id': 0xA142,
             'product_name': self.PRODUCT_NAME,
             'device_name': 'SeeLevel',
-            'dev_prefix': 'seelevel',
+            'dev_prefix': self.DEV_PREFIX,
             'roles': dict(self.ROLES),
             'regs': [],
         })
