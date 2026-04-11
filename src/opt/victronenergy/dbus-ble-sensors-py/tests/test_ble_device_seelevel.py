@@ -476,7 +476,7 @@ class TestBTP3HandleManufacturerData(unittest.TestCase):
         self._patch_enabled()
         created = {}
 
-        def mock_create(role_type, index, device_name=None):
+        def mock_create(role_type, index, device_name=None, config=None):
             svc = _mock_create_service(self.dev, role_type, index,
                                        device_name=device_name,
                                        defaults={'FluidType': 0, 'Capacity': 0.2, 'Status': 0})
@@ -489,33 +489,20 @@ class TestBTP3HandleManufacturerData(unittest.TestCase):
         self.assertIn('tank_00', created)
         self.assertEqual(created['tank_00']._device_name, 'SeeLevel Fresh Water')
 
-    def test_lazy_sets_fluid_type(self):
-        """Lazy creation sets FluidType from SENSORS table."""
+    def test_lazy_passes_fluid_type_in_config(self):
+        """Lazy creation passes fluid_type via config dict."""
         self._patch_enabled()
+        configs = {}
 
-        def mock_create(role_type, index, device_name=None):
+        def mock_create(role_type, index, device_name=None, config=None):
+            configs[f'{role_type}_{index:02d}'] = config
             return _mock_create_service(self.dev, role_type, index,
                                        defaults={'FluidType': 0, 'Capacity': 0.2, 'Status': 0})
 
         self.dev._create_indexed_role_service = mock_create
         self.dev.handle_manufacturer_data(BTP3_TOILET_WATER_0PCT)
 
-        svc = self.dev._role_services['tank_01']
-        self.assertEqual(svc['FluidType'], 5)  # Black water
-
-    def test_lazy_zeroes_default_capacity(self):
-        """Lazy creation resets upstream default capacity 0.2 -> 0.0."""
-        self._patch_enabled()
-
-        def mock_create(role_type, index, device_name=None):
-            return _mock_create_service(self.dev, role_type, index,
-                                       defaults={'FluidType': 0, 'Capacity': 0.2, 'Status': 0})
-
-        self.dev._create_indexed_role_service = mock_create
-        self.dev.handle_manufacturer_data(BTP3_FRESH_WATER_0PCT)
-
-        svc = self.dev._role_services['tank_00']
-        self.assertEqual(svc['Capacity'], 0.0)
+        self.assertEqual(configs['tank_01'], {'fluid_type': 5})
 
     # -- Disabled sensor -------------------------------------------------
 

@@ -153,6 +153,20 @@ class TestBleRoleTank(unittest.TestCase):
         self.dbus_role_service['Level'] = 16
         self.assertEqual(self.tank.get_alarm_low_state(self.dbus_role_service), 0)
 
+    def test_fluid_type_default_from_config(self):
+        """Config fluid_type sets the FluidType setting default."""
+        tank = BleRoleTank(config={'fluid_type': 5})
+        fluid_setting = next(
+            s for s in tank.info['settings'] if s['name'] == 'FluidType')
+        self.assertEqual(fluid_setting['props']['def'], 5)
+
+    def test_fluid_type_default_without_config(self):
+        """No fluid_type in config leaves FluidType default at 0."""
+        tank = BleRoleTank(config={})
+        fluid_setting = next(
+            s for s in tank.info['settings'] if s['name'] == 'FluidType')
+        self.assertEqual(fluid_setting['props']['def'], 0)
+
     def test_topdown_behavior(self):
         topdown = BleRoleTank(config={'flags': ['TANK_FLAG_TOPDOWN']})
         topdown._shape_map = [(0, 0), (1.0, 1.0)]
