@@ -174,8 +174,8 @@ def _make_device(cls, mac='00a0508d9569'):
     dev._plog = 'test:'
     dev.info = {
         'dev_mac': mac,
-        'dev_id': f'seelevel_{mac}',
-        'dev_prefix': 'seelevel',
+        'dev_id': f'{cls.DEV_PREFIX}_{mac}',
+        'dev_prefix': cls.DEV_PREFIX,
         'product_id': 0xA142,
         'product_name': cls.PRODUCT_NAME,
         'device_name': 'SeeLevel',
