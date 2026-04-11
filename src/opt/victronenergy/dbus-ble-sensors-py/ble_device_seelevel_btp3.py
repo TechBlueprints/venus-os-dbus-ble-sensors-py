@@ -76,15 +76,14 @@ class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
         key = f'{role_type}_{sensor_num:02d}'
 
         if key not in self._role_services:
+            config = {}
+            if role_type == 'tank' and fluid_type is not None:
+                config['fluid_type'] = fluid_type
             role_service = self._create_indexed_role_service(
-                role_type, sensor_num, device_name=f"SeeLevel {name}")
+                role_type, sensor_num, device_name=f"SeeLevel {name}",
+                config=config)
             if role_service is None:
                 return
-            if role_type == 'tank':
-                if fluid_type is not None and role_service['FluidType'] == 0:
-                    role_service['FluidType'] = fluid_type
-                if role_service['Capacity'] == 0.2:
-                    role_service['Capacity'] = 0.0
         else:
             role_service = self._role_services[key]
 
