@@ -15,6 +15,7 @@ BTP7 capture — btmon, MAC D8:3B:DA:F8:24:06 (@atillack, GitHub issue
     battery 13.0 V.  Confirmed by @atillack: "hex value is 82 which is 130
     decimal - divide by 10.0 and you get the actual voltage of 13.0 V".
 """
+import os
 import unittest
 from ble_device_seelevel_btp3 import BleDeviceSeeLevelBTP3
 from ble_device_seelevel_btp7 import BleDeviceSeeLevelBTP7
@@ -511,6 +512,186 @@ class TestBTP3HandleManufacturerData(unittest.TestCase):
 
         self.assertNotIn('Level', svc)
         self.assertFalse(svc.connected)
+
+# ===================================================================
+# BTP3 — service creation from raw captures (end-to-end)
+# ===================================================================
+
+class TestBTP3ServiceCreation(unittest.TestCase):
+    """
+    Feed every raw BTP3 capture and verify:
+      - correct services are created with expected fluid_type config
+      - correct device names are assigned
+      - OPN sensors never create a service
+      - battery sensor creates a battery service (no fluid_type)
+    """
+
+    def setUp(self):
+        self.dev = _make_device(BleDeviceSeeLevelBTP3)
+        self.dev._is_indexed_role_enabled = lambda *a: True
+        self.created = {}
+        self.configs = {}
+
+        def mock_create(role_type, index, device_name=None, config=None):
+            key = f'{role_type}_{index:02d}'
+            self.configs[key] = config
+            svc = _mock_create_service(self.dev, role_type, index,
+                                       device_name=device_name,
+                                       defaults={'FluidType': 0, 'Capacity': 0.2, 'Status': 0})
+            self.created[key] = svc
+            return svc
+
+        self.dev._create_indexed_role_service = mock_create
+
+    def test_fresh_water_creates_tank_with_fluid_type_1(self):
+        """Sensor 0 (Fresh Water) -> tank service, fluid_type=1 (Fresh water)."""
+        self.dev.handle_manufacturer_data(BTP3_FRESH_WATER_0PCT)
+
+        self.assertIn('tank_00', self.created)
+        self.assertEqual(self.created['tank_00']._device_name, 'SeeLevel Fresh Water')
+        self.assertEqual(self.configs['tank_00'], {'fluid_type': 1})
+
+    def test_toilet_water_creates_tank_with_fluid_type_5(self):
+        """Sensor 1 (Toilet Water) -> tank service, fluid_type=5 (Black water)."""
+        self.dev.handle_manufacturer_data(BTP3_TOILET_WATER_0PCT)
+
+        self.assertIn('tank_01', self.created)
+        self.assertEqual(self.created['tank_01']._device_name, 'SeeLevel Toilet Water')
+        self.assertEqual(self.configs['tank_01'], {'fluid_type': 5})
+
+    def test_wash_water_creates_tank_with_fluid_type_2(self):
+        """Sensor 2 (Wash Water) -> tank service, fluid_type=2 (Waste water)."""
+        self.dev.handle_manufacturer_data(BTP3_WASH_WATER_0PCT)
+
+        self.assertIn('tank_02', self.created)
+        self.assertEqual(self.created['tank_02']._device_name, 'SeeLevel Wash Water')
+        self.assertEqual(self.configs['tank_02'], {'fluid_type': 2})
+
+    def test_lpg_opn_creates_nothing(self):
+        """Sensor 3 (LPG), value OPN -> no service created."""
+        self.dev.handle_manufacturer_data(BTP3_LPG_OPEN)
+
+        self.assertEqual(len(self.created), 0)
+
+    def test_battery_creates_battery_service(self):
+        """Sensor 13 (Voltage) -> battery service, no fluid_type."""
+        self.dev.handle_manufacturer_data(BTP3_BATTERY_13V7)
+
+        self.assertIn('battery_13', self.created)
+        self.assertEqual(self.created['battery_13']._device_name, 'SeeLevel Voltage')
+        self.assertEqual(self.configs['battery_13'], {})
+
+    def test_no_capacity_override_in_config(self):
+        """Tank config only carries fluid_type — capacity uses the role default
+        (0.2 m³) until the user configures it."""
+        self.dev.handle_manufacturer_data(BTP3_FRESH_WATER_0PCT)
+
+        self.assertNotIn('capacity', self.configs['tank_00'])
+        self.assertEqual(list(self.configs['tank_00'].keys()), ['fluid_type'])
+
+    def test_all_connected_sensors_from_airstream(self):
+        """Feed all 5 real Airstream captures: 3 tanks + 1 OPN + 1 battery."""
+        for payload in (BTP3_FRESH_WATER_0PCT, BTP3_TOILET_WATER_0PCT,
+                        BTP3_WASH_WATER_0PCT, BTP3_LPG_OPEN,
+                        BTP3_BATTERY_13V7):
+            self.dev.handle_manufacturer_data(payload)
+
+        self.assertEqual(len(self.created), 4)
+        self.assertIn('tank_00', self.created)
+        self.assertIn('tank_01', self.created)
+        self.assertIn('tank_02', self.created)
+        self.assertNotIn('tank_03', self.created)
+        self.assertIn('battery_13', self.created)
+
+        self.assertEqual(self.configs['tank_00'], {'fluid_type': 1})
+        self.assertEqual(self.configs['tank_01'], {'fluid_type': 5})
+        self.assertEqual(self.configs['tank_02'], {'fluid_type': 2})
+        self.assertEqual(self.configs['battery_13'], {})
+
+# ===================================================================
+# BTP7 — service creation from raw capture (end-to-end)
+# ===================================================================
+
+class TestBTP7ServiceCreation(unittest.TestCase):
+    """
+    BTP7 creates all 8 tank slots + 1 battery in init(). Verify
+    the config passed for each carries the correct fluid_type from
+    TANK_SLOTS.
+    """
+
+    def setUp(self):
+        from ble_role import BleRole
+        BleRole.load_classes(os.path.dirname(os.path.abspath(__file__)))
+
+        self.dev = _make_device(BleDeviceSeeLevelBTP7, 'd83bdaf82406')
+        self.configs = {}
+
+        def mock_create(role_type, index, device_name=None, config=None):
+            key = f'{role_type}_{index:02d}'
+            self.configs[key] = config
+            return _mock_create_service(self.dev, role_type, index,
+                                       device_name=device_name,
+                                       defaults={'FluidType': 0, 'Capacity': 0.2, 'Status': 0})
+
+        self.dev._create_indexed_role_service = mock_create
+
+    def _init_device(self):
+        self.dev.info['roles'] = dict(BleDeviceSeeLevelBTP7.ROLES)
+        self.dev.info['regs'] = []
+        self.dev._load_configuration()
+        self.dev.init()
+
+    def test_all_slots_created(self):
+        """init() creates 8 tank slots + 1 battery = 9 services."""
+        self._init_device()
+
+        self.assertEqual(len(self.dev._role_services), 9)
+        for slot in range(8):
+            self.assertIn(f'tank_{slot:02d}', self.dev._role_services)
+        self.assertIn('battery_08', self.dev._role_services)
+
+    def test_tank_fluid_types_match_spec(self):
+        """Each tank slot's config carries the correct fluid_type."""
+        self._init_device()
+
+        expected = {
+            'tank_00': 1,   # Fresh Water
+            'tank_01': 2,   # Wash Water
+            'tank_02': 5,   # Toilet Water (Black)
+            'tank_03': 1,   # Fresh Water 2
+            'tank_04': 2,   # Wash Water 2
+            'tank_05': 5,   # Toilet Water 2
+            'tank_06': 2,   # Wash Water 3
+            'tank_07': 8,   # LPG
+        }
+        for key, fluid in expected.items():
+            self.assertEqual(self.configs[key], {'fluid_type': fluid},
+                             f"{key} should have fluid_type={fluid}")
+
+    def test_battery_has_no_fluid_type(self):
+        """Battery service has no fluid_type in config."""
+        self._init_device()
+
+        self.assertIsNone(self.configs.get('battery_08'))
+
+    def test_device_names_match_spec(self):
+        """Each service gets the correct SeeLevel device name."""
+        self._init_device()
+
+        expected_names = {
+            'tank_00': 'SeeLevel Fresh Water',
+            'tank_01': 'SeeLevel Wash Water',
+            'tank_02': 'SeeLevel Toilet Water',
+            'tank_03': 'SeeLevel Fresh Water 2',
+            'tank_04': 'SeeLevel Wash Water 2',
+            'tank_05': 'SeeLevel Toilet Water 2',
+            'tank_06': 'SeeLevel Wash Water 3',
+            'tank_07': 'SeeLevel LPG',
+            'battery_08': 'SeeLevel Voltage',
+        }
+        for key, name in expected_names.items():
+            svc = self.dev._role_services[key]
+            self.assertEqual(svc._device_name, name, f"{key} should be named {name!r}")
 
 # ===================================================================
 # BTP7 — check_manufacturer_data
