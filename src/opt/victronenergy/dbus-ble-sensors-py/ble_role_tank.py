@@ -66,6 +66,8 @@ class BleRoleTank(BleRole):
         self._is_topdown: bool = 'TANK_FLAG_TOPDOWN' in flags
         self._shape_map = None
 
+        fluid_type_default = config.get('fluid_type', 0) if config else 0
+
         self.info.update(
             {
                 'name': 'tank',
@@ -85,7 +87,7 @@ class BleRoleTank(BleRole):
                         'name': 'FluidType',
                         'props': {
                             'type': VE_SN32,
-                            'def': 0,
+                            'def': fluid_type_default,
                             'min': 0,
                             'max': self.INT32_MAX - 3
                         }
@@ -240,8 +242,11 @@ class BleRoleTank(BleRole):
         return int(100 * level), level * capacity, 0
 
     def _tank_capacity_changed(self, role_service, new_capacity):
+        raw = role_service['RawValue']
+        if raw is None:
+            return
         (level, remain, status) = self._compute_level(
-            float(role_service['RawValue']),
+            float(raw),
             float(role_service['RawValueEmpty']),
             float(role_service['RawValueFull']),
             float(new_capacity)
