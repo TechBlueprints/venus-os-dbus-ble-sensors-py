@@ -44,10 +44,11 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
         for slot, (tank_name, fluid_type) in enumerate(self.TANK_SLOTS):
             role_service = self._create_indexed_role_service(
                 'tank', slot, device_name=f"SeeLevel {tank_name}",
-                config={'fluid_type': fluid_type})
+                config={'fluid_type': fluid_type, 'custom_name': tank_name})
 
         self._create_indexed_role_service(
-            'battery', 8, device_name="SeeLevel Voltage")
+            'battery', 8, device_name="SeeLevel Voltage",
+            config={'custom_name': 'Voltage'})
 
         logging.debug(f"{self._plog} initialized {len(self._role_services)} service slots")
 
