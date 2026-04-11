@@ -498,7 +498,7 @@ class TestBTP3HandleManufacturerData(unittest.TestCase):
         self.dev._create_indexed_role_service = mock_create
         self.dev.handle_manufacturer_data(BTP3_TOILET_WATER_0PCT)
 
-        self.assertEqual(configs['tank_01'], {'fluid_type': 5})
+        self.assertEqual(configs['tank_01'], {'custom_name': 'Toilet Water', 'fluid_type': 5})
 
     # -- Disabled sensor -------------------------------------------------
 
@@ -549,7 +549,7 @@ class TestBTP3ServiceCreation(unittest.TestCase):
 
         self.assertIn('tank_00', self.created)
         self.assertEqual(self.created['tank_00']._device_name, 'SeeLevel Fresh Water')
-        self.assertEqual(self.configs['tank_00'], {'fluid_type': 1})
+        self.assertEqual(self.configs['tank_00'], {'custom_name': 'Fresh Water', 'fluid_type': 1})
 
     def test_toilet_water_creates_tank_with_fluid_type_5(self):
         """Sensor 1 (Toilet Water) -> tank service, fluid_type=5 (Black water)."""
@@ -557,7 +557,7 @@ class TestBTP3ServiceCreation(unittest.TestCase):
 
         self.assertIn('tank_01', self.created)
         self.assertEqual(self.created['tank_01']._device_name, 'SeeLevel Toilet Water')
-        self.assertEqual(self.configs['tank_01'], {'fluid_type': 5})
+        self.assertEqual(self.configs['tank_01'], {'custom_name': 'Toilet Water', 'fluid_type': 5})
 
     def test_wash_water_creates_tank_with_fluid_type_2(self):
         """Sensor 2 (Wash Water) -> tank service, fluid_type=2 (Waste water)."""
@@ -565,7 +565,7 @@ class TestBTP3ServiceCreation(unittest.TestCase):
 
         self.assertIn('tank_02', self.created)
         self.assertEqual(self.created['tank_02']._device_name, 'SeeLevel Wash Water')
-        self.assertEqual(self.configs['tank_02'], {'fluid_type': 2})
+        self.assertEqual(self.configs['tank_02'], {'custom_name': 'Wash Water', 'fluid_type': 2})
 
     def test_lpg_opn_creates_nothing(self):
         """Sensor 3 (LPG), value OPN -> no service created."""
@@ -579,15 +579,16 @@ class TestBTP3ServiceCreation(unittest.TestCase):
 
         self.assertIn('battery_13', self.created)
         self.assertEqual(self.created['battery_13']._device_name, 'SeeLevel Voltage')
-        self.assertEqual(self.configs['battery_13'], {})
+        self.assertEqual(self.configs['battery_13'], {'custom_name': 'Voltage'})
 
     def test_no_capacity_override_in_config(self):
-        """Tank config only carries fluid_type — capacity uses the role default
-        (0.2 m³) until the user configures it."""
+        """Tank config only carries fluid_type and custom_name — capacity uses
+        the role default (0.2 m³) until the user configures it."""
         self.dev.handle_manufacturer_data(BTP3_FRESH_WATER_0PCT)
 
         self.assertNotIn('capacity', self.configs['tank_00'])
-        self.assertEqual(list(self.configs['tank_00'].keys()), ['fluid_type'])
+        self.assertIn('fluid_type', self.configs['tank_00'])
+        self.assertIn('custom_name', self.configs['tank_00'])
 
     def test_all_connected_sensors_from_airstream(self):
         """Feed all 5 real Airstream captures: 3 tanks + 1 OPN + 1 battery."""
@@ -603,10 +604,10 @@ class TestBTP3ServiceCreation(unittest.TestCase):
         self.assertNotIn('tank_03', self.created)
         self.assertIn('battery_13', self.created)
 
-        self.assertEqual(self.configs['tank_00'], {'fluid_type': 1})
-        self.assertEqual(self.configs['tank_01'], {'fluid_type': 5})
-        self.assertEqual(self.configs['tank_02'], {'fluid_type': 2})
-        self.assertEqual(self.configs['battery_13'], {})
+        self.assertEqual(self.configs['tank_00'], {'custom_name': 'Fresh Water', 'fluid_type': 1})
+        self.assertEqual(self.configs['tank_01'], {'custom_name': 'Toilet Water', 'fluid_type': 5})
+        self.assertEqual(self.configs['tank_02'], {'custom_name': 'Wash Water', 'fluid_type': 2})
+        self.assertEqual(self.configs['battery_13'], {'custom_name': 'Voltage'})
 
 # ===================================================================
 # BTP7 — service creation from raw capture (end-to-end)
@@ -655,24 +656,25 @@ class TestBTP7ServiceCreation(unittest.TestCase):
         self._init_device()
 
         expected = {
-            'tank_00': 1,   # Fresh Water
-            'tank_01': 2,   # Wash Water
-            'tank_02': 5,   # Toilet Water (Black)
-            'tank_03': 1,   # Fresh Water 2
-            'tank_04': 2,   # Wash Water 2
-            'tank_05': 5,   # Toilet Water 2
-            'tank_06': 2,   # Wash Water 3
-            'tank_07': 8,   # LPG
+            'tank_00': (1, 'Fresh Water'),
+            'tank_01': (2, 'Wash Water'),
+            'tank_02': (5, 'Toilet Water'),
+            'tank_03': (1, 'Fresh Water 2'),
+            'tank_04': (2, 'Wash Water 2'),
+            'tank_05': (5, 'Toilet Water 2'),
+            'tank_06': (2, 'Wash Water 3'),
+            'tank_07': (8, 'LPG'),
         }
-        for key, fluid in expected.items():
-            self.assertEqual(self.configs[key], {'fluid_type': fluid},
-                             f"{key} should have fluid_type={fluid}")
+        for key, (fluid, name) in expected.items():
+            self.assertEqual(self.configs[key],
+                             {'fluid_type': fluid, 'custom_name': name},
+                             f"{key} should have fluid_type={fluid}, custom_name={name!r}")
 
     def test_battery_has_no_fluid_type(self):
-        """Battery service has no fluid_type in config."""
+        """Battery service has custom_name but no fluid_type in config."""
         self._init_device()
 
-        self.assertIsNone(self.configs.get('battery_08'))
+        self.assertEqual(self.configs.get('battery_08'), {'custom_name': 'Voltage'})
 
     def test_device_names_match_spec(self):
         """Each service gets the correct SeeLevel device name."""
