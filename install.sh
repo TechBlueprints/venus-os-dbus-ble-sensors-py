@@ -9,7 +9,7 @@
 set -e
 
 REPO_URL="https://github.com/TechBlueprints/venus-os-dbus-ble-sensors-py.git"
-BRANCH="downstream-merged"
+BRANCH="main"
 INSTALL_DIR="/data/apps/dbus-ble-sensors-py"
 SERVICE_NAME="dbus-ble-sensors-py"
 LAUNCHER_NAME="dbus-ble-sensors-py-launcher"
