@@ -9,6 +9,7 @@
 set -e
 
 REPO_URL="https://github.com/TechBlueprints/venus-os-dbus-ble-sensors-py.git"
+BRANCH="downstream-merged"
 INSTALL_DIR="/data/apps/dbus-ble-sensors-py"
 SERVICE_NAME="dbus-ble-sensors-py"
 LAUNCHER_NAME="dbus-ble-sensors-py-launcher"
@@ -74,11 +75,11 @@ if [ -d "$INSTALL_DIR" ]; then
         echo "  Fetching latest changes..."
         git fetch origin
         LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "none")
-        REMOTE=$(git rev-parse origin/main 2>/dev/null || echo "none")
+        REMOTE=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "none")
         if [ "$LOCAL" != "$REMOTE" ]; then
             echo "  Updates available. Resetting to latest..."
-            git checkout main 2>/dev/null || git checkout -b main origin/main
-            git reset --hard origin/main
+            git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
+            git reset --hard "origin/$BRANCH"
             NEEDS_RESTART=true
             echo "  Repository updated"
         else
@@ -89,14 +90,14 @@ if [ -d "$INSTALL_DIR" ]; then
         git init
         git remote add origin "$REPO_URL"
         git fetch origin
-        git checkout -b main origin/main 2>/dev/null || git checkout main
-        git reset --hard origin/main
+        git checkout -b "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+        git reset --hard "origin/$BRANCH"
         NEEDS_RESTART=true
         echo "  Converted to git repository"
     fi
 else
     echo "  Cloning repository..."
-    git clone "$REPO_URL" "$INSTALL_DIR"
+    git clone -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
     cd "$INSTALL_DIR"
     git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
     echo "  Repository cloned"
