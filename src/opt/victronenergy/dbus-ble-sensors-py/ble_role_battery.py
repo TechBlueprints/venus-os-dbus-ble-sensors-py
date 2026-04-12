@@ -9,7 +9,7 @@ class BleRoleBattery(BleRole):
     NAME = 'battery'
 
     def __init__(self, config: dict = None):
-        super().__init__()
+        super().__init__(config)
 
         self.info.update(
             {
