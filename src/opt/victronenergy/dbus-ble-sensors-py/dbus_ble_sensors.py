@@ -78,12 +78,16 @@ class _AdvMonitor(dbus.service.Object):
     manufacturer-ID filtering so this pattern is intentionally wide.
     """
 
-    def __init__(self, bus: dbus.bus.BusConnection, path: str):
+    def __init__(self, bus: dbus.bus.BusConnection, path: str,
+                 on_release=None):
         super().__init__(bus, path)
+        self._on_release = on_release
 
     @dbus.service.method(_MONITOR_IFACE, in_signature='', out_signature='')
     def Release(self):
-        logging.debug("AdvMonitor: Release")
+        logging.warning("AdvMonitor: released by BlueZ — will re-register")
+        if self._on_release:
+            self._on_release()
 
     @dbus.service.method(_MONITOR_IFACE, in_signature='', out_signature='')
     def Activate(self):
@@ -159,8 +163,11 @@ class DbusBleSensors(object):
         self._tap_thread: threading.Thread | None = None
         self._tap_stop = threading.Event()
         self._monitor_app = _MonitorApp(self._dbus, _MONITOR_APP_PATH, _MONITOR_OBJ_PATH)
-        self._monitor_obj = _AdvMonitor(self._dbus, _MONITOR_OBJ_PATH)
         self._registered_adapters: set[str] = set()
+        self._monitor_obj = _AdvMonitor(
+            self._dbus, _MONITOR_OBJ_PATH,
+            on_release=self._registered_adapters.clear,
+        )
 
         self._list_adapters()
 
