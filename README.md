@@ -26,7 +26,7 @@ Devices currently supported :
 Run this one-liner on your Venus OS device (SSH as root):
 
 ``` bash
-curl -fsSL https://raw.githubusercontent.com/TechBlueprints/venus-os-dbus-ble-sensors-py/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TechBlueprints/venus-os-dbus-ble-sensors-py/downstream-merged/install.sh | bash
 ```
 
 This installs to `/data/apps/dbus-ble-sensors-py/` which persists across firmware updates automatically. If an existing opkg installation is detected, it will be cleanly removed and replaced (all device settings are preserved).
