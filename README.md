@@ -1,5 +1,13 @@
 # Dbus BLE sensors py
 
+> **This is a fork of [ldenisey/venus-os-dbus-ble-sensors-py](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py) with the following PRs merged in ahead of upstream:**
+> - [#2 Replace Bleak with raw HCI monitor channel](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/2) — passive BLE scanning via `AdvertisementMonitor1`, no scan contention
+> - [#3 Add SeeLevel 709-BTP3/BTP7 support](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/3) — tank, temperature, and battery sensors
+> - [#4 Add alarm delay setting to BleRoleTank](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/4)
+> - [#6 Fix Mopeka tank level scaling](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/6) — execution order, butane formula, role consolidation
+> - [#7 Cache D-Bus connections](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/7) — prevent connection proliferation
+> - [#8 Add curl-based install method](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/8) — install without opkg or remounting the filesystem
+
 Venus OS dbus service for BLE device support. Replaces and extends [official dbus ble service](https://github.com/victronenergy/dbus-ble-sensors/tree/master) which does not allow collaboration for new devices support.
 
 Devices currently supported :
@@ -18,6 +26,8 @@ Devices currently supported :
 | Mopeka         | Mopeka TD200               | https://mopeka.com/commercial-industry-based-solutions/water/#:~:text=Mopeka%20TD40,%20TD200                   |
 | Ruuvi          | Ruuvi Tag                  | https://ruuvi.com/ruuvitag/                                                                                    |
 | Ruuvi          | Ruuvi Air                  | https://ruuvi.com/air/                                                                                         |
+| Garnet         | SeeLevel 709-BTP3          | https://garnetsensors.com/seelevel-ii-709-bt/                                                                  |
+| Garnet         | SeeLevel 709-BTP7          | https://garnetsensors.com/seelevel-ii-709-bt/                                                                  |
 
 ## Installation
 
