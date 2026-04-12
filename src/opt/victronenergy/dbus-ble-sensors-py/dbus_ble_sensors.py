@@ -30,6 +30,90 @@ from man_id import MAN_NAMES
 SNIF_LOGGER = logging.getLogger("sniffer")
 SNIF_LOGGER.propagate = False
 
+_MONITOR_IFACE = 'org.bluez.AdvertisementMonitor1'
+_PROPS_IFACE = 'org.freedesktop.DBus.Properties'
+_OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
+_MONITOR_APP_PATH = '/org/bluez/ble_sensors'
+_MONITOR_OBJ_PATH = _MONITOR_APP_PATH + '/0'
+
+_CATCH_ALL_PATTERN = dbus.Struct(
+    [dbus.Byte(0), dbus.Byte(0x01), dbus.Array([dbus.Byte(0x06)], signature='y')],
+    signature=None,
+)
+
+_MONITOR_PROPS = {
+    'Type': dbus.String('or_patterns'),
+    'Patterns': dbus.Array([_CATCH_ALL_PATTERN], signature='(yyay)'),
+}
+
+
+class _MonitorApp(dbus.service.Object):
+    """ObjectManager root that exposes AdvertisementMonitor children to BlueZ.
+
+    BlueZ's RegisterMonitor API uses g_dbus_client which calls
+    GetManagedObjects on the registered root to discover child objects
+    implementing AdvertisementMonitor1.
+    """
+
+    def __init__(self, bus: dbus.bus.BusConnection, path: str, child_path: str):
+        super().__init__(bus, path)
+        self._child_path = child_path
+
+    @dbus.service.method(_OM_IFACE, in_signature='', out_signature='a{oa{sa{sv}}}')
+    def GetManagedObjects(self):
+        return dbus.Dictionary({
+            dbus.ObjectPath(self._child_path): dbus.Dictionary({
+                _MONITOR_IFACE: dbus.Dictionary(_MONITOR_PROPS, signature='sv'),
+            }, signature='sa{sv}'),
+        }, signature='oa{sa{sv}}')
+
+
+class _AdvMonitor(dbus.service.Object):
+    """AdvertisementMonitor1 implementation for passive BLE scanning.
+
+    Registers a broad or_patterns monitor with BlueZ so the controller
+    performs passive scanning.  We match the common LE Flags byte (AD type
+    0x01, value 0x06 = General Discoverable | BR/EDR Not Supported) which
+    captures virtually all BLE peripherals.  The HCI tap does its own
+    manufacturer-ID filtering so this pattern is intentionally wide.
+    """
+
+    def __init__(self, bus: dbus.bus.BusConnection, path: str):
+        super().__init__(bus, path)
+
+    @dbus.service.method(_MONITOR_IFACE, in_signature='', out_signature='')
+    def Release(self):
+        logging.debug("AdvMonitor: Release")
+
+    @dbus.service.method(_MONITOR_IFACE, in_signature='', out_signature='')
+    def Activate(self):
+        logging.info("AdvMonitor: passive scanning activated by BlueZ")
+
+    @dbus.service.method(_MONITOR_IFACE, in_signature='o', out_signature='')
+    def DeviceFound(self, device):
+        pass
+
+    @dbus.service.method(_MONITOR_IFACE, in_signature='o', out_signature='')
+    def DeviceLost(self, device):
+        pass
+
+    @dbus.service.method(_PROPS_IFACE, in_signature='ss', out_signature='v')
+    def Get(self, interface, prop):
+        if interface == _MONITOR_IFACE:
+            if prop == 'Type':
+                return _MONITOR_PROPS['Type']
+            if prop == 'Patterns':
+                return _MONITOR_PROPS['Patterns']
+        raise dbus.exceptions.DBusException(
+            f'No property {prop}',
+            name='org.freedesktop.DBus.Error.InvalidArgs')
+
+    @dbus.service.method(_PROPS_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface == _MONITOR_IFACE:
+            return dbus.Dictionary(_MONITOR_PROPS, signature='sv')
+        return dbus.Dictionary({}, signature='sv')
+
 
 class DbusBleSensors(object):
     """
@@ -38,9 +122,13 @@ class DbusBleSensors(object):
 
     BLE advertisements are received via an HCI monitor channel tap — a passive
     read-only socket that sees ALL HCI traffic between the host and every
-    Bluetooth controller (the same mechanism btmon uses).  This bypasses
-    BlueZ's AdvertisementMonitor1 filtering entirely, eliminating the need
-    for Bleak, dbus-fast, or any BlueZ scanning API.
+    Bluetooth controller (the same mechanism btmon uses).
+
+    To make the controller actually scan, we register an AdvertisementMonitor1
+    with BlueZ on each adapter.  This triggers *passive* scanning — the
+    controller listens for advertisements without sending SCAN_REQ packets —
+    which coexists cleanly with other services that need active scanning and
+    GATT connections (e.g. power-watchdog, shyion-switch via bleak).
 
     Cf.
     - https://github.com/victronenergy/dbus-ble-sensors/
@@ -53,7 +141,7 @@ class DbusBleSensors(object):
         self._dbus_ble_service = DbusBleService()
 
         self._adapters = []
-        self._list_adapters()
+        self._adapter_paths: dict[str, str] = {}
 
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
@@ -70,6 +158,11 @@ class DbusBleSensors(object):
         self._silence_warned: bool = False
         self._tap_thread: threading.Thread | None = None
         self._tap_stop = threading.Event()
+        self._monitor_app = _MonitorApp(self._dbus, _MONITOR_APP_PATH, _MONITOR_OBJ_PATH)
+        self._monitor_obj = _AdvMonitor(self._dbus, _MONITOR_OBJ_PATH)
+        self._registered_adapters: set[str] = set()
+
+        self._list_adapters()
 
     def _list_adapters(self):
         self._dbus.add_signal_receiver(
@@ -102,7 +195,9 @@ class DbusBleSensors(object):
             logging.info(f"{name}: adding adapter, path={path!r}, address={mac!r}")
             if name not in self._adapters:
                 self._adapters.append(name)
+                self._adapter_paths[name] = str(path)
                 self._dbus_ble_service.add_ble_adapter(name, mac)
+                self._register_passive_monitor(name)
 
     def _on_interfaces_removed(self, path, interfaces):
         if not str(path).startswith('/org/bluez'):
@@ -111,7 +206,43 @@ class DbusBleSensors(object):
         if 'org.bluez.Adapter1' in interfaces:
             self._dbus_ble_service.remove_ble_adapter(name)
             self._adapters.remove(name)
+            self._adapter_paths.pop(name, None)
+            self._registered_adapters.discard(name)
             logging.info(f"{name}: adapter removed")
+
+    def _register_passive_monitor(self, adapter_name: str):
+        """Register the AdvertisementMonitor app with a BlueZ adapter.
+
+        The HCI monitor tap is read-only — it sees traffic but cannot tell
+        the controller to scan.  This registers our AdvertisementMonitor1
+        hierarchy with BlueZ which triggers passive scanning on the adapter.
+        Unlike StartDiscovery (active scanning), this coexists cleanly with
+        other services that need active scans and GATT connections.
+
+        Uses async D-Bus call to avoid deadlock: BlueZ needs to call
+        GetManagedObjects on our root during registration, which requires
+        the GLib main loop to dispatch the incoming call.
+        """
+        adapter_path = self._adapter_paths.get(adapter_name)
+        if not adapter_path or adapter_name in self._registered_adapters:
+            return
+        try:
+            adapter = self._dbus.get_object('org.bluez', adapter_path)
+            mgr = dbus.Interface(adapter, 'org.bluez.AdvertisementMonitorManager1')
+            mgr.RegisterMonitor(
+                _MONITOR_APP_PATH,
+                reply_handler=lambda: self._on_monitor_registered(adapter_name),
+                error_handler=lambda exc: self._on_monitor_register_failed(adapter_name, exc),
+            )
+        except dbus.exceptions.DBusException as exc:
+            logging.warning(f"{adapter_name}: failed to register monitor: {exc}")
+
+    def _on_monitor_registered(self, adapter_name: str):
+        self._registered_adapters.add(adapter_name)
+        logging.info(f"{adapter_name}: passive scanning monitor registered")
+
+    def _on_monitor_register_failed(self, adapter_name: str, exc):
+        logging.warning(f"{adapter_name}: failed to register monitor: {exc}")
 
     def _process_advertisement(self, dev_mac: str, manufacturer_data: dict[int, bytes]):
         """Process a single BLE advertisement (called on the GLib main thread)."""
@@ -275,12 +406,17 @@ class DbusBleSensors(object):
             self._tap_thread = None
             self._start_tap()
 
-        # Silence detection: warn if no matching advertisements for a while
+        # Re-register monitors on any adapter that lost its registration
+        for name in self._adapter_paths:
+            if name not in self._registered_adapters:
+                self._register_passive_monitor(name)
+
+        # Silence detection
         if self._last_tap_rx > 0 and now - self._last_tap_rx > SILENCE_WARNING_SECONDS:
             if not self._silence_warned:
                 logging.warning(
                     f"No matching advertisements received for "
-                    f"{int(now - self._last_tap_rx)}s — is BLE scanning active?")
+                    f"{int(now - self._last_tap_rx)}s")
                 self._silence_warned = True
 
         return True
