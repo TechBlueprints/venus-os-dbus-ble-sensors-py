@@ -121,7 +121,6 @@ class BleDevice(object):
 
     def _load_configuration(self):
         self.info['manufacturer_id'] = self.MANUFACTURER_ID
-        self.info['device_name'] = self.info['device_name'] + ' ' + self.info['dev_mac'][-6:].upper()
         self._plog = f"{self.info['dev_mac']} - {self.info['device_name']}:"
 
         for key in ['manufacturer_id', 'product_id', 'product_name', 'device_name', 'dev_prefix', 'roles', 'regs', 'settings', 'alarms']:
