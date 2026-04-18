@@ -129,12 +129,12 @@ class DbusBleService(object):
         custom_name_setting_path = f"/Settings/Devices/{dbus_role_service.get_dbus_id()}/CustomName"
         custom_name = self._dbus_settings.get_value(custom_name_setting_path)
         name = custom_name if custom_name else dbus_role_service.get_device_name()
-        self._set_value(f"/Devices/{dev_id}_{role_name}/Name", f"{name} {role_name}")
+        self._set_value(f"/Devices/{dev_id}_{role_name}/Name", name)
 
         def set_name_callback(service_name: str, path: str, custom_name_changes: str):
             if service_name != DbusSettingsService._SETTINGS_SERVICENAME or path != custom_name_setting_path:
                 return
-            self._set_value(f"/Devices/{dev_id}_{role_name}/Name", f"{custom_name_changes['Value']} {role_name}")
+            self._set_value(f"/Devices/{dev_id}_{role_name}/Name", custom_name_changes['Value'])
         self._dbus_settings.get_item(custom_name_setting_path).eventCallback = set_name_callback
 
         # Add enable entry and fire the callback with the persisted value so

@@ -84,6 +84,33 @@ def get_firmware_version(settings: DbusSettingsService,
     return s or None
 
 
+def preferred_adapter_setting_path(dev_mac: str) -> str:
+    return f"/Settings/Devices/orion_tr_{_mac_key(dev_mac)}/PreferredAdapter"
+
+
+def get_preferred_adapter(settings: DbusSettingsService,
+                          dev_mac: str) -> Optional[str]:
+    path = preferred_adapter_setting_path(dev_mac)
+    raw = settings.try_get_value(path)
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s or None
+
+
+def set_preferred_adapter(settings: DbusSettingsService,
+                          dev_mac: str, adapter: str) -> None:
+    """Store which BlueZ adapter (e.g. ``hci1``) last connected successfully."""
+    mk = _mac_key(dev_mac)
+    s = str(adapter).strip()
+    if not s:
+        return
+    path = preferred_adapter_setting_path(dev_mac)
+    settings.set_item(path, s, 0, 0, silent=True)
+    settings.set_value(path, s)
+    logger.info("Stored preferred adapter %s for Orion-TR %s", s, mk)
+
+
 def set_firmware_version(settings: DbusSettingsService,
                          dev_mac: str, version: str) -> None:
     """Persist the firmware version string (free-form) in silent settings."""

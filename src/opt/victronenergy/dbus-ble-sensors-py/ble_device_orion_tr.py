@@ -58,8 +58,10 @@ from orion_tr_key_settings import (
     advertisement_key_setting_path,
     get_advertisement_key,
     get_firmware_version,
+    get_preferred_adapter,
     set_advertisement_key,
     set_firmware_version,
+    set_preferred_adapter,
 )
 from orion_tr_pin import resolve_pairing_passkey
 from scan_control import pause_scanning, resume_scanning
@@ -77,6 +79,20 @@ VREG_DEVICE_MODE = 0x0200
 # PageAlternatorModel.  0xA3F0 matches what the standalone service uses
 # when flipping to alternator mode.
 ALTERNATOR_PRODUCT_ID = 0xA3F0
+
+# Fallback product names for Orion-TR product IDs not (yet) in the
+# vendored victron_ble MODEL_ID_MAPPING.  Sourced from the standalone
+# dbus-victron-orion-tr driver.
+_ORION_PRODUCT_NAMES = {
+    0xA3C0: "Orion-TR Smart 12/12-18A",
+    0xA3C1: "Orion-TR Smart 12/24-10A",
+    0xA3C2: "Orion-TR Smart 12/48-6A",
+    0xA3D0: "Orion-TR Smart 24/12-20A",
+    0xA3D1: "Orion-TR Smart 24/24-12A",
+    0xA3D2: "Orion-TR Smart 24/48-6A",
+    0xA3D5: "Orion-TR Smart 48/24-12A",
+    0xA3D6: "Orion-TR Smart 48/48-6A",
+}
 
 # VE.Direct OperationMode values that indicate charger-style operation.
 _CHARGER_MODES = {3, 4, 5, 6}  # BULK, ABSORPTION, FLOAT, STORAGE
@@ -118,7 +134,9 @@ def _gatt() -> AsyncGATTWriter:
 
 
 def _run_key_cli(mac: str, passkey: int,
-                 timeout_s: float = 45.0) -> Optional[Dict[str, Any]]:
+                 timeout_s: float = 45.0,
+                 preferred_adapter: Optional[str] = None,
+                 ) -> Optional[Dict[str, Any]]:
     """Invoke :mod:`orion_tr_key_cli` and return its parsed JSON payload.
 
     Running in a separate process keeps the provisioning flow isolated
@@ -137,6 +155,8 @@ def _run_key_cli(mac: str, passkey: int,
         "--passkey", str(passkey),
         "--timeout", str(int(timeout_s)),
     ]
+    if preferred_adapter:
+        cmd.extend(["--preferred-adapter", preferred_adapter])
     logger.info("Spawning key-provisioner subprocess: %s", " ".join(cmd))
     try:
         result = subprocess.run(
@@ -367,6 +387,19 @@ class BleDeviceOrionTR(BleDevice):
         )
         self._current_role_name = "dcdc"
 
+    def init(self):
+        super().init()
+        # Seed CustomName from the BLE-advertised name so the device
+        # list shows the user's own label (e.g. "24v Front Bay") instead
+        # of the long model spec.  Only set if the user hasn't already
+        # chosen a custom name via the UI.
+        adv_name = _bluez_device_name(self.info["dev_mac"])
+        if adv_name:
+            for role_service in self._role_services.values():
+                current = role_service["/CustomName"]
+                if not current:
+                    role_service["/CustomName"] = adv_name
+
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
         return self.matches_manufacturer_data(manufacturer_data)
 
@@ -441,13 +474,20 @@ class BleDeviceOrionTR(BleDevice):
         charger_error = parsed.get_charger_error()
         off_reason = parsed.get_off_reason()
 
+        # victron_ble's model-id table may not cover all Orion-TR product
+        # IDs (e.g. 0xA3D5 48V models).  Fall back to our own table.
+        model_name = parsed.get_model_name()
+        if model_name and model_name.startswith("<Unknown"):
+            pid = struct.unpack("<H", manufacturer_data[2:4])[0]
+            model_name = _ORION_PRODUCT_NAMES.get(pid, model_name)
+
         return {
             "device_state": int(charge_state.value) if charge_state is not None else 0,
             "charger_error": int(charger_error.value) if charger_error is not None else 0,
             "input_voltage": parsed.get_input_voltage(),
             "output_voltage": parsed.get_output_voltage(),
             "off_reason": int(off_reason.value) if off_reason is not None else 0,
-            "model_name": parsed.get_model_name(),
+            "model_name": model_name,
         }
 
     # ------------------------------------------------------------------
@@ -483,12 +523,17 @@ class BleDeviceOrionTR(BleDevice):
         pause_scanning("orion-tr key provisioning")
         _provision_busy = True
 
+        # Check if we have a preferred adapter from a prior successful connect
+        pref_adapter = get_preferred_adapter(self._dbus_settings,
+                                             self.info["dev_mac"])
+
         def worker():
             global _provision_busy
             try:
                 with _provision_lock:
                     payload = _run_key_cli(mac_colon,
-                                           self._pairing_passkey)
+                                           self._pairing_passkey,
+                                           preferred_adapter=pref_adapter)
                 if not payload:
                     logger.warning(
                         "%s: key provisioning did not produce a 16-byte "
@@ -571,6 +616,15 @@ class BleDeviceOrionTR(BleDevice):
                 logger.exception(
                     "%s: failed to parse temperature", self._plog)
 
+        adapter = payload.get("adapter")
+        if adapter:
+            try:
+                set_preferred_adapter(self._dbus_settings,
+                                     self.info["dev_mac"], adapter)
+            except Exception:
+                logger.exception(
+                    "%s: failed to store preferred adapter", self._plog)
+
     # ------------------------------------------------------------------
     # Daily early-morning refresh
     # ------------------------------------------------------------------
@@ -606,6 +660,8 @@ class BleDeviceOrionTR(BleDevice):
             "%s: daily morning refresh — reading firmware via GATT",
             self._plog)
 
+        pref_adapter = get_preferred_adapter(self._dbus_settings,
+                                             self.info["dev_mac"])
         pause_scanning("orion-tr daily refresh")
         _provision_busy = True
 
@@ -614,7 +670,8 @@ class BleDeviceOrionTR(BleDevice):
             try:
                 with _provision_lock:
                     payload = _run_key_cli(mac_colon,
-                                           self._pairing_passkey)
+                                           self._pairing_passkey,
+                                           preferred_adapter=pref_adapter)
                 if not payload:
                     logger.warning(
                         "%s: daily refresh did not produce a payload",
@@ -649,8 +706,7 @@ class BleDeviceOrionTR(BleDevice):
             if parsed.get("output_voltage") is not None:
                 role_service["/Dc/0/Voltage"] = parsed["output_voltage"]
 
-            # Update product name from victron_ble's model-id lookup if
-            # it resolved to a real name (not "<Unknown device: ...>").
+            # ProductName = model spec from victron_ble's product-id table.
             model = parsed.get("model_name")
             if model and not model.startswith("<Unknown"):
                 role_service["/ProductName"] = model
