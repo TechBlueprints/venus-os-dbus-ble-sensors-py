@@ -61,6 +61,14 @@ PIN) and returned a valid advertisement key.
 
 ## Known gaps / future work
 
+- **`/Mode = 4` (off) works end-to-end** — the IP22 drops its encrypted
+  payload and stops outputting within seconds.  **`/Mode = 1` (on) is
+  accepted at GATT but has not yet re-enabled the unit** in testing on
+  the bench, which is advertising only the product-id prefix and not
+  returning to Power Supply state.  Needs further investigation: may
+  be an AC-input / output-load dependency, or the IP22 may use a
+  different VREG than `0x0200` to wake from a software off.
+
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
   surface one — pending exploration.
