@@ -10,6 +10,10 @@ from dbus.mainloop.glib import DBusGMainLoop
 from argparse import ArgumentParser
 from ble_device import BleDevice
 from ble_device_orion_tr import BleDeviceOrionTR, is_orion_tr_manufacturer_data
+from ble_device_ip22_charger import (
+    BleDeviceIP22Charger,
+    is_ip22_charger_manufacturer_data,
+)
 from ble_role import BleRole
 from dbus_bus import get_bus
 from dbus_ble_service import DbusBleService
@@ -261,9 +265,11 @@ class DbusBleSensors(object):
             if dev_mac not in self._known_mac:
                 self.snif_data(man_id, man_data)
 
-                # Victron manufacturer id 0x02E1: Orion-TR Smart vs SolarSense
+                # Victron manufacturer id 0x02E1: Orion-TR Smart, IP22 charger or SolarSense
                 if man_id == 0x02E1 and is_orion_tr_manufacturer_data(man_data):
                     device_class = BleDeviceOrionTR
+                elif man_id == 0x02E1 and is_ip22_charger_manufacturer_data(man_data):
+                    device_class = BleDeviceIP22Charger
                 else:
                     device_class = BleDevice.DEVICE_CLASSES.get(man_id, None)
                 if device_class is None:
