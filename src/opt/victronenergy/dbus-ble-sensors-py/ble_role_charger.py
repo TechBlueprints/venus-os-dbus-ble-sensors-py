@@ -47,8 +47,8 @@ class BleRoleCharger(BleRole):
             s.add_path("/DeviceOffReason", 0)
             s.add_path("/Relay/0/State", 0)
 
-            def on_mode(path, value):
-                return role_service._ble_device._ip22_on_mode_write(
-                    role_service, int(value))
-
-            s.add_path("/Mode", 1, writeable=True, onchangecallback=on_mode)
+            # IP22 firmware 0.162 returns application error "register
+            # not writable" (ACK `09 00 19 02 00 01`) for any SetValue
+            # against VREG 0x0200, so /Mode is published read-only
+            # until a writable control path is found.
+            s.add_path("/Mode", 1)

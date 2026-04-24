@@ -61,13 +61,20 @@ PIN) and returned a valid advertisement key.
 
 ## Known gaps / future work
 
-- **`/Mode = 4` (off) works end-to-end** — the IP22 drops its encrypted
-  payload and stops outputting within seconds.  **`/Mode = 1` (on) is
-  accepted at GATT but has not yet re-enabled the unit** in testing on
-  the bench, which is advertising only the product-id prefix and not
-  returning to Power Supply state.  Needs further investigation: may
-  be an AC-input / output-load dependency, or the IP22 may use a
-  different VREG than `0x0200` to wake from a software off.
+- **`/Mode` writes are a no-op on this firmware.**  A direct probe of
+  `ED:47:4D:2A:7C:2A` (firmware `fc00c140`, advertised as `0.162`)
+  confirmed that writing VREG `0x0200` with either opcode `0x06` (Set)
+  or `0x26` (privileged Set), payload `= 1` or `= 4`, returns the
+  application-layer error `09 00 19 02 00 01` on `DATA_LAST` — i.e.
+  "register not writable" for every value.  The earlier bench
+  observation that `/Mode = 4` caused the unit to drop to the short
+  product-id-only advertisement was a coincidence: subsequent writes
+  do not move the state machine either direction.
+
+  DEVICE_MODE is effectively read-only on IP22 charger firmware
+  on a different VREG (or using a mechanism outside the plain CBOR
+  Set op); finding it is deferred until there's a reason to pursue
+  on/off control beyond telemetry.
 
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
