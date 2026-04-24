@@ -86,11 +86,30 @@ PIN) and returned a valid advertisement key.
 
   So on this firmware `0x0200` simply isn't implemented — the Orion-TR
   path is a dead end here.  `0x0101` exists but isn't writable either.
-  on"/"Charger off" switch to must route through yet another VREG;
-  candidates worth probing next are the BPC range (`0xDA00`+) and
-  `/Settings/Function` (0xEDFA-ish), plus the command-shaped writes
-  into `0xEC77`/`0xEC78` the VE.Smart keep-alive path uses.  Easiest
-  unit on and off — both writes will be obvious in a `btmon` trace.
+
+  - The CTRL char returns `00 01 00 01 50 14 00` on a `ReadValue` —
+    byte 0 is the "Flags" field, and `0x00` means **path protocol
+    not supported** on this firmware.  The opcode-10 / opcode-11 /
+    opcode-12 path tree (see `vesmart-server/gattserver.py`) is the
+    interface modern devices expose; IP22 fw `0.162` predates it.
+    `0x00208c10`, size ~24 KB) is where the app falls back to a
+    hard-coded **VBusItem-path ↔ VREG** map per device family.  The
+    decoder tables from its caller — those callers are what register
+    the SmartCharger-specific mappings.  Those data tables aren't
+    extractable with `strings` / static scanning alone; the path-string
+    through the GOT, not directly encoded in the call-site bytes.
+  - Probed `0xEDE0`-`EDFC`, `EDFA-FD`, `EDF8` on IP22 with PUK+PIN
+    auth + every opcode variant I could think of (`0x06`, `0x26`,
+    `0x46`, `0x66`): all return code `02` ("encryption not supported")
+    on 1-byte writes, and get no ACK at all on 2-byte writes.  So
+    the IP22 has a real write-privilege class above what bond + PUK
+    + PIN provides, or the correct register is in a different range
+    entirely — most likely the latter given the unambiguous "unknown
+    register" response on `0x0200`.
+
+  Next time this is pursued, the pragmatic move is to capture a BLE
+  The write frame on `306b0003` will reveal both the VREG and the
+  opcode in one shot, sidestepping the stripped-binary archaeology.
 
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
