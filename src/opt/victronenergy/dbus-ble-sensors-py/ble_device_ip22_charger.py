@@ -83,13 +83,18 @@ _KEY_CLI_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "orion_tr_key_cli.py")
 
 def is_ip22_charger_manufacturer_data(manufacturer_data: bytes) -> bool:
-    if len(manufacturer_data) < 5:
+    # The IP22 drops its encrypted payload when powered off and advertises
+    # a short "product-id only" frame, so accept any length >= 4 as long as
+    # the product id is in the IP22 range.  Frames with a full encrypted
+    # payload additionally carry mode byte ``0x08`` (AcCharger).
+    if len(manufacturer_data) < 4:
         return False
     pid = struct.unpack("<H", manufacturer_data[2:4])[0]
     if not (IP22_PRODUCT_ID_MIN <= pid <= IP22_PRODUCT_ID_MAX):
         return False
-    # AcCharger mode byte per victron_ble: 0x08
-    return manufacturer_data[4] == 0x08
+    if len(manufacturer_data) >= 5 and manufacturer_data[4] != 0x08:
+        return False
+    return True
 
 def _shared_bus() -> dbus.Bus:
     return (
@@ -299,6 +304,13 @@ class BleDeviceIP22Charger(BleDevice):
 
         if not key:
             self._maybe_provision_key()
+            return
+
+        # Short "off" frame: just the product-id prefix, no encrypted
+        # payload.  Publish a minimal off-state snapshot without trying to
+        # decrypt (victron_ble rejects sub-length data).
+        if len(manufacturer_data) < 10:
+            self._publish_off_state()
             return
 
         try:
@@ -515,6 +527,17 @@ class BleDeviceIP22Charger(BleDevice):
     # ------------------------------------------------------------------
     # Publishing
     # ------------------------------------------------------------------
+
+    def _publish_off_state(self) -> None:
+        """Publish a minimal snapshot when the device is advertising the
+        short power-off frame (no encrypted payload)."""
+        for role_service in list(self._role_services.values()):
+            role_service["/State"] = 0
+            role_service["/Dc/0/Current"] = 0.0
+            role_service["/Dc/0/Power"] = 0.0
+            if not self._mode_busy:
+                role_service["/Mode"] = 4
+            role_service.connect()
 
     def _publish(self, parsed) -> None:
         for role_service in list(self._role_services.values()):
