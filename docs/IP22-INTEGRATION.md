@@ -76,6 +76,22 @@ PIN) and returned a valid advertisement key.
   Set op); finding it is deferred until there's a reason to pursue
   on/off control beyond telemetry.
 
+  Progress notes from a live GATT probe against ED:47:
+
+  | VREG | SetValue=01 response | Meaning |
+  |---|---|---|
+  | `0x0200` (DEVICE_MODE) | `09 00 19 02 00 01` | code `01` = **unknown** (not in VREG table) |
+  | `0x0101` (COMMAND) | `09 00 19 01 01 03` | code `03` = **readonly** (exists, but rejected) |
+  | `0xEDE0`-`0xEDE1` | no ACK / session drop | device doesn't respond |
+
+  So on this firmware `0x0200` simply isn't implemented — the Orion-TR
+  path is a dead end here.  `0x0101` exists but isn't writable either.
+  on"/"Charger off" switch to must route through yet another VREG;
+  candidates worth probing next are the BPC range (`0xDA00`+) and
+  `/Settings/Function` (0xEDFA-ish), plus the command-shaped writes
+  into `0xEC77`/`0xEC78` the VE.Smart keep-alive path uses.  Easiest
+  unit on and off — both writes will be obvious in a `btmon` trace.
+
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
   surface one — pending exploration.
