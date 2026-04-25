@@ -111,6 +111,22 @@ PIN) and returned a valid advertisement key.
   The write frame on `306b0003` will reveal both the VREG and the
   opcode in one shot, sidestepping the stripped-binary archaeology.
 
+  path (`/Link/Command`, `/Mode`, `/Settings/Function`, `/Bpc/...`,
+  `/Settings/PowerSupplyModeVoltage`, etc.) in `.rodata`.
+
+  The path↔VREG map is **not** stored as a static C++ array — no
+  `.data.rel.ro` or `.rodata` location holds 32-bit pointers to the
+  QSL headers paired with VREG immediates.  The map is built at
+  the caller passes in, and `init()` itself has no direct callers in
+  the symbol graph (it's reached only through Qt's virtual dispatch).
+  None of the candidate VREGs yielded a writable register class via
+  any opcode tried after PUK + PIN authentication.
+
+  Conclusion: the static analysis available without runtime
+  not sufficient to recover the IP22 on/off VREG.  A `btsnoop_hci.log`
+  the unit will show the write directly and is the clearly cheaper
+  next step.
+
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
   surface one — pending exploration.
