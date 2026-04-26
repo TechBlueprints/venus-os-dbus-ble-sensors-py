@@ -166,6 +166,85 @@ def bluez_device_name(dev_mac: str) -> Optional[str]:
         return None
     return None
 
+_NOMINAL_BATTERY_VOLTAGES = (12, 24, 36, 48)
+
+# Match the Orion-TR Smart naming: ``"Orion Smart 12V/24V-15A …"`` or
+# the older shorthand ``"Orion-TR Smart 12/24-10A"``.  The second
+# voltage is the *output* side, which is the battery the Orion-TR
+# regulates against — that's what we want for /Settings/BatteryVoltage.
+_ORION_NAME_RE = re.compile(
+    r"Orion[-\w ]*\s+(\d+)\s*V?\s*/\s*(\d+)\s*V?\s*-\s*\d+\s*A?",
+    re.IGNORECASE,
+)
+
+def battery_voltage_from_model(model_name: Optional[str],
+                                pid_table: Optional[dict[int, str]] = None,
+                                pid: Optional[int] = None) -> Optional[int]:
+    """Extract the nominal battery voltage (12 / 24 / 36 / 48) from a
+    Victron model-name string, with fallback to a per-driver
+    ``pid -> name`` table.
+
+    Recognises two naming conventions:
+
+      * **IP22 / Phoenix Smart chargers** —
+        ``"... Charger {V}|{A} ..."`` or ``"... Charger {V}/{A} ..."``.
+        The first integer is the battery voltage.
+
+      * **Orion-TR Smart DC-DC** —
+        ``"Orion [-TR] Smart {Vin}[V]/{Vout}[V]-{A}A …"``.  The
+        *output* voltage is the battery side (an Orion-TR Smart 12/24
+        regulates a 24 V house bank from a 12 V starter battery).
+
+    Returns ``None`` when the name doesn't match either convention or
+    the resolved voltage isn't one of the canonical Victron rails.
+    Pass ``pid_table`` + ``pid`` so the off-state / short-beacon path
+    can still resolve a value when no model name is in scope.
+    """
+    if model_name is None and pid_table is not None and pid is not None:
+        model_name = pid_table.get(pid)
+    if not model_name:
+        return None
+
+    # Orion-TR pattern first — it's more specific (requires the
+    # "Orion" keyword) so it doesn't accidentally consume IP22 names.
+    m = _ORION_NAME_RE.search(model_name)
+    if m:
+        try:
+            v_out = int(m.group(2))
+            if v_out in _NOMINAL_BATTERY_VOLTAGES:
+                return v_out
+        except ValueError:
+            pass
+        # Some 12V/12V or 24V/24V variants — the output is still the
+        # battery side, even though it equals input.
+        try:
+            v_out = int(m.group(2))
+            if v_out in _NOMINAL_BATTERY_VOLTAGES:
+                return v_out
+        except ValueError:
+            pass
+
+    # IP22 / Phoenix Smart pattern: "... Charger {V}{|or/}{A} ..."
+    if "Charger" in model_name:
+        for sep in ("|", "/"):
+            if sep not in model_name:
+                continue
+            tail = model_name.split("Charger", 1)
+            if len(tail) != 2:
+                continue
+            spec = tail[1].strip().split()[0]
+            if sep not in spec:
+                continue
+            head = spec.split(sep, 1)[0]
+            try:
+                v = int(head)
+                if v in _NOMINAL_BATTERY_VOLTAGES:
+                    return v
+            except ValueError:
+                pass
+
+    return None
+
 def encode_u16_le_scaled(value: float, scale: int,
                          max_value: int = 0xFFFF) -> Optional[bytes]:
     """Encode ``value * scale`` as a little-endian u16 byte pair,

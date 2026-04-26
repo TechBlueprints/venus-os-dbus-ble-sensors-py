@@ -58,6 +58,7 @@ from ble_charger_common import (
     ChargerCommonMixin,
     CHARGE_CURRENT_DEADBAND_A,
     CHARGE_VOLTAGE_DEADBAND_V,
+    battery_voltage_from_model,
     bluez_device_name as _orion_bluez_device_name,
     encode_u16_le_scaled,
     serial_from_advertised_name as _orion_serial_from_advertised_name,
@@ -820,6 +821,18 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
             except KeyError:
                 pass
 
+            # /Settings/BatteryVoltage — derived from the model name
+            # using the Orion-TR-aware shared parser.  An Orion-TR
+            # Smart 12/24 has a 24 V output (battery side).
+            battery_v = battery_voltage_from_model(
+                model, pid_table=_ORION_PRODUCT_NAMES,
+                pid=self.info.get("product_id"))
+            if battery_v is not None:
+                try:
+                    role_service["/Settings/BatteryVoltage"] = battery_v
+                except KeyError:
+                    pass
+
             # Force /ProductId to match the active service type.  gui-v2
             # keys its layout off /ProductId for alternator services.
             if is_alternator:
@@ -852,7 +865,53 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                     self._current_role_name, needed)
         self._swap_role(needed)
 
+    @staticmethod
+    def _enabled_setting_path(dev_id_str: str, role_name: str) -> str:
+        # Mirrors what dbus-ble-sensors-py uses for its per-role
+        # Enabled flag: /Settings/Devices/<dev_id>/<role>/Enabled.
+        return f"/Settings/Devices/{dev_id_str}/{role_name}/Enabled"
+
+    def _carry_enabled_flag_to(self, new_role_name: str) -> None:
+        """Persist Enabled=1 on the new role's settings path *before* it
+        is registered, so register_role_service()'s on-startup callback
+        sees the flag and immediately connects the new D-Bus service.
+
+        Without this, role swaps from dcdc → alternator (or back) leave
+        the new role disconnected from D-Bus until the user re-toggles
+        Enabled in gui-v2.  We carry the flag from whichever existing
+        role currently has it set."""
+        previously_enabled = False
+        for old_role_name in self._role_services:
+            try:
+                old_path = self._enabled_setting_path(
+                    self.info["dev_id"], old_role_name)
+                if int(self._dbus_settings.get_value(old_path) or 0) == 1:
+                    previously_enabled = True
+                    break
+            except Exception:
+                logger.exception(
+                    "%s: could not read Enabled flag for %r",
+                    self._plog, old_role_name)
+        if not previously_enabled:
+            return
+        new_path = self._enabled_setting_path(
+            self.info["dev_id"], new_role_name)
+        try:
+            self._dbus_settings.set_item(new_path, 1, 0, 1, silent=True)
+            self._dbus_settings.set_value(new_path, 1)
+            logger.info("%s: carried Enabled=1 across to role %r",
+                        self._plog, new_role_name)
+        except Exception:
+            logger.exception(
+                "%s: failed to carry Enabled flag to %r",
+                self._plog, new_role_name)
+
     def _swap_role(self, new_role_name: str) -> None:
+        # Mirror Enabled=1 across before tearing down the old role —
+        # register_role_service() reads the flag at startup and uses it
+        # to decide whether to immediately connect the new D-Bus service.
+        self._carry_enabled_flag_to(new_role_name)
+
         # Tear down every existing role.  There should only be one at a
         # time for an Orion-TR, but be defensive.
         for name, role_service in list(self._role_services.items()):

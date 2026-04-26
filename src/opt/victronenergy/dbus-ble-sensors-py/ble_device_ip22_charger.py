@@ -60,6 +60,7 @@ from ble_charger_common import (
     ChargerCommonMixin,
     CHARGE_CURRENT_DEADBAND_A,
     CHARGE_VOLTAGE_DEADBAND_V,
+    battery_voltage_from_model,
     bluez_device_name as _bluez_device_name,
     encode_u16_le_scaled,
     format_mac_colons as _format_mac_colons,
@@ -86,6 +87,18 @@ VREG_BATTERY_TYPE        = 0xEDF1   # u8;  0xFF = USER (unlocks voltage writes)
 VREG_FLOAT_VOLTAGE       = 0xEDF6   # u16 LE, 0.01 V
 VREG_ABSORPTION_VOLTAGE  = 0xEDF7   # u16 LE, 0.01 V
 VREG_DEVICE_MODE = 0x0200    # legacy alias retained for back-compat in code paths
+
+# Optional charge-profile VREGs that the standard Victron solar /
+# Phoenix Smart layout puts in this range — equalize voltage /
+# duration, bulk / absorption max time, rebulk threshold.  These are
+# *not yet wired* on the IP22 driver: they need an end-to-end probe
+# on each firmware variant before we expose writable settings paths
+# to gui-v2 (an unknown-VREG write returns ack code 1 and costs a
+# scan-pause / connect / disconnect cycle).
+#
+# Use ``scripts/probe_ip22_optional_vregs.py`` (see commit message)
+# to run the probe on a bench unit and confirm which addresses
+# respond before extending the role.
 
 # IP22 battery-type sentinel that unlocks user-defined absorption /
 # float voltage writes via 0xEDF7 / 0xEDF6.  Probed live: writes to
@@ -227,28 +240,12 @@ def _format_firmware_version(raw_hex: Optional[str]) -> Optional[str]:
 
 def _battery_voltage_for_product(model_name: Optional[str],
                                  pid: int) -> Optional[int]:
-    """Map a 12V/24V/36V/48V IP22 model to its nominal battery voltage.
-    The model name is the authoritative source (``"... 12|30 (1)"`` →
-    12); when only the product id is known, fall back to the
-    _IP22_PRODUCT_NAMES table so behaviour is consistent for both the
-    short-beacon "off" path and the encrypted-payload path."""
-    if model_name is None:
-        model_name = _IP22_PRODUCT_NAMES.get(pid)
-    if model_name:
-        for sep in ("|", "/"):
-            if sep in model_name:
-                tail = model_name.split("Charger", 1)
-                if len(tail) == 2:
-                    spec = tail[1].strip().split()[0]
-                    if sep in spec:
-                        head = spec.split(sep, 1)[0]
-                        try:
-                            v = int(head)
-                            if v in (12, 24, 36, 48):
-                                return v
-                        except ValueError:
-                            pass
-    return None
+    """IP22-side wrapper around the shared ``battery_voltage_from_model``,
+    falling back to the IP22 product-id table when the encrypted-payload
+    path doesn't have a model name in scope (e.g. the short-beacon
+    off-state path)."""
+    return battery_voltage_from_model(
+        model_name, pid_table=_IP22_PRODUCT_NAMES, pid=pid)
 
 class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
     """Blue Smart IP22 charger driven by encrypted Victron advertisements."""
@@ -344,6 +341,26 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         return self.matches_manufacturer_data(manufacturer_data)
 
     def handle_manufacturer_data(self, manufacturer_data: bytes):
+        # Adv-arrival counter, gated on env var so it ships in
+        # production but only emits log lines when actively debugging.
+        # Use ``IP22_ADV_TRACE=1`` in the service's run script when
+        # chasing the HCI-tap suppression issue (see
+        # docs/IP22-INTEGRATION.md §"HCI-tap suppression").
+        if os.environ.get("IP22_ADV_TRACE"):
+            if not hasattr(self, "_adv_trace_counts"):
+                self._adv_trace_counts: dict[int, int] = {}
+                self._adv_trace_last_log = 0.0
+            L = len(manufacturer_data)
+            self._adv_trace_counts[L] = (
+                self._adv_trace_counts.get(L, 0) + 1)
+            now = time.monotonic()
+            if now - self._adv_trace_last_log > 30.0:
+                self._adv_trace_last_log = now
+                logger.info(
+                    "%s: adv-trace counts (last 30 s+) %s",
+                    self._plog, dict(self._adv_trace_counts))
+                self._adv_trace_counts = {}
+
         if not DbusBleService.get().is_device_enabled(self.info):
             return
 

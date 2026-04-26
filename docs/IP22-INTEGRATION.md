@@ -403,3 +403,37 @@ PIN) and returned a valid advertisement key.
   hits *every* /Dc/0/* and /State path, not just alarms; treating it
   as a transport-layer task in a follow-up rather than gating the
   integrated-charger work on it.
+
+  **Diagnostic:** set `IP22_ADV_TRACE=1` in the service's run script
+  (e.g. `start-dbus-ble-sensors-py.sh`) and the IP22 driver emits a
+  log line every 30 s with the count of advertisement arrivals
+  bucketed by manufacturer-data length:
+
+  ```
+  INFO:ble_device_ip22_charger:ed474d2a7c2a - BSC IP22 12/30...HQ2133XMU6Y::
+       adv-trace counts (last 30 s+) {4: 1}
+  ```
+
+  If the count for the suppressed unit stays at `{4: 1}` over
+  multiple windows while `btmon` shows steady traffic, the issue is
+  in the BlueZ → service hop (AdvMonitor dedup or PropertiesChanged
+  filtering); if it grows but length-21 advs never appear, the HCI
+  tap parser is dropping them.  Either localises the bug.
+
+- **Optional charge-profile settings not yet wired.**
+  `/Settings/{EqualizationVoltage, EqualizationDuration,
+  AbsorptionMaxTime, BulkMaxTime, RebulkVoltage}` are reachable on
+  Solar-charger-class layouts but their existence on AC-charger
+  firmware needs verification first — an unknown-VREG write costs a
+  full pause-scan / connect / disconnect cycle.  Run
+  `scripts/probe_charger_vregs.py --mac <ip22> --candidates ip22-optional`
+  to confirm which addresses respond before extending the role.
+
+- **`/History/Cumulative/User/ChargedAh` cap on Orion-TR.**  IP22's
+  encrypted advertisement carries `output_current1`, so ChargedAh
+  ticks correctly there.  The Orion-TR's `DcDcConverterData` doesn't
+  expose current at all, so its history accumulator sees
+  `current_a=None` and only OperationTime advances.  Closing this
+  gap requires GATT-polling a current register on a slow loop — see
+  `sample-driver/research/ORION-TR-INTEGRATED-CHARGER.md` §3 for
+  the design discussion.
