@@ -146,6 +146,43 @@ PIN) and returned a valid advertisement key.
   A few more hours of either (a) Qt-6-internal layout reconstruction
   HCI snoop log path is still strictly cheaper.
 
+  **April 2026 — confirmed register set and writability via direct GATT
+  probe of ED:47** (firmware 3.65, app version VREG `0x0102`):
+
+  | VREG | Type | Read | Write | Notes |
+  |---|---|---|---|---|
+  | `0x0100` | u32 | ✓ | n/a | product id `0x00FFA330` (BSC IP22 12/30) |
+  | `0x0102` | u16 | ✓ | n/a | application version `0x365FF` ≈ fw 3.65 |
+  | `0x010A` | str | ✓ | n/a | serial `HQ2133XMU6Y` |
+  | `0x010B` | str | ✓ | n/a | "BSC IP22 12/30 (1)" |
+  | `0x010C` | str | ✓ | n/a | "BSC IP22 12/30…HQ2133XMU6Y" (long name) |
+  | `0x010F` | — | ✗ code 1 | — | not implemented |
+  | `0x0140` | u32 | ✓ | n/a | capabilities `0x40C100FC` |
+  | `0x0200` | — | ✗ code 1 | ✗ code 1 | **not implemented on IP22** (Orion-TR uses this) |
+  | `0x0201` | u8 | ✓ | ✗ code 3 | Device State (read-only) — `0x03=Bulk`, `0x04=Absorption`, etc. |
+  | `0x0202` | — | ✗ code 1 | ✗ code 1 | **not implemented on IP22** (BlueSolar remote-control mask) |
+  | `0x0207` | u32 | ✓ | (no err) | Device off reason; write of `0x4` accepted but no observed effect |
+  | `0xEDF0` | u16 | ✓ | ✓ (clamped) | **Battery max current** in 0.1A; writes accepted but device clamps to ≥7.5A |
+  | `0xEDF1` | u8 | ✓ | ✓ | Battery type; `0xFF`=USER unlocks voltage writes |
+  | `0xEDF7` | u16 | ✓ | ✓ when `EDF1=USER` | Absorption voltage in 0.01V |
+  | `0xEDF6` | u16 | ✓ | ✓ | Float voltage |
+  | `0xEDFC` | u16 | ✓ | ✓ | Bulk time limit |
+  | `0xEDFE` | u8 | ✓ | ✗ code 3 | Adaptive mode (read-only on this fw) |
+  | `0xEDFF` | u8 | ✓ | ? | Batterysafe mode |
+  | (~22 more `0xEDxx` settings) | | ✓ | ✓ when unlocked | per BlueSolar doc |
+
+  Error code interpretation observed on this BLE CBOR layer:
+  `1` = unknown register, `2` = bad value/size, `3` = read-only.
+
+  **No on/off VREG was found.**  The IP22 firmware does not expose
+  `0x0200`/`0x0202`, and `0x0207` (off-reason) appears read-only on
+  this firmware (writes accepted silently but state doesn't change).
+  Both [pvtex/Victron_BlueSmart_IP22](https://github.com/pvtex/Victron_BlueSmart_IP22)
+  and [wasn-eu/Victron_BlueSmart_IP22](https://github.com/wasn-eu/Victron_BlueSmart_IP22)
+  achieve "remote control" by manipulating `0xEDF0` (charge-current
+  limit) only.  That's the practical control surface this driver should
+  expose.
+
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
   surface one — pending exploration.

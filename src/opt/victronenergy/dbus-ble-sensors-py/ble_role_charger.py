@@ -47,8 +47,20 @@ class BleRoleCharger(BleRole):
             s.add_path("/DeviceOffReason", 0)
             s.add_path("/Relay/0/State", 0)
 
-            # IP22 firmware 0.162 returns application error "register
-            # not writable" (ACK `09 00 19 02 00 01`) for any SetValue
-            # against VREG 0x0200, so /Mode is published read-only
-            # until a writable control path is found.
+            # IP22 firmware does not implement VREG 0x0200; /Mode stays
+            # read-only.  The practical control surface is the charge
+            # current limit (VREG 0xEDF0), wired below.
             s.add_path("/Mode", 1)
+
+            # /Settings/ChargeCurrentLimit — writable via GATT 0xEDF0.
+            # The device clamps below ~7.5A to its hardware minimum.
+            ble = role_service._ble_device
+            if hasattr(ble, "_ip22_on_charge_current_limit_write"):
+                def on_ccl(_path, value):
+                    return ble._ip22_on_charge_current_limit_write(
+                        role_service, value)
+                s.add_path(
+                    "/Settings/ChargeCurrentLimit", None,
+                    writeable=True, onchangecallback=on_ccl)
+            else:
+                s.add_path("/Settings/ChargeCurrentLimit", None)

@@ -56,7 +56,18 @@ logger = logging.getLogger(__name__)
 VICTRON_MANUFACTURER_ID = 0x02E1
 IP22_PRODUCT_ID_MIN = 0xA330
 IP22_PRODUCT_ID_MAX = 0xA33F
-VREG_DEVICE_MODE = 0x0200
+
+# IP22 (BSC firmware 3.65) does NOT implement VREG 0x0200 (Device mode) or
+# 0x0202 (Remote control mask) — both return the "unknown register" error
+# (ack code 1) on this firmware.  The only verified-writable real-control
+# register is 0xEDF0 (Battery max current, u16 LE in 0.1A units).  Both
+# the open-source pvtex/Victron_BlueSmart_IP22 and wasn-eu/Victron_BlueSmart_IP22
+# drivers control the charger by manipulating only this register; the
+# device clamps writes below ~7.5A to the minimum hardware limit.
+#
+# /Mode on/off via the Orion-TR-style 0x0200 write is NOT viable here.
+VREG_BATTERY_MAX_CURRENT = 0xEDF0
+VREG_DEVICE_MODE = 0x0200    # legacy alias retained for back-compat in code paths
 
 # Known IP22 / Blue Smart model spec strings by product id.  Used when the
 # vendored ``victron_ble`` package's table doesn't cover a given SKU.
@@ -592,32 +603,49 @@ class BleDeviceIP22Charger(BleDevice):
     def _ip22_on_mode_write(self,
                             role_service: DbusRoleService,
                             value: int) -> bool:
-        if value not in (1, 4):
+        # Disabled: the IP22 BLE firmware does not implement VREG 0x0200.
+        # See docs/IP22-INTEGRATION.md for the register-probe matrix.
+        return False
+
+    # ------------------------------------------------------------------
+    # /Settings/ChargeCurrentLimit write (GATT) — VREG 0xEDF0, u16 LE in 0.1A
+    # ------------------------------------------------------------------
+
+    def _ip22_on_charge_current_limit_write(self,
+                                            role_service: DbusRoleService,
+                                            value_amps) -> bool:
+        # value_amps is the requested current in amps (float-ish).  IP22
+        # encodes this as u16 LE, scale 0.1A.  The device clamps writes
+        # below the model minimum (~7.5A on the 12/30 model).
+        try:
+            tenths = int(round(float(value_amps) * 10))
+        except (TypeError, ValueError):
+            return False
+        if tenths < 0 or tenths > 0xFFFF:
             return False
         writer = _gatt()
         if writer.busy:
             logger.warning("%s: GATT writer busy", self._plog)
             return False
 
-        self._mode_busy = True
         mac = _format_mac_colons(self.info["dev_mac"])
-        mode_byte = 4 if value == 4 else 1
-
-        pause_scanning("ip22 /Mode write")
+        pause_scanning("ip22 /Settings/ChargeCurrentLimit write")
 
         def on_done(success: bool):
             try:
-                self._mode_busy = False
                 if not success:
-                    logger.error("%s: GATT mode write failed", self._plog)
+                    logger.error("%s: GATT ChargeCurrentLimit write failed",
+                                 self._plog)
             finally:
-                resume_scanning("ip22 /Mode write")
+                resume_scanning("ip22 /Settings/ChargeCurrentLimit write")
 
+        # u16 little-endian in 0.1A units
+        value_bytes = bytes([tenths & 0xFF, (tenths >> 8) & 0xFF])
         writer.write_register(
             mac,
             self._pairing_passkey,
-            VREG_DEVICE_MODE,
-            bytes([mode_byte]),
+            VREG_BATTERY_MAX_CURRENT,
+            value_bytes,
             on_done=on_done,
         )
         return True
