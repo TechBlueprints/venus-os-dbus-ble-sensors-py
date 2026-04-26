@@ -309,3 +309,17 @@ PIN) and returned a valid advertisement key.
   -80 dBm) consistently fails Pair() with `AuthenticationCanceled`.
   Moving it closer to the cerbo or using a USB BLE adapter with a
   better antenna is the workaround; no driver change needed.
+
+- **HCI-tap pipeline drops post-init advs on the bench unit (ED:47).**
+  After service start, ED:47 surfaces the very first short-beacon adv
+  through `_process_advertisement` and then goes silent from the
+  driver's point of view, even though `btmon` confirms ~165 short
+  beacons + ~3 full-telemetry advs per minute are still leaving the
+  device.  The other IP22 on the bench (F2:86) gets full telemetry
+  through cleanly, so the integration pipeline itself is healthy —
+  the suppression is specific to ED:47 and points at either
+  `AsyncTap`'s `last_mfg_data` dedup or BlueZ's AdvMonitor
+  PropertiesChanged firing pattern for that particular MAC.  This
+  hits *every* /Dc/0/* and /State path, not just alarms; treating it
+  as a transport-layer task in a follow-up rather than gating the
+  integrated-charger work on it.
