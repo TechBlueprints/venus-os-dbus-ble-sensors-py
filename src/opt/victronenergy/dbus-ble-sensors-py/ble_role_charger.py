@@ -116,7 +116,7 @@ class BleRoleCharger(BleRole):
             s.add_path(
                 "/Link/NetworkMode", 0,
                 writeable=True,
-                onchangecallback=_bind("_ip22_on_link_network_mode_write"))
+                onchangecallback=_bind("_on_link_network_mode_write"))
 
             # /Link/ChargeCurrent: target current pushed by DVCC (amps).
             # Wired to VREG 0xEDF0 with a 0.1 A deadband so steady-state
@@ -143,13 +143,13 @@ class BleRoleCharger(BleRole):
             # bookkeeping but don't push to the wire.
             s.add_path("/Link/TemperatureSense", None,
                        writeable=True,
-                       onchangecallback=_bind("_ip22_on_link_passive_write"))
+                       onchangecallback=_bind("_on_link_passive_write"))
             s.add_path("/Link/VoltageSense", None,
                        writeable=True,
-                       onchangecallback=_bind("_ip22_on_link_passive_write"))
+                       onchangecallback=_bind("_on_link_passive_write"))
             s.add_path("/Link/BatteryCurrent", None,
                        writeable=True,
-                       onchangecallback=_bind("_ip22_on_link_passive_write"))
+                       onchangecallback=_bind("_on_link_passive_write"))
             s.add_path("/Link/TemperatureSenseActive", 0)
             s.add_path("/Link/VoltageSenseActive", 0)
 
@@ -158,7 +158,7 @@ class BleRoleCharger(BleRole):
             s.add_path(
                 "/Settings/BmsPresent", 0,
                 writeable=True,
-                onchangecallback=_bind("_ip22_on_settings_bms_present_write"))
+                onchangecallback=_bind("_on_settings_bms_present_write"))
 
             # /Settings/ChargeCurrentLimit — writable via GATT 0xEDF0.
             # Same VREG as /Link/ChargeCurrent above; both paths land at

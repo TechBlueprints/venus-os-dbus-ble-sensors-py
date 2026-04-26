@@ -53,6 +53,19 @@ from ip22_key_settings import (
 from scan_control import pause_scanning, resume_scanning
 from ve_types import VE_UN8
 
+# Behaviours shared between IP22 and Orion-TR (in charger / alternator
+# role): per-device GATT write queue, settings persistence, history
+# accumulators, charger alarms, DVCC engagement + /State=252 override.
+from ble_charger_common import (
+    ChargerCommonMixin,
+    CHARGE_CURRENT_DEADBAND_A,
+    CHARGE_VOLTAGE_DEADBAND_V,
+    bluez_device_name as _bluez_device_name,
+    encode_u16_le_scaled,
+    format_mac_colons as _format_mac_colons,
+    serial_from_advertised_name as _serial_from_advertised_name,
+)
+
 logger = logging.getLogger(__name__)
 
 VICTRON_MANUFACTURER_ID = 0x02E1
@@ -74,91 +87,10 @@ VREG_FLOAT_VOLTAGE       = 0xEDF6   # u16 LE, 0.01 V
 VREG_ABSORPTION_VOLTAGE  = 0xEDF7   # u16 LE, 0.01 V
 VREG_DEVICE_MODE = 0x0200    # legacy alias retained for back-compat in code paths
 
-# DVCC dedupe thresholds.  DVCC pushes /Link/ChargeVoltage and
-# /Link/ChargeCurrent on every cycle (~once per minute even when idle);
-# a GATT write costs ~3-5 s of pause-scan + connect + write + disconnect,
-# so we only round-trip a write when the request meaningfully differs
-# from what we last pushed.  Tolerances match what the IP22 itself can
-# resolve: 0.1 A and 0.01 V.
-_CHARGE_CURRENT_DEADBAND_A = 0.1
-_CHARGE_VOLTAGE_DEADBAND_V = 0.05
-
-# IP22 battery-type sentinel that unlocks user-defined absorption/float
-# voltage writes via 0xEDF7 / 0xEDF6.  Probed live: writes to 0xEDF7
-# return code 02 (param error) until 0xEDF1 == 0xFF.
+# IP22 battery-type sentinel that unlocks user-defined absorption /
+# float voltage writes via 0xEDF7 / 0xEDF6.  Probed live: writes to
+# 0xEDF7 return code 02 (param error) until 0xEDF1 == 0xFF.
 BATTERY_TYPE_USER = 0xFF
-
-# Settings persistence — paths under com.victronenergy.settings.
-# Same convention as the existing ip22_<mac>/AdvertisementKey entries.
-def _settings_charge_current_limit_path(dev_mac: str) -> str:
-    s = dev_mac.lower().replace(":", "")
-    return f"/Settings/Devices/ip22_{s}/ChargeCurrentLimit"
-
-def _settings_absorption_voltage_path(dev_mac: str) -> str:
-    s = dev_mac.lower().replace(":", "")
-    return f"/Settings/Devices/ip22_{s}/AbsorptionVoltage"
-
-def _settings_float_voltage_path(dev_mac: str) -> str:
-    s = dev_mac.lower().replace(":", "")
-    return f"/Settings/Devices/ip22_{s}/FloatVoltage"
-
-def _settings_history_op_time_path(dev_mac: str) -> str:
-    s = dev_mac.lower().replace(":", "")
-    return f"/Settings/Devices/ip22_{s}/History/OperationTime"
-
-def _settings_history_charged_ah_path(dev_mac: str) -> str:
-    s = dev_mac.lower().replace(":", "")
-    return f"/Settings/Devices/ip22_{s}/History/ChargedAh"
-
-# History accumulators — persist to settings at most this often, to avoid
-# beating up flash every advertisement (advertising interval is ~1 s).
-_HISTORY_FLUSH_INTERVAL_S = 60.0
-
-# ChargerError -> /Alarms/* mapping.  Only the codes that map to a real
-# *charger-side* alarm path are listed; the rest stay visible through
-# /ErrorCode and gui-v2's ChargerError::getDescription() text.
-#
-# Severity: 0 = OK, 1 = Warning, 2 = Alarm (Venus convention).
-#
-# What does NOT belong here:
-#   - /Alarms/{High,Low}BatteryTemperature: those are battery-monitor /
-#     BMS paths.  The charger sees a battery temperature error, decides
-#     to suspend charging, and reflects that through /State and
-#     /ErrorCode (codes 1, 14 -> "Battery temperature too high/low" via
-#     ChargerError::getDescription()).  It is not the authority on
-#     battery state, so it doesn't republish that condition as a
-#     charger-side alarm.
-#   - Battery-monitor paths (LowVoltage, LowSoc), inverter paths
-#     (Overload, Ripple, LoadDisconnect, VecanDisconnected): not
-#     properties of an AC charger.
-_CHARGER_ALARM_PATHS: tuple[str, ...] = (
-    "/Alarms/HighTemperature",   # charger's own heatsink / internal temp
-    "/Alarms/HighVoltage",       # battery-bus over-voltage at charger output
-    "/Alarms/HighRipple",        # AC-input ripple at charger input stage
-    "/Alarms/Fan",               # cooling-fan failure
-)
-# Map: charger_error_code -> {alarm_path: severity}
-_CHARGER_ERROR_TO_ALARMS: dict[int, dict[str, int]] = {
-    2:  {"/Alarms/HighVoltage": 2},
-    11: {"/Alarms/HighRipple": 2},
-    17: {"/Alarms/HighTemperature": 2},   # TEMPERATURE_CHARGER
-    22: {"/Alarms/HighTemperature": 2},   # INTERNAL_TEMPERATURE_A
-    23: {"/Alarms/HighTemperature": 2},   # INTERNAL_TEMPERATURE_B
-    24: {"/Alarms/Fan": 2},
-    26: {"/Alarms/HighTemperature": 2},   # OVERHEATED
-}
-
-# victron_ble.OperationMode.EXTERNAL_CONTROL — the value gui-v2 and
-# dbus-systemcalc-py recognise as "this charger is externally
-# controlled by the GX / a BMS, not running its own state machine".
-# Hard-coded so we don't drag the enum import down a hot path.
-_STATE_EXTERNAL_CONTROL = 252
-
-def _alarms_for_error(error_code: int) -> dict[str, int]:
-    """Return the {path: severity} dict to apply for a ChargerError code.
-    Paths not present in the result should be cleared to 0 by the
-    caller — that's how an alarm de-asserts when the error goes away."""
-    return _CHARGER_ERROR_TO_ALARMS.get(int(error_code), {})
 
 # Known IP22 / Blue Smart model spec strings by product id.  Used when the
 # vendored ``victron_ble`` package's table doesn't cover a given SKU.
@@ -293,23 +225,8 @@ def _format_firmware_version(raw_hex: Optional[str]) -> Optional[str]:
         return base + suffix
     return raw_hex
 
-def _format_mac_colons(dev_mac: str) -> str:
-    s = dev_mac.lower().replace(":", "")
-    return ":".join(s[i : i + 2] for i in range(0, 12, 2)).upper()
-
-_SERIAL_TOKEN_RE = __import__("re").compile(r"(HQ[0-9A-Z]{8,12})")
-
-def _serial_from_advertised_name(name: Optional[str]) -> Optional[str]:
-    """Extract the Victron serial token (e.g. ``HQ2133XMU6Y``) from a
-    BlueZ advertised name like ``"BSC IP22 12/30...HQ2133XMU6Y"`` or
-    ``"Blue Smart BL HQ2133XMU6Y"``.  Returns ``None`` if no token is
-    found."""
-    if not name:
-        return None
-    m = _SERIAL_TOKEN_RE.search(name)
-    return m.group(1) if m else None
-
-def _battery_voltage_for_product(model_name: Optional[str], pid: int) -> Optional[int]:
+def _battery_voltage_for_product(model_name: Optional[str],
+                                 pid: int) -> Optional[int]:
     """Map a 12V/24V/36V/48V IP22 model to its nominal battery voltage.
     The model name is the authoritative source (``"... 12|30 (1)"`` →
     12); when only the product id is known, fall back to the
@@ -318,7 +235,6 @@ def _battery_voltage_for_product(model_name: Optional[str], pid: int) -> Optiona
     if model_name is None:
         model_name = _IP22_PRODUCT_NAMES.get(pid)
     if model_name:
-        # Format: "... Charger {V}|{A} ..." or "... Charger {V}/{A} ..."
         for sep in ("|", "/"):
             if sep in model_name:
                 tail = model_name.split("Charger", 1)
@@ -334,34 +250,11 @@ def _battery_voltage_for_product(model_name: Optional[str], pid: int) -> Optiona
                             pass
     return None
 
-def _bluez_device_name(dev_mac: str) -> Optional[str]:
-    mac_suffix = "/dev_" + _format_mac_colons(dev_mac).replace(":", "_")
-    try:
-        bus = _shared_bus()
-        om = dbus.Interface(
-            bus.get_object("org.bluez", "/", introspect=False),
-            "org.freedesktop.DBus.ObjectManager")
-        objects = om.GetManagedObjects()
-        for path in objects:
-            if not str(path).endswith(mac_suffix):
-                continue
-            if "org.bluez.Device1" not in objects[path]:
-                continue
-            obj = bus.get_object("org.bluez", path, introspect=False)
-            props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
-            for prop in ("Name", "Alias"):
-                try:
-                    val = str(props.Get("org.bluez.Device1", prop))
-                except dbus.DBusException:
-                    continue
-                if val:
-                    return val
-    except Exception:
-        return None
-    return None
-
-class BleDeviceIP22Charger(BleDevice):
+class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
     """Blue Smart IP22 charger driven by encrypted Victron advertisements."""
+
+    # Used in /Settings/Devices/<ns>_<mac>/* paths (see ble_charger_common).
+    SETTINGS_NS_PREFIX = "ip22"
 
     # Some IP22 firmwares interleave a 4-byte "product-id only" beacon
     # alongside the encrypted telemetry advertisement.  When the unit is
@@ -369,6 +262,14 @@ class BleDeviceIP22Charger(BleDevice):
     # still emit it occasionally — so honour the short-frame "off" reading
     # only after this many seconds without a successful telemetry decode.
     _OFF_FRAME_GRACE_S = 30.0
+
+    # Settings-suffix → role-path map used by
+    # ChargerCommonMixin.load_persisted_charger_settings() at startup.
+    PERSISTED_SETTING_SUFFIXES_TO_PATHS = {
+        "ChargeCurrentLimit": "/Settings/ChargeCurrentLimit",
+        "AbsorptionVoltage":  "/Settings/AbsorptionVoltage",
+        "FloatVoltage":       "/Settings/FloatVoltage",
+    }
 
     @staticmethod
     def matches_manufacturer_data(manufacturer_data: bytes) -> bool:
@@ -384,40 +285,12 @@ class BleDeviceIP22Charger(BleDevice):
         self._stored_key_invalid = False
         self._last_daily_refresh_date: Optional[str] = None
         self._last_full_telemetry_at: float = 0.0
-        # Last value we successfully pushed to the device for each writable
-        # DVCC link path.  Used to dedupe GATT writes when DVCC re-publishes
-        # the same setpoint on every cycle.
-        self._last_pushed_charge_current_a: Optional[float] = None
-        self._last_pushed_charge_voltage_v: Optional[float] = None
         # Cached battery-type byte; if it isn't already USER (0xFF) the
         # absorption-voltage write at 0xEDF7 will be rejected with code 02.
         self._battery_type_is_user: Optional[bool] = None
-        # GATT write queue.  DVCC pushes /Link/ChargeCurrent and
-        # /Link/ChargeVoltage in quick succession; the shared
-        # AsyncGATTWriter has a single _busy flag and rejects concurrent
-        # writes, so we coalesce per-VREG requests in this slot map and
-        # drain them serially via _kick_pending_writes().  Mapping is
-        # ``vreg_id -> (value_bytes, on_complete)``; later writes to the
-        # same VREG before drain replace the slot — DVCC only cares about
-        # the most recent setpoint anyway.
-        self._pending_writes: dict[int, tuple[bytes, Optional[Callable]]] = {}
-        self._pending_drain_scheduled = False
-        # /Link/NetworkStatus value: 4 = stand-alone, 1 = master/GX in
-        # control.  Flips to 1 whenever DVCC writes any of /Link/NetworkMode,
-        # /Link/ChargeCurrent, /Link/ChargeVoltage or /Settings/BmsPresent.
-        # Reset to 4 if BmsPresent goes back to 0 and NetworkMode is 0.
-        self._dvcc_engaged = False
-        # Last advertised /State value from victron_ble — kept so
-        # _set_dvcc_engaged() can re-derive /State immediately when DVCC
-        # engages or disengages, instead of waiting for the next
-        # advertisement tick (which on this device may be ~20 s away).
-        self._last_advertised_state: int = 0
-        # History accumulators (ChargedAh integrates positive battery
-        # current over time; OperationTime ticks while /State != off).
-        self._history_op_time_s: float = 0.0
-        self._history_charged_ah: float = 0.0
-        self._history_last_tick: Optional[float] = None
-        self._history_last_flush: float = 0.0
+        # GATT queue / history / DVCC engagement / persistence-dedupe
+        # state — all initialised by the shared mixin.
+        self._init_charger_common()
         super().__init__(dev_mac)
 
     def configure(self, manufacturer_data: bytes):
@@ -876,9 +749,7 @@ class BleDeviceIP22Charger(BleDevice):
         def on_done(success: bool):
             if success:
                 self._last_pushed_charge_current_a = new_a
-                self._persist_setting(
-                    _settings_charge_current_limit_path(self.info["dev_mac"]),
-                    new_a)
+                self._persist_setting("ChargeCurrentLimit", new_a)
 
         self._enqueue_write(VREG_BATTERY_MAX_CURRENT, value_bytes,
                             on_complete=on_done)
@@ -903,75 +774,6 @@ class BleDeviceIP22Charger(BleDevice):
     # to push them onto the wire.
 
     # ------------------------------------------------------------------
-    # Per-device GATT write queue — collapses DVCC bursts and serialises
-    # writes against the single-slot AsyncGATTWriter.
-    # ------------------------------------------------------------------
-
-    _PENDING_DRAIN_INTERVAL_MS = 1500
-
-    def _enqueue_write(self, vreg: int, value_bytes: bytes,
-                       on_complete: Optional[Callable] = None) -> None:
-        # Newer write to the same VREG supersedes any pending one.  This
-        # is exactly what we want for DVCC-style continuous setpoints.
-        self._pending_writes[vreg] = (value_bytes, on_complete)
-        self._kick_pending_writes()
-
-    def _kick_pending_writes(self) -> None:
-        if not self._pending_writes:
-            return
-        writer = _gatt()
-        if writer.busy:
-            self._schedule_drain()
-            return
-
-        # Pop one slot and fire the underlying GATT write.  on_done
-        # reschedules the drain so the next pending VREG goes out next.
-        vreg, (value_bytes, on_complete) = next(
-            iter(self._pending_writes.items()))
-        del self._pending_writes[vreg]
-
-        mac = _format_mac_colons(self.info["dev_mac"])
-        pause_scanning(f"ip22 GATT write 0x{vreg:04X}")
-
-        def on_done(success: bool):
-            try:
-                if not success:
-                    logger.error("%s: GATT write 0x%04X failed",
-                                 self._plog, vreg)
-                if on_complete is not None:
-                    try:
-                        on_complete(success)
-                    except Exception:
-                        logger.exception(
-                            "%s: pending-write completion callback failed",
-                            self._plog)
-            finally:
-                resume_scanning(f"ip22 GATT write 0x{vreg:04X}")
-                self._schedule_drain()
-
-        writer.write_register(
-            mac, self._pairing_passkey,
-            vreg, value_bytes,
-            on_done=on_done,
-        )
-
-    def _schedule_drain(self) -> None:
-        if self._pending_drain_scheduled or not self._pending_writes:
-            return
-        self._pending_drain_scheduled = True
-
-        def _on_drain_tick():
-            self._pending_drain_scheduled = False
-            try:
-                self._kick_pending_writes()
-            except Exception:
-                logger.exception("%s: pending-write drain tick failed",
-                                 self._plog)
-            return False  # one-shot
-
-        GLib.timeout_add(self._PENDING_DRAIN_INTERVAL_MS, _on_drain_tick)
-
-    # ------------------------------------------------------------------
     # /Link/ChargeCurrent — DVCC target current → VREG 0xEDF0
     # ------------------------------------------------------------------
 
@@ -988,7 +790,7 @@ class BleDeviceIP22Charger(BleDevice):
         # of whatever NetworkMode/BmsPresent currently say.
         self._set_dvcc_engaged(role_service, True)
         last = self._last_pushed_charge_current_a
-        if last is not None and abs(new_a - last) < _CHARGE_CURRENT_DEADBAND_A:
+        if last is not None and abs(new_a - last) < CHARGE_CURRENT_DEADBAND_A:
             return True
         tenths = int(round(new_a * 10))
         if tenths < 0 or tenths > 0xFFFF:
@@ -1018,7 +820,7 @@ class BleDeviceIP22Charger(BleDevice):
             return False
         self._set_dvcc_engaged(role_service, True)
         last = self._last_pushed_charge_voltage_v
-        if last is not None and abs(new_v - last) < _CHARGE_VOLTAGE_DEADBAND_V:
+        if last is not None and abs(new_v - last) < CHARGE_VOLTAGE_DEADBAND_V:
             return True
         centivolts = int(round(new_v * 100))
         if centivolts < 0 or centivolts > 0xFFFF:
@@ -1034,16 +836,10 @@ class BleDeviceIP22Charger(BleDevice):
                             on_complete=on_voltage_set)
         return True
 
-    @staticmethod
-    def _ip22_on_link_passive_write(_role_service: DbusRoleService,
-                                    _value) -> bool:
-        # Generic "store on D-Bus, no GATT" handler used for
-        # /Link/TemperatureSense, /Link/VoltageSense, /Link/BatteryCurrent.
-        # Returning True signals the D-Bus layer to commit the value on
-        # the path so DVCC can read it back; we don't push it to the IP22
-        # over GATT because this firmware exposes no consumer VREG for
-        # the sense inputs.
-        return True
+    # /Link/{NetworkMode,TemperatureSense,VoltageSense,BatteryCurrent}
+    # and /Settings/BmsPresent passive handlers come from
+    # ChargerCommonMixin: _on_link_passive_write,
+    # _on_link_network_mode_write, _on_settings_bms_present_write.
 
     # ------------------------------------------------------------------
     # /Settings/AbsorptionVoltage  ->  VREG 0xEDF7
@@ -1082,23 +878,18 @@ class BleDeviceIP22Charger(BleDevice):
         if new_v <= 0 or new_v > 80:
             return False
         last = self._last_pushed_charge_voltage_v
-        if last is not None and abs(new_v - last) < _CHARGE_VOLTAGE_DEADBAND_V:
-            self._persist_setting(
-                _settings_absorption_voltage_path(self.info["dev_mac"]),
-                new_v)
+        if last is not None and abs(new_v - last) < CHARGE_VOLTAGE_DEADBAND_V:
+            self._persist_setting("AbsorptionVoltage", new_v)
             return True
-        centivolts = int(round(new_v * 100))
-        if centivolts < 0 or centivolts > 0xFFFF:
+        value_bytes = encode_u16_le_scaled(new_v, 100)
+        if value_bytes is None:
             return False
-        value_bytes = bytes([centivolts & 0xFF, (centivolts >> 8) & 0xFF])
         self._ensure_battery_type_user()
 
         def on_done(success: bool):
             if success:
                 self._last_pushed_charge_voltage_v = new_v
-                self._persist_setting(
-                    _settings_absorption_voltage_path(self.info["dev_mac"]),
-                    new_v)
+                self._persist_setting("AbsorptionVoltage", new_v)
 
         self._enqueue_write(VREG_ABSORPTION_VOLTAGE, value_bytes,
                             on_complete=on_done)
@@ -1113,218 +904,22 @@ class BleDeviceIP22Charger(BleDevice):
             return False
         if new_v <= 0 or new_v > 80:
             return False
-        centivolts = int(round(new_v * 100))
-        if centivolts < 0 or centivolts > 0xFFFF:
+        value_bytes = encode_u16_le_scaled(new_v, 100)
+        if value_bytes is None:
             return False
-        value_bytes = bytes([centivolts & 0xFF, (centivolts >> 8) & 0xFF])
         self._ensure_battery_type_user()
 
         def on_done(success: bool):
             if success:
-                self._persist_setting(
-                    _settings_float_voltage_path(self.info["dev_mac"]),
-                    new_v)
+                self._persist_setting("FloatVoltage", new_v)
 
         self._enqueue_write(VREG_FLOAT_VOLTAGE, value_bytes,
                             on_complete=on_done)
         return True
 
-    # ------------------------------------------------------------------
-    # /Link/NetworkStatus dynamic update — tracks DVCC engagement.
-    # ------------------------------------------------------------------
-
-    def _derive_published_state(self, advertised_state: int) -> int:
-        """Return the value that should appear on /State right now.
-        252 (EXTERNAL_CONTROL) when DVCC is engaged and the device is
-        powered, otherwise the raw advertised state.  Off stays off."""
-        if advertised_state == 0:
-            return 0
-        if self._dvcc_engaged:
-            return _STATE_EXTERNAL_CONTROL
-        return advertised_state
-
-    def _set_dvcc_engaged(self, role_service: DbusRoleService,
-                          engaged: bool) -> None:
-        # 1 = DVCC / GX in control; 4 = stand-alone (factory default).
-        # Only push to D-Bus when the value changes — gui-v2 redraws on
-        # every PropertiesChanged, no point spamming.
-        new_status = 1 if engaged else 4
-        try:
-            current = role_service["/Link/NetworkStatus"]
-        except Exception:
-            current = None
-        was_engaged = self._dvcc_engaged
-        self._dvcc_engaged = engaged
-        if current != new_status:
-            role_service["/Link/NetworkStatus"] = new_status
-
-        # Mid-cycle engagement / disengagement: flip /State immediately
-        # using the last advertised state, instead of waiting for the
-        # next telemetry adv (which on this device can be ~20 s away).
-        if was_engaged != engaged:
-            new_state = self._derive_published_state(self._last_advertised_state)
-            try:
-                if role_service["/State"] != new_state:
-                    role_service["/State"] = new_state
-            except Exception:
-                logger.debug("%s: /State refresh on engage-change failed",
-                             self._plog)
-
-    def _ip22_on_link_network_mode_write(self,
-                                          role_service: DbusRoleService,
-                                          value) -> bool:
-        try:
-            mode = int(value)
-        except (TypeError, ValueError):
-            return False
-        try:
-            bms_present = int(role_service["/Settings/BmsPresent"] or 0)
-        except Exception:
-            bms_present = 0
-        self._set_dvcc_engaged(role_service, mode != 0 or bms_present == 1)
-        return True
-
-    def _ip22_on_settings_bms_present_write(self,
-                                             role_service: DbusRoleService,
-                                             value) -> bool:
-        try:
-            bms_present = int(value)
-        except (TypeError, ValueError):
-            return False
-        try:
-            mode = int(role_service["/Link/NetworkMode"] or 0)
-        except Exception:
-            mode = 0
-        self._set_dvcc_engaged(role_service, bms_present == 1 or mode != 0)
-        return True
-
-    # ------------------------------------------------------------------
-    # Settings persistence — back the user-facing /Settings/* paths with
-    # com.victronenergy.settings entries so values survive a reboot.
-    # ------------------------------------------------------------------
-
-    def _persist_setting(self, settings_path: str, value) -> None:
-        try:
-            self._dbus_settings.set_item(settings_path, float(value),
-                                         silent=True)
-            self._dbus_settings.set_value(settings_path, float(value))
-        except Exception:
-            logger.exception("%s: failed to persist %s=%r",
-                             self._plog, settings_path, value)
-
-    def load_persisted_charger_settings(self,
-                                         role_service: DbusRoleService) -> None:
-        """Pull saved /Settings/Devices/ip22_<mac>/* values into the role
-        service paths so they survive service restart.  Called once per
-        role from BleRoleCharger.init() right after add_path().  Note:
-        we do not GATT-write anything here — the device retains its own
-        copy of these settings across power cycles, and DVCC will
-        re-push setpoints anyway."""
-        mac = self.info["dev_mac"]
-        for setting_path, role_path in (
-                (_settings_charge_current_limit_path(mac),
-                 "/Settings/ChargeCurrentLimit"),
-                (_settings_absorption_voltage_path(mac),
-                 "/Settings/AbsorptionVoltage"),
-                (_settings_float_voltage_path(mac),
-                 "/Settings/FloatVoltage"),
-        ):
-            try:
-                v = self._dbus_settings.try_get_value(setting_path)
-            except Exception:
-                v = None
-            if v is None:
-                continue
-            try:
-                role_service[role_path] = float(v)
-            except Exception:
-                logger.exception("%s: seed %s from settings failed",
-                                 self._plog, role_path)
-
-        # History accumulators — load once into in-memory state, then
-        # _tick_history() takes over.
-        op_path = _settings_history_op_time_path(mac)
-        ah_path = _settings_history_charged_ah_path(mac)
-        try:
-            v = self._dbus_settings.try_get_value(op_path)
-            if v is not None:
-                self._history_op_time_s = float(v)
-        except Exception:
-            pass
-        try:
-            v = self._dbus_settings.try_get_value(ah_path)
-            if v is not None:
-                self._history_charged_ah = float(v)
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # History accumulators
-    # ------------------------------------------------------------------
-
-    def _tick_history(self, state: int, current_a: float) -> None:
-        """Increment OperationTime and ChargedAh based on elapsed time
-        since the last advertisement.  Caller passes the current /State
-        and /Dc/0/Current; we only count when the charger is actually
-        producing positive battery current and not in fault/off."""
-        now = time.monotonic()
-        last = self._history_last_tick
-        self._history_last_tick = now
-        if last is None:
-            return
-        dt = now - last
-        # Drop unrealistically-long gaps (e.g. service-restart pause) so
-        # we don't credit the user with hours of phantom charging.
-        if dt <= 0 or dt > 600.0:
-            return
-        # OperationTime: any "actively charging" state counts.
-        if state in (3, 4, 5, 6, 7, 247):  # bulk/abs/float/storage/eq/recond
-            self._history_op_time_s += dt
-        # ChargedAh: integrate positive current.
-        if current_a is not None and current_a > 0.0:
-            self._history_charged_ah += (current_a * dt) / 3600.0
-
-    def _publish_alarms(self,
-                        role_service: DbusRoleService,
-                        error_code: int) -> None:
-        """Translate the current ChargerError code into the charger-side
-        /Alarms/* paths, clearing any path that the new error doesn't
-        assert.  This keeps gui-v2's notification panel honest: when the
-        underlying condition goes away, the alarm de-asserts, and the
-        /ErrorCode int still tells the full story for everything else
-        (over-current, bulk-time, internal hardware faults)."""
-        active = _alarms_for_error(error_code)
-        for path in _CHARGER_ALARM_PATHS:
-            severity = active.get(path, 0)
-            try:
-                if role_service[path] != severity:
-                    role_service[path] = severity
-            except KeyError:
-                # Path not registered (shouldn't happen — declared in
-                # ble_role_charger.py) — log once and move on.
-                logger.debug("%s: alarm path %s missing from role",
-                             self._plog, path)
-
-    def _publish_history(self, role_service: DbusRoleService) -> None:
-        role_service["/History/Cumulative/User/OperationTime"] = int(
-            self._history_op_time_s)
-        # Round to 0.01 Ah; high precision adds noise, low loses
-        # information at trickle currents.
-        role_service["/History/Cumulative/User/ChargedAh"] = round(
-            self._history_charged_ah, 2)
-
-        # Periodic flush to settings so the values survive a restart.
-        now = time.monotonic()
-        if now - self._history_last_flush < _HISTORY_FLUSH_INTERVAL_S:
-            return
-        self._history_last_flush = now
-        mac = self.info["dev_mac"]
-        try:
-            self._persist_setting(
-                _settings_history_op_time_path(mac),
-                float(self._history_op_time_s))
-            self._persist_setting(
-                _settings_history_charged_ah_path(mac),
-                float(self._history_charged_ah))
-        except Exception:
-            logger.exception("%s: history flush failed", self._plog)
+    # /Link/NetworkStatus dynamic update, /State = 252 override on
+    # DVCC engagement, settings persistence, history accumulators,
+    # and /Alarms/* derivation are all provided by ChargerCommonMixin.
+    # IP22-specific extension points: PERSISTED_SETTING_SUFFIXES_TO_PATHS
+    # (declared near the top of the class), and _publish_alarms /
+    # _publish_history called from _publish() below.
