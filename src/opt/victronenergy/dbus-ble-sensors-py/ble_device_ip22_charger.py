@@ -235,6 +235,13 @@ def _bluez_device_name(dev_mac: str) -> Optional[str]:
 class BleDeviceIP22Charger(BleDevice):
     """Blue Smart IP22 charger driven by encrypted Victron advertisements."""
 
+    # Some IP22 firmwares interleave a 4-byte "product-id only" beacon
+    # alongside the encrypted telemetry advertisement.  When the unit is
+    # genuinely off it sends only the short beacon, but a running unit can
+    # still emit it occasionally — so honour the short-frame "off" reading
+    # only after this many seconds without a successful telemetry decode.
+    _OFF_FRAME_GRACE_S = 30.0
+
     @staticmethod
     def matches_manufacturer_data(manufacturer_data: bytes) -> bool:
         return is_ip22_charger_manufacturer_data(manufacturer_data)
@@ -248,6 +255,7 @@ class BleDeviceIP22Charger(BleDevice):
         self._last_provision_attempt: float = 0.0
         self._stored_key_invalid = False
         self._last_daily_refresh_date: Optional[str] = None
+        self._last_full_telemetry_at: float = 0.0
         super().__init__(dev_mac)
 
     def configure(self, manufacturer_data: bytes):
@@ -318,10 +326,17 @@ class BleDeviceIP22Charger(BleDevice):
             return
 
         # Short "off" frame: just the product-id prefix, no encrypted
-        # payload.  Publish a minimal off-state snapshot without trying to
-        # decrypt (victron_ble rejects sub-length data).
+        # payload.  Some IP22 firmwares interleave short beacons with full
+        # telemetry advertisements as a power-saving feature even while the
+        # charger is running, so do not treat a short frame as authoritative
+        # off-state if a full telemetry frame arrived recently — let the
+        # most recent decoded telemetry stand.  Only honour the short frame
+        # as "off" once the IP22 has gone quiet for ``_OFF_FRAME_GRACE_S``.
         if len(manufacturer_data) < 10:
-            self._publish_off_state()
+            now = time.monotonic()
+            last_full = getattr(self, "_last_full_telemetry_at", 0.0)
+            if now - last_full >= self._OFF_FRAME_GRACE_S:
+                self._publish_off_state()
             return
 
         try:
@@ -344,6 +359,7 @@ class BleDeviceIP22Charger(BleDevice):
         if parsed is None:
             return
 
+        self._last_full_telemetry_at = time.monotonic()
         self._publish(parsed)
         self._maybe_daily_refresh()
 

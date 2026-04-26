@@ -161,7 +161,7 @@ PIN) and returned a valid advertisement key.
   | `0x0200` | — | ✗ code 1 | ✗ code 1 | **not implemented on IP22** (Orion-TR uses this) |
   | `0x0201` | u8 | ✓ | ✗ code 3 | Device State (read-only) — `0x03=Bulk`, `0x04=Absorption`, etc. |
   | `0x0202` | — | ✗ code 1 | ✗ code 1 | **not implemented on IP22** (BlueSolar remote-control mask) |
-  | `0x0207` | u32 | ✓ | (no err) | Device off reason; write of `0x4` accepted but no observed effect |
+  | `0x0207` | u32 | ✓ | ✗ code 3 | Device off reason — read-only (re-probed Apr 2026) |
   | `0xEDF0` | u16 | ✓ | ✓ (clamped) | **Battery max current** in 0.1A; writes accepted but device clamps to ≥7.5A |
   | `0xEDF1` | u8 | ✓ | ✓ | Battery type; `0xFF`=USER unlocks voltage writes |
   | `0xEDF7` | u16 | ✓ | ✓ when `EDF1=USER` | Absorption voltage in 0.01V |
@@ -186,10 +186,36 @@ PIN) and returned a valid advertisement key.
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
   surface one — pending exploration.
-- **Charge-setpoint writes.** `/Link/ChargeVoltage`, `/Link/ChargeCurrent`,
-  `/Settings/ChargeCurrentLimit` are declared on the role service but
-  not yet wired through to the GATT writer.  Needed for DVCC parity
-  with the IP43 reference implementation.
+- **Charge-setpoint writes.** `/Settings/ChargeCurrentLimit` is now
+  wired through `BleDeviceIP22Charger._ip22_on_charge_current_limit_write`
+  → VREG `0xEDF0` (commit `aa7c137`).  Setting it to a value at or below
+  the firmware's hardware minimum (~7.5 A) clamps to that minimum rather
+  than turning the unit off — see "On/off mechanism" below.
+  `/Link/ChargeVoltage` / `/Link/ChargeCurrent` are still declared on the
+  role service but not yet wired; deferred until DVCC pulls actually
+  arrive against this driver.
+- **Short-frame "off" override.** Some IP22 firmwares interleave the
+  4-byte product-id beacon with the encrypted telemetry advertisement as
+  a power-saving rotation even while the charger is running.  An older
+  version of `handle_manufacturer_data` interpreted any short frame as a
+  hard "off" snapshot, which constantly clobbered live telemetry.  The
+  driver now keeps a `_last_full_telemetry_at` timestamp and only honours
+  the short frame as off-state once the IP22 has gone quiet for
+  `_OFF_FRAME_GRACE_S` (30 s).
+- **On/off mechanism (final answer).**  The IP22 firmware on the bench
+  unit (3.65, advertised as `0.162`) does not implement `0x0200`
+  (`DEVICE_MODE`) or `0x0202` (BlueSolar remote-control mask).  `0x0207`
+  (`DeviceOffReason`) is read-only (returns `09 00 19 02 07 03` for any
+  write).  No alternative writable on/off VREG was found over multiple
+  range probes (0x0000–0x02FF, 0x0E00–0x0FFF, 0xEC00–0xECFF,
+  0xEDA0–0xEDFF, 0x0140–0x017F).  Both the
+  [pvtex](https://github.com/pvtex/Victron_BlueSmart_IP22) and
+  [wasn-eu](https://github.com/wasn-eu/Victron_BlueSmart_IP22) reference
+  drivers come to the same conclusion: the only practical control over
+  IP22 BLE is the charge-current limit (`0xEDF0`), which is what this
+  driver exposes via `/Settings/ChargeCurrentLimit`.  `/Mode` remains
+  read-only; gui-v2 should rely on `/Capabilities/HasNoDeviceOffMode = 1`
+  if it gets exposed in a future revision.
 - **Marginal-RSSI pairing.** The second IP22 on the bench (F2:86, RSSI
   -80 dBm) consistently fails Pair() with `AuthenticationCanceled`.
   Moving it closer to the cerbo or using a USB BLE adapter with a
