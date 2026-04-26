@@ -127,6 +127,25 @@ PIN) and returned a valid advertisement key.
   the unit will show the write directly and is the clearly cheaper
   next step.
 
+  that the global tables are:
+
+    (3568 entries)
+  - `pathsByVreg`  = `QMultiHash<ushort, std::pair<Path*, int>>`
+    (1199 entries — keyed by VREG directly)
+    (1199 entries — name-keyed, not vreg-keyed despite the symbol)
+
+  (144-byte Spans: 128 ctrl bytes + Entry* + alloc/nextFree).  Walking
+  pathsByPath with 32-byte stride correctly yields path strings,
+  including all 14 SmartCharger paths we care about.  pathsByVreg's
+  per-entry layout for `QMultiHash<ushort, pair<Path*, int>>` did NOT
+  yield readable (vreg, Path*) pairs with strides 16/24/32 — Path*
+  values stored there are byte-distinct from the Path* values in
+  pathsByPath, so the cross-reference scan came up empty in some runs
+  and inconsistent in others.
+
+  A few more hours of either (a) Qt-6-internal layout reconstruction
+  HCI snoop log path is still strictly cheaper.
+
 - **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
   service, so no standard path exists.  A VREG enumeration pass may
   surface one — pending exploration.
