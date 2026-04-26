@@ -5,6 +5,30 @@ The IP22 is published as a standard `com.victronenergy.charger.*` D-Bus
 service that participates in the DVCC contract — `dbus-systemcalc-py`
 treats it the same as a USB-connected VE.Direct IP43 reference unit.
 
+## Identity, settings, and history
+
+- `/Serial` is populated lazily from the BlueZ-advertised name on first
+  publish (the encrypted advertisement payload doesn't carry a serial).
+  The `_SERIAL_TOKEN_RE` matches the standard Victron `HQ` prefix.
+- `/Settings/BatteryVoltage` is fixed per product id (`12 / 24 / 36 / 48 V`)
+  by parsing the `_IP22_PRODUCT_NAMES` model-spec string (`"... 12|30 (1)"`
+  → 12).
+- `/Settings/{ChargeCurrentLimit,AbsorptionVoltage,FloatVoltage}` are
+  writable on D-Bus and persisted to `com.victronenergy.settings` under
+  `/Settings/Devices/ip22_<mac>/{ChargeCurrentLimit,AbsorptionVoltage,FloatVoltage}`.
+  The role calls `BleDeviceIP22Charger.load_persisted_charger_settings()`
+  after `add_path()` so a Cerbo reboot restores the last-known values
+  onto the role-service paths without a fresh GATT round-trip (the
+  device retains its own copy across power cycles).
+- `/History/Cumulative/User/{OperationTime,ChargedAh}` are local
+  accumulators ticked from `_tick_history()` on every `_publish` /
+  `_publish_off_state` call.  OperationTime ticks while `/State` is in
+  `{3,4,5,6,7,247}` (bulk/abs/float/storage/eq/recond); ChargedAh
+  integrates positive `Dc/0/Current` over time.  Gaps longer than 600 s
+  (e.g. service restart) are discarded so we don't credit phantom
+  charging.  Values flush to settings every `_HISTORY_FLUSH_INTERVAL_S`
+  (60 s) so we don't beat up flash on the 1 Hz adv interval.
+
 ## DVCC contract (what makes this an integrated charger, not just a sensor)
 
 `dbus-systemcalc-py` writes onto the following paths to drive a charger;
@@ -13,7 +37,7 @@ two that map to writable VREGs through a per-device GATT write queue:
 
 | D-Bus path | Direction | IP22 backing |
 |---|---|---|
-| `/Link/NetworkStatus` | read | published (init `4` = stand-alone) |
+| `/Link/NetworkStatus` | read | published; flips between `4` (stand-alone) and `1` (DVCC active) when `/Link/NetworkMode != 0`, `/Settings/BmsPresent == 1`, or any `/Link/ChargeCurrent`/`/Link/ChargeVoltage` write arrives |
 | `/Link/NetworkMode` | write | stored only — IP22 has no consumer VREG |
 | `/Link/ChargeCurrent` | write | GATT → VREG `0xEDF0` (u16 LE, 0.1 A); 0.1 A deadband |
 | `/Link/ChargeVoltage` | write | GATT → VREG `0xEDF7` (u16 LE, 0.01 V); 0.05 V deadband |

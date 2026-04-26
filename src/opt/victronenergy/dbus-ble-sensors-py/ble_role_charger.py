@@ -58,6 +58,22 @@ class BleRoleCharger(BleRole):
             s.add_path("/DeviceOffReason", 0)
             s.add_path("/Relay/0/State", 0)
 
+            # /Serial — populated lazily on first telemetry tick from the
+            # advertised BlueZ name (the encrypted payload itself doesn't
+            # carry it).  Initial None lets vrmlogger / VRM cope with the
+            # unknown-yet state.
+            s.add_path("/Serial", None)
+
+            # /Settings/BatteryVoltage — fixed nominal voltage per
+            # product id (12 / 24 / 36 / 48 V).  Filled on first publish.
+            s.add_path("/Settings/BatteryVoltage", None)
+
+            # /History/Cumulative/User/{OperationTime,ChargedAh} —
+            # local accumulators backed by com.victronenergy.settings.
+            # Required for VRM history / energy charts.
+            s.add_path("/History/Cumulative/User/OperationTime", 0)
+            s.add_path("/History/Cumulative/User/ChargedAh", 0.0)
+
             # IP22 firmware does not implement VREG 0x0200; /Mode stays
             # read-only.  Tell gui-v2 not to expose a "Charger off" toggle
             # — the rotary switch on the front panel is the only off
@@ -76,10 +92,12 @@ class BleRoleCharger(BleRole):
 
             # /Link/NetworkMode: bitmask DVCC writes to indicate which
             # links are active (1=ext control, 2=ext voltage, 4=BMS, ...).
-            # We just store it; IP22 firmware has no consumer VREG.
-            s.add_path("/Link/NetworkMode", 0,
-                       writeable=True,
-                       onchangecallback=_bind("_ip22_on_link_passive_write"))
+            # We store the value AND flip /Link/NetworkStatus to reflect
+            # DVCC engagement; IP22 firmware itself has no consumer VREG.
+            s.add_path(
+                "/Link/NetworkMode", 0,
+                writeable=True,
+                onchangecallback=_bind("_ip22_on_link_network_mode_write"))
 
             # /Link/ChargeCurrent: target current pushed by DVCC (amps).
             # Wired to VREG 0xEDF0 with a 0.1 A deadband so steady-state
@@ -117,22 +135,46 @@ class BleRoleCharger(BleRole):
             s.add_path("/Link/VoltageSenseActive", 0)
 
             # /Settings/BmsPresent: DVCC writes 1 when a BMS is in the
-            # system.  Stored only — IP22 has no equivalent VREG.
-            s.add_path("/Settings/BmsPresent", 0,
-                       writeable=True,
-                       onchangecallback=_bind("_ip22_on_link_passive_write"))
+            # system.  Same NetworkStatus side-effect as /Link/NetworkMode.
+            s.add_path(
+                "/Settings/BmsPresent", 0,
+                writeable=True,
+                onchangecallback=_bind("_ip22_on_settings_bms_present_write"))
 
             # /Settings/ChargeCurrentLimit — writable via GATT 0xEDF0.
-            # The device clamps below ~7.5A to its hardware minimum.
             # Same VREG as /Link/ChargeCurrent above; both paths land at
             # 0xEDF0.  /Link/ChargeCurrent is the DVCC-side override,
-            # /Settings/ChargeCurrentLimit is the user-set cap.
-            if hasattr(ble, "_ip22_on_charge_current_limit_write"):
-                def on_ccl(_path, value):
-                    return ble._ip22_on_charge_current_limit_write(
-                        role_service, value)
-                s.add_path(
-                    "/Settings/ChargeCurrentLimit", None,
-                    writeable=True, onchangecallback=on_ccl)
-            else:
-                s.add_path("/Settings/ChargeCurrentLimit", None)
+            # /Settings/ChargeCurrentLimit is the user-set cap (gui-v2
+            # settings page).  Persisted to com.victronenergy.settings.
+            s.add_path(
+                "/Settings/ChargeCurrentLimit", None,
+                writeable=True,
+                onchangecallback=_bind("_ip22_on_charge_current_limit_write"))
+
+            # /Settings/AbsorptionVoltage — writable via GATT 0xEDF7
+            # (with automatic 0xEDF1=USER guard).  Persisted.
+            s.add_path(
+                "/Settings/AbsorptionVoltage", None,
+                writeable=True,
+                onchangecallback=_bind("_ip22_on_absorption_voltage_write"))
+
+            # /Settings/FloatVoltage — writable via GATT 0xEDF6
+            # (with automatic 0xEDF1=USER guard).  Persisted.
+            s.add_path(
+                "/Settings/FloatVoltage", None,
+                writeable=True,
+                onchangecallback=_bind("_ip22_on_float_voltage_write"))
+
+        # All paths created — pull any persisted /Settings/Devices/...
+        # values back into the role-service paths so a Cerbo reboot
+        # restores the user's configured values without a fresh GATT
+        # round-trip.
+        if hasattr(ble, "load_persisted_charger_settings"):
+            try:
+                ble.load_persisted_charger_settings(role_service)
+            except Exception:
+                # The role service is otherwise functional; missing
+                # persisted settings should not stop service registration.
+                import logging as _logging
+                _logging.exception(
+                    "ip22 charger: load_persisted_charger_settings failed")
