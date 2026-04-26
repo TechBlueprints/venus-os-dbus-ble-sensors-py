@@ -54,6 +54,14 @@ from victron_ble.exceptions import (  # type: ignore
 )
 
 from orion_tr_gatt import AsyncGATTWriter
+from ble_charger_common import (
+    ChargerCommonMixin,
+    CHARGE_CURRENT_DEADBAND_A,
+    CHARGE_VOLTAGE_DEADBAND_V,
+    bluez_device_name as _orion_bluez_device_name,
+    encode_u16_le_scaled,
+    serial_from_advertised_name as _orion_serial_from_advertised_name,
+)
 from orion_tr_key_settings import (
     advertisement_key_setting_path,
     get_advertisement_key,
@@ -72,7 +80,50 @@ logger = logging.getLogger(__name__)
 VICTRON_MANUFACTURER_ID = 0x02E1
 ORION_PRODUCT_ID_MIN = 0xA3C0
 ORION_PRODUCT_ID_MAX = 0xA3DF
+
+# VREGs verified by direct GATT probe (firmware 1.10 on bench unit
+# FF:13:42:2B:7A:4B, "Orion Smart 12V/24V-15A DC-DC Converter").
+#
+# Confirmed implemented:
+#   0x0100  product id (u32)
+#   0x0102  app version (u32)            firmware "1.10" -> 0x011700FF
+#   0x010C  long name + serial           tstr
+#   0x0200  DEVICE_MODE                  u8: 1 = ON, 4 = OFF (writable)
+#   0x0207  DEVICE_OFF_REASON            u32 flags (read-only on this fw)
+#   0xEDDB                                u16 LE; 26.90 V on bench
+#                                         (likely default absorption v
+#                                         for 24 V profile)
+#   0xEDE2                                u16 LE; 26.80 V on bench
+#                                         (likely default float v
+#                                         for 24 V profile)
+#   0xEDE9                                u16 LE; tracked the live
+#                                         /Dc/0/Voltage = 19.50 V — looks
+#                                         like the *active* output
+#                                         setpoint, not a stored config
+#   0xEDF1                                u8 = 0x00 (not USER) — battery
+#                                         type, same role as IP22 0xEDF1
+#   0xEDFE                                u8 = 0x00 (Adaptive mode)
+#   0xEDFB, 0xEDFC                        u16 LE; values 200, 1000
+#                                         (units / meaning unconfirmed)
+#
+# **Not yet mapped** to Orion-TR equivalents of the IP22 charge profile:
+#   - max-current setpoint (IP22 = 0xEDF0)
+#   - absorption-voltage setpoint (IP22 = 0xEDF7)
+#   - float-voltage setpoint (IP22 = 0xEDF6)
+#   - Charger / PSU function-select VREG
+#
+# Probe sweeps of 0xEDF0-0xEDFF returned no responses on this firmware,
+# suggesting the Orion-TR uses a different layout than the IP22 (likely
+# 0xEDDx / 0xEDEx given which VREGs *did* respond).  The constants
+# or a more thorough live probe — see also
+# sample-driver/research/IP22-CHARGER-BLE-PROTOCOL.md §10 for the
+# matching IP22 reference.
 VREG_DEVICE_MODE = 0x0200
+VREG_BATTERY_TYPE = 0xEDF1            # confirmed; same as IP22
+BATTERY_TYPE_USER = 0xFF
+VREG_BATTERY_MAX_CURRENT: Optional[int] = None  # TODO: live-probe
+VREG_ABSORPTION_VOLTAGE: Optional[int] = None   # TODO: live-probe
+VREG_FLOAT_VOLTAGE: Optional[int] = None        # TODO: live-probe
 
 # gui-v2 renders alternator units under "DC Sources" based on /ProductId:
 # a value >= 0xA3E0 is treated as "real alternator" and uses
@@ -303,8 +354,20 @@ def _bluez_device_name(dev_mac: str) -> Optional[str]:
         return None
     return None
 
-class BleDeviceOrionTR(BleDevice):
+class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
     """Orion-TR Smart DC-DC / buck-boost on encrypted Victron manufacturer data."""
+
+    # Used in /Settings/Devices/<ns>_<mac>/* paths (see ble_charger_common).
+    SETTINGS_NS_PREFIX = "orion_tr"
+
+    # /Settings/Devices/orion_tr_<mac>/<suffix> -> role-service path for
+    # values restored at service start.  The Orion-TR alternator role
+    # publishes the same three writable settings as the IP22 charger.
+    PERSISTED_SETTING_SUFFIXES_TO_PATHS = {
+        "ChargeCurrentLimit": "/Settings/ChargeCurrentLimit",
+        "AbsorptionVoltage":  "/Settings/AbsorptionVoltage",
+        "FloatVoltage":       "/Settings/FloatVoltage",
+    }
 
     @staticmethod
     def matches_manufacturer_data(manufacturer_data: bytes) -> bool:
@@ -325,6 +388,12 @@ class BleDeviceOrionTR(BleDevice):
         # "once per morning when in range" GATT read.
         self._last_daily_refresh_date: Optional[str] = None
         self._current_role_name: Optional[str] = None
+        # Cached battery-type byte; if it isn't already USER (0xFF)
+        # absorption / float voltage writes will be rejected on
+        # firmwares that gate those writes the way the IP22 does.
+        self._battery_type_is_user: Optional[bool] = None
+        # GATT queue / history / DVCC engagement / persistence state.
+        self._init_charger_common()
         super().__init__(dev_mac)
 
     # ------------------------------------------------------------------
@@ -685,6 +754,14 @@ class BleDeviceOrionTR(BleDevice):
     # ------------------------------------------------------------------
 
     def _publish(self, parsed) -> None:
+        # Lazily populate the BlueZ-derived serial once per process —
+        # the encrypted advertisement payload doesn't carry one.
+        if not self.info.get("serial"):
+            serial = _orion_serial_from_advertised_name(
+                _orion_bluez_device_name(self.info["dev_mac"]))
+            if serial:
+                self.info["serial"] = serial
+
         for role_service in list(self._role_services.values()):
             ble_svc = DbusBleService.get()
             if not ble_svc.is_device_role_enabled(
@@ -701,8 +778,20 @@ class BleDeviceOrionTR(BleDevice):
             model = parsed.get("model_name")
             if model and not model.startswith("<Unknown"):
                 role_service["/ProductName"] = model
-            role_service["/State"] = st
-            role_service["/ErrorCode"] = int(parsed["charger_error"])
+
+            err = int(parsed["charger_error"])
+            self._last_advertised_state = st
+            # Only the alternator role represents the device as a
+            # charger — DVCC is not a meaningful contract for the
+            # dcdc role (PSU mode), so suppress the /State=252
+            # override and the charger /Alarms/* there.
+            is_alternator = role_service.ble_role.NAME == "alternator"
+            if is_alternator:
+                role_service["/State"] = self._derive_published_state(st)
+                self._publish_alarms(role_service, err)
+            else:
+                role_service["/State"] = st
+            role_service["/ErrorCode"] = err
             role_service["/DeviceOffReason"] = int(parsed["off_reason"])
 
             # Keep /Mode in sync with the inferred mode, unless a write is
@@ -710,12 +799,29 @@ class BleDeviceOrionTR(BleDevice):
             if not self._mode_busy:
                 role_service["/Mode"] = 4 if st == 0 else 1
 
+            # /Serial — published on every role that declares it.
+            try:
+                if self.info.get("serial"):
+                    role_service["/Serial"] = self.info["serial"]
+            except KeyError:
+                pass
+
             # Force /ProductId to match the active service type.  gui-v2
             # keys its layout off /ProductId for alternator services.
-            if role_service.ble_role.NAME == "alternator":
+            if is_alternator:
                 role_service["/ProductId"] = ALTERNATOR_PRODUCT_ID
             else:
                 role_service["/ProductId"] = self.info["product_id"]
+
+            # History accumulators — alternator role only (charging
+            # context).  Tick from the *real* advertised state, not
+            # the EXTERNAL_CONTROL override.
+            if is_alternator:
+                # Orion-TR adv carries input/output voltage but not
+                # output current directly; pass None so ChargedAh
+                # only ticks once we have a real current source.
+                self._tick_history(state=st, current_a=None)
+                self._publish_history(role_service)
 
             role_service.connect()
 
@@ -754,6 +860,7 @@ class BleDeviceOrionTR(BleDevice):
             logger.error("%s: role %r not registered — keeping previous",
                          self._plog, new_role_name)
             return
+        logger.info("%s: building new role %r", self._plog, new_role_name)
         role = role_cls({})
         try:
             role.check_configuration()
@@ -761,12 +868,30 @@ class BleDeviceOrionTR(BleDevice):
             logger.exception("%s: role %r configuration invalid",
                              self._plog, new_role_name)
             return
-        role_service = DbusRoleService(self, role)
-        role_service.load_settings()
-        self._role_services[new_role_name] = role_service
-        DbusBleService.get().register_role_service(role_service)
+        try:
+            role_service = DbusRoleService(self, role)
+        except Exception:
+            logger.exception("%s: DbusRoleService(%r) construction failed",
+                             self._plog, new_role_name)
+            return
+        try:
+            role_service.load_settings()
+        except Exception:
+            logger.exception("%s: role %r load_settings (init) failed",
+                             self._plog, new_role_name)
+            return
+        try:
+            self._role_services[new_role_name] = role_service
+            DbusBleService.get().register_role_service(role_service)
+        except Exception:
+            logger.exception("%s: register_role_service(%r) failed",
+                             self._plog, new_role_name)
+            self._role_services.pop(new_role_name, None)
+            return
         self._current_role_name = new_role_name
         self.info["roles"] = {new_role_name: {}}
+        logger.info("%s: role swap to %r complete",
+                    self._plog, new_role_name)
 
     # ------------------------------------------------------------------
     # Mode write (GATT)
@@ -807,3 +932,73 @@ class BleDeviceOrionTR(BleDevice):
             on_done=on_done,
         )
         return True
+
+    # ------------------------------------------------------------------
+    # DVCC + user-facing setting writes (GATT, queued)
+    # ------------------------------------------------------------------
+    #
+    # The IP22 maps these to 0xEDF0 (current) and 0xEDF7 / 0xEDF6
+    # (voltage).  On the Orion-TR firmware on the bench unit those
+    # register addresses don't respond — the equivalents are somewhere
+    # else (probably in the 0xEDDx / 0xEDEx range based on which VREGs
+    # *did* respond to a probe sweep).  Until they're mapped, the
+    # handlers below validate the request, persist it to settings so
+    # gui-v2 / VRM still get a meaningful value, and log a warning
+    # rather than emitting a GATT write to an unknown register.
+
+    def _orion_persist_only_write(self, suffix: str, deadband: float,
+                                   last_attr: str, role_path: str,
+                                   value, value_min: float,
+                                   value_max: float) -> bool:
+        try:
+            new = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not (value_min <= new <= value_max):
+            return False
+        last = getattr(self, last_attr, None)
+        if last is not None and abs(new - last) < deadband:
+            self._persist_setting(suffix, new)
+            return True
+        setattr(self, last_attr, new)
+        self._persist_setting(suffix, new)
+        logger.warning(
+            "%s: %s=%.3f accepted on D-Bus / settings only — "
+            "Orion-TR-side VREG mapping is TODO; no GATT write emitted",
+            self._plog, role_path, new)
+        return True
+
+    def _orion_on_link_charge_current_write(self, role_service, value):
+        self._set_dvcc_engaged(role_service, True)
+        return self._orion_persist_only_write(
+            "ChargeCurrentLimit", CHARGE_CURRENT_DEADBAND_A,
+            "_last_pushed_charge_current_a", "/Link/ChargeCurrent",
+            value, 0.0, 1000.0)
+
+    def _orion_on_link_charge_voltage_write(self, role_service, value):
+        self._set_dvcc_engaged(role_service, True)
+        return self._orion_persist_only_write(
+            "AbsorptionVoltage", CHARGE_VOLTAGE_DEADBAND_V,
+            "_last_pushed_charge_voltage_v", "/Link/ChargeVoltage",
+            value, 0.0, 80.0)
+
+    def _orion_on_charge_current_limit_write(self, role_service, value):
+        return self._orion_persist_only_write(
+            "ChargeCurrentLimit", CHARGE_CURRENT_DEADBAND_A,
+            "_last_pushed_charge_current_a",
+            "/Settings/ChargeCurrentLimit",
+            value, 0.0, 1000.0)
+
+    def _orion_on_absorption_voltage_write(self, role_service, value):
+        return self._orion_persist_only_write(
+            "AbsorptionVoltage", CHARGE_VOLTAGE_DEADBAND_V,
+            "_last_pushed_charge_voltage_v",
+            "/Settings/AbsorptionVoltage",
+            value, 0.0, 80.0)
+
+    def _orion_on_float_voltage_write(self, role_service, value):
+        return self._orion_persist_only_write(
+            "FloatVoltage", CHARGE_VOLTAGE_DEADBAND_V,
+            "_last_pushed_charge_voltage_v",
+            "/Settings/FloatVoltage",
+            value, 0.0, 80.0)
