@@ -23,8 +23,10 @@ import os
 import struct
 import subprocess
 import threading
+
+from gi.repository import GLib
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import dbus
 
@@ -66,8 +68,25 @@ IP22_PRODUCT_ID_MAX = 0xA33F
 # device clamps writes below ~7.5A to the minimum hardware limit.
 #
 # /Mode on/off via the Orion-TR-style 0x0200 write is NOT viable here.
-VREG_BATTERY_MAX_CURRENT = 0xEDF0
+VREG_BATTERY_MAX_CURRENT = 0xEDF0   # u16 LE, 0.1 A
+VREG_BATTERY_TYPE        = 0xEDF1   # u8;  0xFF = USER (unlocks voltage writes)
+VREG_FLOAT_VOLTAGE       = 0xEDF6   # u16 LE, 0.01 V
+VREG_ABSORPTION_VOLTAGE  = 0xEDF7   # u16 LE, 0.01 V
 VREG_DEVICE_MODE = 0x0200    # legacy alias retained for back-compat in code paths
+
+# DVCC dedupe thresholds.  DVCC pushes /Link/ChargeVoltage and
+# /Link/ChargeCurrent on every cycle (~once per minute even when idle);
+# a GATT write costs ~3-5 s of pause-scan + connect + write + disconnect,
+# so we only round-trip a write when the request meaningfully differs
+# from what we last pushed.  Tolerances match what the IP22 itself can
+# resolve: 0.1 A and 0.01 V.
+_CHARGE_CURRENT_DEADBAND_A = 0.1
+_CHARGE_VOLTAGE_DEADBAND_V = 0.05
+
+# IP22 battery-type sentinel that unlocks user-defined absorption/float
+# voltage writes via 0xEDF7 / 0xEDF6.  Probed live: writes to 0xEDF7
+# return code 02 (param error) until 0xEDF1 == 0xFF.
+BATTERY_TYPE_USER = 0xFF
 
 # Known IP22 / Blue Smart model spec strings by product id.  Used when the
 # vendored ``victron_ble`` package's table doesn't cover a given SKU.
@@ -256,6 +275,24 @@ class BleDeviceIP22Charger(BleDevice):
         self._stored_key_invalid = False
         self._last_daily_refresh_date: Optional[str] = None
         self._last_full_telemetry_at: float = 0.0
+        # Last value we successfully pushed to the device for each writable
+        # DVCC link path.  Used to dedupe GATT writes when DVCC re-publishes
+        # the same setpoint on every cycle.
+        self._last_pushed_charge_current_a: Optional[float] = None
+        self._last_pushed_charge_voltage_v: Optional[float] = None
+        # Cached battery-type byte; if it isn't already USER (0xFF) the
+        # absorption-voltage write at 0xEDF7 will be rejected with code 02.
+        self._battery_type_is_user: Optional[bool] = None
+        # GATT write queue.  DVCC pushes /Link/ChargeCurrent and
+        # /Link/ChargeVoltage in quick succession; the shared
+        # AsyncGATTWriter has a single _busy flag and rejects concurrent
+        # writes, so we coalesce per-VREG requests in this slot map and
+        # drain them serially via _kick_pending_writes().  Mapping is
+        # ``vreg_id -> (value_bytes, on_complete)``; later writes to the
+        # same VREG before drain replace the slot — DVCC only cares about
+        # the most recent setpoint anyway.
+        self._pending_writes: dict[int, tuple[bytes, Optional[Callable]]] = {}
+        self._pending_drain_scheduled = False
         super().__init__(dev_mac)
 
     def configure(self, manufacturer_data: bytes):
@@ -664,4 +701,177 @@ class BleDeviceIP22Charger(BleDevice):
             value_bytes,
             on_done=on_done,
         )
+        return True
+
+    # ------------------------------------------------------------------
+    # DVCC integration — /Link/* writes pushed by dbus-systemcalc-py
+    # ------------------------------------------------------------------
+    #
+    # dbus-systemcalc-py pushes target setpoints onto a charger service via
+    # /Link/ChargeCurrent and /Link/ChargeVoltage and expects them to take
+    # effect on the hardware.  For IP22 we map:
+    #
+    #   /Link/ChargeCurrent  -> VREG 0xEDF0 (Battery max current,    0.1 A)
+    #   /Link/ChargeVoltage  -> VREG 0xEDF7 (Absorption voltage,     0.01 V)
+    #
+    # The other DVCC inputs (/Link/TemperatureSense, /Link/VoltageSense,
+    # /Link/BatteryCurrent, /Link/NetworkMode, /Settings/BmsPresent) are
+    # accepted on the role but only stored — IP22 firmware 3.65 has no
+    # writable VREG that consumes external sense or BMS-presence data, so
+    # we surface them on D-Bus for systemcalc to read back without trying
+    # to push them onto the wire.
+
+    # ------------------------------------------------------------------
+    # Per-device GATT write queue — collapses DVCC bursts and serialises
+    # writes against the single-slot AsyncGATTWriter.
+    # ------------------------------------------------------------------
+
+    _PENDING_DRAIN_INTERVAL_MS = 1500
+
+    def _enqueue_write(self, vreg: int, value_bytes: bytes,
+                       on_complete: Optional[Callable] = None) -> None:
+        # Newer write to the same VREG supersedes any pending one.  This
+        # is exactly what we want for DVCC-style continuous setpoints.
+        self._pending_writes[vreg] = (value_bytes, on_complete)
+        self._kick_pending_writes()
+
+    def _kick_pending_writes(self) -> None:
+        if not self._pending_writes:
+            return
+        writer = _gatt()
+        if writer.busy:
+            self._schedule_drain()
+            return
+
+        # Pop one slot and fire the underlying GATT write.  on_done
+        # reschedules the drain so the next pending VREG goes out next.
+        vreg, (value_bytes, on_complete) = next(
+            iter(self._pending_writes.items()))
+        del self._pending_writes[vreg]
+
+        mac = _format_mac_colons(self.info["dev_mac"])
+        pause_scanning(f"ip22 GATT write 0x{vreg:04X}")
+
+        def on_done(success: bool):
+            try:
+                if not success:
+                    logger.error("%s: GATT write 0x%04X failed",
+                                 self._plog, vreg)
+                if on_complete is not None:
+                    try:
+                        on_complete(success)
+                    except Exception:
+                        logger.exception(
+                            "%s: pending-write completion callback failed",
+                            self._plog)
+            finally:
+                resume_scanning(f"ip22 GATT write 0x{vreg:04X}")
+                self._schedule_drain()
+
+        writer.write_register(
+            mac, self._pairing_passkey,
+            vreg, value_bytes,
+            on_done=on_done,
+        )
+
+    def _schedule_drain(self) -> None:
+        if self._pending_drain_scheduled or not self._pending_writes:
+            return
+        self._pending_drain_scheduled = True
+
+        def _on_drain_tick():
+            self._pending_drain_scheduled = False
+            try:
+                self._kick_pending_writes()
+            except Exception:
+                logger.exception("%s: pending-write drain tick failed",
+                                 self._plog)
+            return False  # one-shot
+
+        GLib.timeout_add(self._PENDING_DRAIN_INTERVAL_MS, _on_drain_tick)
+
+    # ------------------------------------------------------------------
+    # /Link/ChargeCurrent — DVCC target current → VREG 0xEDF0
+    # ------------------------------------------------------------------
+
+    def _ip22_on_link_charge_current_write(self,
+                                            role_service: DbusRoleService,
+                                            value_amps) -> bool:
+        try:
+            new_a = float(value_amps)
+        except (TypeError, ValueError):
+            return False
+        if new_a < 0 or new_a > 1000:
+            return False
+        last = self._last_pushed_charge_current_a
+        if last is not None and abs(new_a - last) < _CHARGE_CURRENT_DEADBAND_A:
+            return True
+        tenths = int(round(new_a * 10))
+        if tenths < 0 or tenths > 0xFFFF:
+            return False
+        value_bytes = bytes([tenths & 0xFF, (tenths >> 8) & 0xFF])
+
+        def on_done(success: bool):
+            if success:
+                self._last_pushed_charge_current_a = new_a
+
+        self._enqueue_write(VREG_BATTERY_MAX_CURRENT, value_bytes,
+                            on_complete=on_done)
+        return True
+
+    # ------------------------------------------------------------------
+    # /Link/ChargeVoltage — DVCC target voltage → VREG 0xEDF7
+    # ------------------------------------------------------------------
+
+    def _ip22_on_link_charge_voltage_write(self,
+                                            role_service: DbusRoleService,
+                                            value_volts) -> bool:
+        try:
+            new_v = float(value_volts)
+        except (TypeError, ValueError):
+            return False
+        if new_v <= 0 or new_v > 80:
+            return False
+        last = self._last_pushed_charge_voltage_v
+        if last is not None and abs(new_v - last) < _CHARGE_VOLTAGE_DEADBAND_V:
+            return True
+        centivolts = int(round(new_v * 100))
+        if centivolts < 0 or centivolts > 0xFFFF:
+            return False
+        value_bytes = bytes([centivolts & 0xFF, (centivolts >> 8) & 0xFF])
+
+        # 0xEDF7 only accepts writes once the battery-type sentinel
+        # 0xEDF1 == 0xFF (USER) has been set; queue that first whenever we
+        # haven't confirmed the cache.  The drain runs serialised so the
+        # USER write completes before the voltage write goes out.
+        if self._battery_type_is_user is not True:
+            def on_user_set(success: bool):
+                if success:
+                    self._battery_type_is_user = True
+                else:
+                    logger.error(
+                        "%s: GATT BatteryType=USER write failed",
+                        self._plog)
+            self._enqueue_write(
+                VREG_BATTERY_TYPE, bytes([BATTERY_TYPE_USER]),
+                on_complete=on_user_set,
+            )
+
+        def on_voltage_set(success: bool):
+            if success:
+                self._last_pushed_charge_voltage_v = new_v
+
+        self._enqueue_write(VREG_ABSORPTION_VOLTAGE, value_bytes,
+                            on_complete=on_voltage_set)
+        return True
+
+    @staticmethod
+    def _ip22_on_link_passive_write(_role_service: DbusRoleService,
+                                    _value) -> bool:
+        # Generic "store on D-Bus, no GATT" handler used for
+        # /Link/TemperatureSense, /Link/VoltageSense, /Link/BatteryCurrent,
+        # /Link/NetworkMode and /Settings/BmsPresent.  Returning True
+        # signals the D-Bus layer to commit the value on the path so DVCC
+        # can read it back; we don't push it to the IP22 over GATT because
+        # this firmware exposes no consumer VREG for the sense inputs.
         return True

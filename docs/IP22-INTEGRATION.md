@@ -1,9 +1,45 @@
 # Blue Smart IP22 Charger BLE Integration
 
-Status: **first working pass landed on `feature/ip22-smart-charger`.**
+Status: **integrated-charger pass landed on `feature/ip22-smart-charger`.**
 The IP22 is published as a standard `com.victronenergy.charger.*` D-Bus
-service, decoding live telemetry from encrypted Victron advertisements
-and accepting on/off writes through a paired GATT session.
+service that participates in the DVCC contract — `dbus-systemcalc-py`
+treats it the same as a USB-connected VE.Direct IP43 reference unit.
+
+## DVCC contract (what makes this an integrated charger, not just a sensor)
+
+`dbus-systemcalc-py` writes onto the following paths to drive a charger;
+the role service exposes all of them and the IP22 BLE driver wires the
+two that map to writable VREGs through a per-device GATT write queue:
+
+| D-Bus path | Direction | IP22 backing |
+|---|---|---|
+| `/Link/NetworkStatus` | read | published (init `4` = stand-alone) |
+| `/Link/NetworkMode` | write | stored only — IP22 has no consumer VREG |
+| `/Link/ChargeCurrent` | write | GATT → VREG `0xEDF0` (u16 LE, 0.1 A); 0.1 A deadband |
+| `/Link/ChargeVoltage` | write | GATT → VREG `0xEDF7` (u16 LE, 0.01 V); 0.05 V deadband |
+| `/Link/TemperatureSense` | write | stored only |
+| `/Link/VoltageSense` | write | stored only |
+| `/Link/BatteryCurrent` | write | stored only |
+| `/Settings/BmsPresent` | write | stored only |
+| `/Settings/ChargeCurrentLimit` | write | GATT → VREG `0xEDF0` (user-set cap; same VREG as the DVCC override) |
+| `/Mode` | read | fixed `1`; see "On/off mechanism" below |
+| `/Capabilities/HasNoDeviceOffMode` | read | `1` — gui-v2 hides the "Charger off" toggle |
+
+Voltage writes on the IP22 require `VREG 0xEDF1` (battery type) to be
+`0xFF` (USER); otherwise `0xEDF7` rejects with ack code `02`.  The
+driver flips that sentinel transparently on the first `/Link/ChargeVoltage`
+write and caches the success so subsequent voltage updates skip the
+extra round-trip.
+
+The `_pending_writes` slot map in `BleDeviceIP22Charger` collapses
+DVCC's once-per-cycle re-publish into a single per-VREG outstanding
+write, then drains them serially through the shared single-slot
+`AsyncGATTWriter`.  Steady-state DVCC traffic where every cycle pushes
+the same setpoint produces zero GATT round-trips after the initial
+push (verified live: three consecutive `/Link/ChargeCurrent=22.5` +
+`/Link/ChargeVoltage=14.4` SetValue calls produced no GATT writes; a
+follow-up `24.0 / 14.6` produced exactly two writes: `0xEDF0=f000` and
+`0xEDF7=b405`, with the cached USER battery type skipping `0xEDF1`).
 
 ## Device model
 
