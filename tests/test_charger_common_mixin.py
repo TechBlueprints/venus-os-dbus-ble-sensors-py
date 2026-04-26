@@ -152,12 +152,71 @@ def test_tick_history_negative_current_does_not_subtract(subject):
     # Negative current does NOT decrement ChargedAh.
     assert subject._history_charged_ah == 0.0
 
-def test_publish_history_writes_role_paths(subject, fake_role):
+def test_publish_history_writes_op_time_always(subject, fake_role):
     subject._history_op_time_s = 3600.5
-    subject._history_charged_ah = 12.34
     subject._publish_history(fake_role)
+    # OperationTime always ticks even on devices with no current data.
     assert fake_role.values["/History/Cumulative/User/OperationTime"] == 3600
-    assert fake_role.values["/History/Cumulative/User/ChargedAh"] == 12.34
+
+def test_publish_history_skips_charged_ah_until_current_seen(
+        subject, fake_role):
+    """Regression guard for the Orion-TR honesty fix.
+
+    The Orion-TR's DcDcConverterData decoder doesn't expose output
+    current — _tick_history is called with current_a=None forever.
+    /ChargedAh must NOT be written to D-Bus in that case, so the role's
+    declared default (None) shows through and gui-v2 renders "--"
+    rather than misleadingly charting 0 Ah.
+    """
+    # Simulate many ticks with no current data — must never set
+    # _history_has_current_data and never write /ChargedAh.
+    subject._tick_history(state=3, current_a=None)
+    import time as _t
+    subject._history_last_tick = _t.monotonic() - 5.0
+    subject._tick_history(state=3, current_a=None)
+    assert subject._history_has_current_data is False
+
+    subject._publish_history(fake_role)
+    assert "/History/Cumulative/User/OperationTime" in fake_role.values
+    assert "/History/Cumulative/User/ChargedAh" not in fake_role.values
+
+def test_publish_history_writes_charged_ah_after_first_real_current(
+        subject, fake_role):
+    """IP22-side path: as soon as we get a real current reading the
+    flag flips and /ChargedAh starts being published, even on later
+    ticks where current=None."""
+    subject._tick_history(state=3, current_a=None)
+    import time as _t
+    subject._history_last_tick = _t.monotonic() - 1.0
+    subject._tick_history(state=3, current_a=10.0)
+    assert subject._history_has_current_data is True
+
+    subject._history_op_time_s = 60.0
+    subject._history_charged_ah = 0.5
+    subject._publish_history(fake_role)
+    assert fake_role.values["/History/Cumulative/User/ChargedAh"] == 0.5
+
+    # Even after going back to None, /ChargedAh continues to publish
+    # the latest accumulated value.  The flag is sticky.
+    subject._history_last_tick = _t.monotonic() - 2.0
+    subject._tick_history(state=3, current_a=None)
+    fake_role.values.pop("/History/Cumulative/User/ChargedAh", None)
+    subject._publish_history(fake_role)
+    assert fake_role.values.get(
+        "/History/Cumulative/User/ChargedAh") == 0.5
+
+def test_publish_history_skips_charged_ah_settings_flush_too(
+        subject, fake_role, fake_settings):
+    """The persisted settings entry for ChargedAh must also be skipped
+    when the device hasn't seen current — otherwise we'd persist a
+    bogus 0 that survives a service restart."""
+    subject._history_last_flush = 0.0  # force flush window
+    subject._tick_history(state=3, current_a=None)
+    subject._publish_history(fake_role)
+    op_path = "/Settings/Devices/test_aabbccddeeff/History/OperationTime"
+    ah_path = "/Settings/Devices/test_aabbccddeeff/History/ChargedAh"
+    assert op_path in fake_settings.values
+    assert ah_path not in fake_settings.values
 
 def test_publish_history_throttles_settings_flush(subject, fake_role,
                                                    fake_settings):

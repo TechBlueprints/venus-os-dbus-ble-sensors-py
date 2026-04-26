@@ -87,11 +87,17 @@ class BleRoleAlternator(BleRole):
             # stays None and gui-v2 falls back to its detection.
             s.add_path("/Settings/BatteryVoltage", None)
 
-            # /History/Cumulative/User/{OperationTime,ChargedAh} —
-            # local accumulators backed by com.victronenergy.settings.
-            # Required for VRM history / energy charts.
+            # /History/Cumulative/User/OperationTime — ticks while the
+            # device is in a charging state.  Backed by
+            # com.victronenergy.settings.
             s.add_path("/History/Cumulative/User/OperationTime", 0)
-            s.add_path("/History/Cumulative/User/ChargedAh", 0.0)
+            # /History/Cumulative/User/ChargedAh — initial *None*
+            # because the Orion-TR's encrypted advertisement does not
+            # carry output current.  ChargerCommonMixin._publish_history
+            # only writes this path when it has seen real current data,
+            # so the value stays None and gui-v2 / VRM render it as
+            # "--" rather than misleadingly charting 0 Ah.
+            s.add_path("/History/Cumulative/User/ChargedAh", None)
 
             # /Alarms/* — charger's own failure modes only.  Battery
             # state belongs on a battery-monitor / BMS, not here.

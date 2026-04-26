@@ -68,11 +68,15 @@ class BleRoleCharger(BleRole):
             # product id (12 / 24 / 36 / 48 V).  Filled on first publish.
             s.add_path("/Settings/BatteryVoltage", None)
 
-            # /History/Cumulative/User/{OperationTime,ChargedAh} —
-            # local accumulators backed by com.victronenergy.settings.
-            # Required for VRM history / energy charts.
+            # /History/Cumulative/User/OperationTime — ticks while in
+            # a charging state.  Backed by com.victronenergy.settings.
             s.add_path("/History/Cumulative/User/OperationTime", 0)
-            s.add_path("/History/Cumulative/User/ChargedAh", 0.0)
+            # /History/Cumulative/User/ChargedAh — initial *None* until
+            # we've actually seen a current reading.  IP22's encrypted
+            # advertisement carries output_current1 so this fills in on
+            # the first telemetry tick.  See ChargerCommonMixin
+            # _history_has_current_data for the lazy-publish gate.
+            s.add_path("/History/Cumulative/User/ChargedAh", None)
 
             # /Alarms/* — charger-side alarms only (the charger's *own*
             # failure modes).  Severity 0=ok, 1=warning, 2=alarm.

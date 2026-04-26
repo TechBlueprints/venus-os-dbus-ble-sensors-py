@@ -73,9 +73,17 @@ class BleRoleDcdc(BleRole):
             # /Settings/BatteryVoltage — derived from the model name.
             s.add_path("/Settings/BatteryVoltage", None)
 
-            # /History/Cumulative/User/{OperationTime,ChargedAh}
+            # /History/Cumulative/User/OperationTime — ticks while the
+            # device is in a charging state (won't accumulate during
+            # PSU mode where /State = 11).
             s.add_path("/History/Cumulative/User/OperationTime", 0)
-            s.add_path("/History/Cumulative/User/ChargedAh", 0.0)
+            # /History/Cumulative/User/ChargedAh — initial *None* because
+            # the Orion-TR's encrypted advertisement does not carry
+            # current data.  The mixin only writes this path when it
+            # has seen a real (non-None) current reading, so the value
+            # stays None and gui-v2 / VRM render it as "--" rather than
+            # misleadingly charting 0 Ah.
+            s.add_path("/History/Cumulative/User/ChargedAh", None)
 
             # Charger-side alarms (own failure modes only).
             s.add_path("/Alarms/HighTemperature", 0)

@@ -322,6 +322,14 @@ class ChargerCommonMixin:
         self._history_charged_ah: float = 0.0
         self._history_last_tick: Optional[float] = None
         self._history_last_flush: float = 0.0
+        # Flag flipped True the first time _tick_history sees a real
+        # (non-None) current reading — used by _publish_history to
+        # decide whether to write /ChargedAh.  The Orion-TR's
+        # encrypted advertisement doesn't carry current, so its history
+        # accumulator never sees a real value and /ChargedAh stays at
+        # its initial role-declared value (None) — which gui-v2 / VRM
+        # render as "unknown" rather than "the user charged 0 Ah".
+        self._history_has_current_data = False
 
         # DVCC dedupe state — last value we successfully GATT-pushed.
         self._last_pushed_charge_current_a: Optional[float] = None
@@ -442,14 +450,22 @@ class ChargerCommonMixin:
             return
         if state in HISTORY_TICK_STATES:
             self._history_op_time_s += dt
-        if current_a is not None and current_a > 0.0:
-            self._history_charged_ah += (current_a * dt) / 3600.0
+        if current_a is not None:
+            self._history_has_current_data = True
+            if current_a > 0.0:
+                self._history_charged_ah += (current_a * dt) / 3600.0
 
     def _publish_history(self, role_service) -> None:
         role_service["/History/Cumulative/User/OperationTime"] = int(
             self._history_op_time_s)
-        role_service["/History/Cumulative/User/ChargedAh"] = round(
-            self._history_charged_ah, 2)
+        # Only write /ChargedAh if we've actually seen current data —
+        # see _history_has_current_data note in _init_charger_common.
+        # Devices whose advertisement decoder doesn't expose current
+        # (e.g. Orion-TR Smart) leave the path at its declared default
+        # (None), which gui-v2 renders as "--" rather than "0 Ah".
+        if self._history_has_current_data:
+            role_service["/History/Cumulative/User/ChargedAh"] = round(
+                self._history_charged_ah, 2)
 
         now = time.monotonic()
         if now - self._history_last_flush < HISTORY_FLUSH_INTERVAL_S:
@@ -458,8 +474,9 @@ class ChargerCommonMixin:
         try:
             self._persist_setting("History/OperationTime",
                                   float(self._history_op_time_s))
-            self._persist_setting("History/ChargedAh",
-                                  float(self._history_charged_ah))
+            if self._history_has_current_data:
+                self._persist_setting("History/ChargedAh",
+                                      float(self._history_charged_ah))
         except Exception:
             logger.exception("%s: history flush failed", self._plog)
 
