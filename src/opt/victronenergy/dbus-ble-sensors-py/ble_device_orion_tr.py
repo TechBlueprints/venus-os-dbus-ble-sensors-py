@@ -119,11 +119,25 @@ ORION_PRODUCT_ID_MAX = 0xA3DF
 # sample-driver/research/IP22-CHARGER-BLE-PROTOCOL.md §10 for the
 # matching IP22 reference.
 VREG_DEVICE_MODE = 0x0200
-VREG_BATTERY_TYPE = 0xEDF1            # confirmed; same as IP22
+# Charge-profile VREGs — mapped via direct GATT write/read probes on the
+# bench unit (FF:13:42:2B:7A:4B, firmware 1.10).  Layout matches the
+# IP22 charger here, including the USER battery-type gate that voltage
+# writes are conditioned on.
+VREG_BATTERY_TYPE       = 0xEDF1   # u8;  0xFF = USER (unlocks voltage writes)
+VREG_FLOAT_VOLTAGE      = 0xEDF6   # u16 LE, 0.01 V (write-probe: 27.10 V took)
+VREG_ABSORPTION_VOLTAGE = 0xEDF7   # u16 LE, 0.01 V (write-probe: 28.50 V took)
 BATTERY_TYPE_USER = 0xFF
-VREG_BATTERY_MAX_CURRENT: Optional[int] = None  # TODO: live-probe
-VREG_ABSORPTION_VOLTAGE: Optional[int] = None   # TODO: live-probe
-VREG_FLOAT_VOLTAGE: Optional[int] = None        # TODO: live-probe
+# Max-current VREG: probed exhaustively (0xEDF0, 0xEDF8-0xEDFF, 0xEDD0-
+# 0xEDEE) — Orion-TR firmware 1.10 returns ack code 1 (unknown register)
+# for 0xEDF0 (the IP22's charge-current VREG) and exposes no equivalent
+# at any tested address.  The hardware max is fixed by the model
+# "Current limit" field maps somewhere we haven't located.  Until found,
+# /Settings/ChargeCurrentLimit and /Link/ChargeCurrent are persisted to
+# settings and surfaced on D-Bus, but no GATT write is emitted — see
+# _orion_persist_only_write below.  The DVCC stop-charging mechanism
+# (drop /Link/ChargeVoltage to <= battery resting V) goes through
+# 0xEDF7, which IS wired, so BMS control still works end-to-end.
+VREG_BATTERY_MAX_CURRENT: Optional[int] = None  # TODO: locate on this firmware
 
 # gui-v2 renders alternator units under "DC Sources" based on /ProductId:
 # a value >= 0xA3E0 is treated as "real alternator" and uses
@@ -937,19 +951,69 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
     # DVCC + user-facing setting writes (GATT, queued)
     # ------------------------------------------------------------------
     #
-    # The IP22 maps these to 0xEDF0 (current) and 0xEDF7 / 0xEDF6
-    # (voltage).  On the Orion-TR firmware on the bench unit those
-    # register addresses don't respond — the equivalents are somewhere
-    # else (probably in the 0xEDDx / 0xEDEx range based on which VREGs
-    # *did* respond to a probe sweep).  Until they're mapped, the
-    # handlers below validate the request, persist it to settings so
-    # gui-v2 / VRM still get a meaningful value, and log a warning
-    # rather than emitting a GATT write to an unknown register.
+    # Same VREG layout as the IP22 for the two voltage setpoints
+    # (0xEDF7 absorption, 0xEDF6 float), gated on 0xEDF1 = USER (0xFF).
+    # The max-current VREG (IP22 = 0xEDF0) is *not* implemented on this
+    # firmware — see the note at the top of the file.  ChargeCurrent /
+    # ChargeCurrentLimit handlers therefore persist to settings without
+    # emitting a GATT write; the BMS off-mechanism (drop ChargeVoltage)
+    # remains fully wired through 0xEDF7.
+
+    def _orion_ensure_battery_type_user(self) -> None:
+        if self._battery_type_is_user is True:
+            return
+
+        def _on_user_set(success: bool):
+            if success:
+                self._battery_type_is_user = True
+            else:
+                logger.error(
+                    "%s: GATT BatteryType=USER write failed", self._plog)
+
+        self._enqueue_write(
+            VREG_BATTERY_TYPE, bytes([BATTERY_TYPE_USER]),
+            on_complete=_on_user_set,
+        )
+
+    def _orion_voltage_write(self, vreg: int, value_volts,
+                              suffix: str, role_path: str) -> bool:
+        """Shared body for /Link/ChargeVoltage, /Settings/AbsorptionVoltage,
+        and /Settings/FloatVoltage on the Orion-TR.  Validates, dedupes,
+        ensures the USER battery-type guard, and queues the GATT write
+        — same shape as the IP22 voltage handlers."""
+        try:
+            new_v = float(value_volts)
+        except (TypeError, ValueError):
+            return False
+        if new_v <= 0 or new_v > 80:
+            return False
+        last = self._last_pushed_charge_voltage_v
+        if last is not None and abs(new_v - last) < CHARGE_VOLTAGE_DEADBAND_V:
+            self._persist_setting(suffix, new_v)
+            return True
+        value_bytes = encode_u16_le_scaled(new_v, 100)
+        if value_bytes is None:
+            return False
+        self._orion_ensure_battery_type_user()
+
+        def on_done(success: bool):
+            if success:
+                self._last_pushed_charge_voltage_v = new_v
+                self._persist_setting(suffix, new_v)
+
+        self._enqueue_write(vreg, value_bytes, on_complete=on_done)
+        return True
 
     def _orion_persist_only_write(self, suffix: str, deadband: float,
                                    last_attr: str, role_path: str,
                                    value, value_min: float,
-                                   value_max: float) -> bool:
+                                   value_max: float,
+                                   reason: str) -> bool:
+        """Used for ChargeCurrent paths until we locate the Orion-TR's
+        max-current VREG (IP22's 0xEDF0 is unknown on this firmware).
+        Validates, dedupes, persists to settings, and logs once at
+        warning level so it's clear the value is captured but not
+        pushed to the wire."""
         try:
             new = float(value)
         except (TypeError, ValueError):
@@ -962,43 +1026,46 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
             return True
         setattr(self, last_attr, new)
         self._persist_setting(suffix, new)
-        logger.warning(
-            "%s: %s=%.3f accepted on D-Bus / settings only — "
-            "Orion-TR-side VREG mapping is TODO; no GATT write emitted",
-            self._plog, role_path, new)
+        logger.warning("%s: %s=%.3f stored — %s", self._plog,
+                       role_path, new, reason)
         return True
 
+    # /Link/ChargeCurrent — DVCC envelope.  Persist-only until the
+    # Orion-TR max-current VREG is mapped (see file header).
     def _orion_on_link_charge_current_write(self, role_service, value):
         self._set_dvcc_engaged(role_service, True)
         return self._orion_persist_only_write(
             "ChargeCurrentLimit", CHARGE_CURRENT_DEADBAND_A,
             "_last_pushed_charge_current_a", "/Link/ChargeCurrent",
-            value, 0.0, 1000.0)
+            value, 0.0, 1000.0,
+            "Orion-TR max-current VREG not yet located on this firmware "
+            "— BMS off-mechanism uses /Link/ChargeVoltage which IS wired")
 
+    # /Link/ChargeVoltage — DVCC primary lever.  GATT-wired to 0xEDF7.
     def _orion_on_link_charge_voltage_write(self, role_service, value):
         self._set_dvcc_engaged(role_service, True)
-        return self._orion_persist_only_write(
-            "AbsorptionVoltage", CHARGE_VOLTAGE_DEADBAND_V,
-            "_last_pushed_charge_voltage_v", "/Link/ChargeVoltage",
-            value, 0.0, 80.0)
+        return self._orion_voltage_write(
+            VREG_ABSORPTION_VOLTAGE, value,
+            "AbsorptionVoltage", "/Link/ChargeVoltage")
 
+    # /Settings/ChargeCurrentLimit — user-set cap.  Persist-only.
     def _orion_on_charge_current_limit_write(self, role_service, value):
         return self._orion_persist_only_write(
             "ChargeCurrentLimit", CHARGE_CURRENT_DEADBAND_A,
             "_last_pushed_charge_current_a",
             "/Settings/ChargeCurrentLimit",
-            value, 0.0, 1000.0)
+            value, 0.0, 1000.0,
+            "Orion-TR max-current VREG not yet located on this firmware")
 
+    # /Settings/AbsorptionVoltage — GATT-wired to 0xEDF7 (same VREG as
+    # /Link/ChargeVoltage; user-set vs DVCC-set converge on the wire).
     def _orion_on_absorption_voltage_write(self, role_service, value):
-        return self._orion_persist_only_write(
-            "AbsorptionVoltage", CHARGE_VOLTAGE_DEADBAND_V,
-            "_last_pushed_charge_voltage_v",
-            "/Settings/AbsorptionVoltage",
-            value, 0.0, 80.0)
+        return self._orion_voltage_write(
+            VREG_ABSORPTION_VOLTAGE, value,
+            "AbsorptionVoltage", "/Settings/AbsorptionVoltage")
 
+    # /Settings/FloatVoltage — GATT-wired to 0xEDF6.
     def _orion_on_float_voltage_write(self, role_service, value):
-        return self._orion_persist_only_write(
-            "FloatVoltage", CHARGE_VOLTAGE_DEADBAND_V,
-            "_last_pushed_charge_voltage_v",
-            "/Settings/FloatVoltage",
-            value, 0.0, 80.0)
+        return self._orion_voltage_write(
+            VREG_FLOAT_VOLTAGE, value,
+            "FloatVoltage", "/Settings/FloatVoltage")
