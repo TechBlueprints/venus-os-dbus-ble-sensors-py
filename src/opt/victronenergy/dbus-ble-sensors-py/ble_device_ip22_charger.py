@@ -114,6 +114,45 @@ def _settings_history_charged_ah_path(dev_mac: str) -> str:
 # beating up flash every advertisement (advertising interval is ~1 s).
 _HISTORY_FLUSH_INTERVAL_S = 60.0
 
+# ChargerError -> /Alarms/* mapping.  Only the codes that map to a real
+# *charger-side* alarm path are listed; the rest stay visible through
+# /ErrorCode and gui-v2's ChargerError::getDescription() text.
+#
+# Severity: 0 = OK, 1 = Warning, 2 = Alarm (Venus convention).
+# Low-battery-temperature is a *warning* because the charger has
+# proactively protected the cells; high-temperature/over-voltage/ripple
+# are real alarms.
+#
+# Battery-monitor / inverter alarms (LowVoltage, LowSoc, Overload,
+# Ripple, LoadDisconnect, VecanDisconnected) are intentionally absent —
+# they are not properties of an AC charger.
+_CHARGER_ALARM_PATHS: tuple[str, ...] = (
+    "/Alarms/HighTemperature",
+    "/Alarms/HighBatteryTemperature",
+    "/Alarms/LowBatteryTemperature",
+    "/Alarms/HighVoltage",
+    "/Alarms/HighRipple",
+    "/Alarms/Fan",
+)
+# Map: charger_error_code -> {alarm_path: severity}
+_CHARGER_ERROR_TO_ALARMS: dict[int, dict[str, int]] = {
+    1:  {"/Alarms/HighBatteryTemperature": 2},
+    2:  {"/Alarms/HighVoltage": 2},
+    11: {"/Alarms/HighRipple": 2},
+    14: {"/Alarms/LowBatteryTemperature": 1},
+    17: {"/Alarms/HighTemperature": 2},
+    22: {"/Alarms/HighTemperature": 2},
+    23: {"/Alarms/HighTemperature": 2},
+    24: {"/Alarms/Fan": 2},
+    26: {"/Alarms/HighTemperature": 2},
+}
+
+def _alarms_for_error(error_code: int) -> dict[str, int]:
+    """Return the {path: severity} dict to apply for a ChargerError code.
+    Paths not present in the result should be cleared to 0 by the
+    caller — that's how an alarm de-asserts when the error goes away."""
+    return _CHARGER_ERROR_TO_ALARMS.get(int(error_code), {})
+
 # Known IP22 / Blue Smart model spec strings by product id.  Used when the
 # vendored ``victron_ble`` package's table doesn't cover a given SKU.
 _IP22_PRODUCT_NAMES = {
@@ -691,6 +730,10 @@ class BleDeviceIP22Charger(BleDevice):
                 role_service["/Settings/BatteryVoltage"] = battery_v
             if self.info.get("serial"):
                 role_service["/Serial"] = self.info["serial"]
+            # Off-state by definition can't have charger-side alarms;
+            # clear all of them so a stale alarm from before the unit
+            # was switched off doesn't linger.
+            self._publish_alarms(role_service, 0)
             self._publish_history(role_service)
             role_service.connect()
 
@@ -725,7 +768,9 @@ class BleDeviceIP22Charger(BleDevice):
                 role_service["/ProductName"] = model
             role_service["/ProductId"] = self.info["product_id"]
             role_service["/State"] = st
-            role_service["/ErrorCode"] = int(parsed["charger_error"])
+            err = int(parsed["charger_error"])
+            role_service["/ErrorCode"] = err
+            self._publish_alarms(role_service, err)
 
             # /Serial — populated lazily from the BlueZ-advertised name on
             # first telemetry tick (the encrypted payload itself doesn't
@@ -1188,6 +1233,27 @@ class BleDeviceIP22Charger(BleDevice):
         # ChargedAh: integrate positive current.
         if current_a is not None and current_a > 0.0:
             self._history_charged_ah += (current_a * dt) / 3600.0
+
+    def _publish_alarms(self,
+                        role_service: DbusRoleService,
+                        error_code: int) -> None:
+        """Translate the current ChargerError code into the charger-side
+        /Alarms/* paths, clearing any path that the new error doesn't
+        assert.  This keeps gui-v2's notification panel honest: when the
+        underlying condition goes away, the alarm de-asserts, and the
+        /ErrorCode int still tells the full story for everything else
+        (over-current, bulk-time, internal hardware faults)."""
+        active = _alarms_for_error(error_code)
+        for path in _CHARGER_ALARM_PATHS:
+            severity = active.get(path, 0)
+            try:
+                if role_service[path] != severity:
+                    role_service[path] = severity
+            except KeyError:
+                # Path not registered (shouldn't happen — declared in
+                # ble_role_charger.py) — log once and move on.
+                logger.debug("%s: alarm path %s missing from role",
+                             self._plog, path)
 
     def _publish_history(self, role_service: DbusRoleService) -> None:
         role_service["/History/Cumulative/User/OperationTime"] = int(

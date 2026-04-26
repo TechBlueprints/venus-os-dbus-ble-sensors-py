@@ -74,6 +74,20 @@ class BleRoleCharger(BleRole):
             s.add_path("/History/Cumulative/User/OperationTime", 0)
             s.add_path("/History/Cumulative/User/ChargedAh", 0.0)
 
+            # /Alarms/* — charger-side alarms only.  Severity 0=ok,
+            # 1=warning, 2=alarm.  Battery-monitor / inverter alarms
+            # (LowVoltage, LowSoc, Overload, Ripple, LoadDisconnect,
+            # VecanDisconnected) are intentionally absent — they are
+            # not properties of an AC charger.  See the
+            # _CHARGER_ERROR_TO_ALARMS table in ble_device_ip22_charger
+            # for the ChargerError -> alarm-path mapping.
+            s.add_path("/Alarms/HighTemperature", 0)
+            s.add_path("/Alarms/HighBatteryTemperature", 0)
+            s.add_path("/Alarms/LowBatteryTemperature", 0)
+            s.add_path("/Alarms/HighVoltage", 0)
+            s.add_path("/Alarms/HighRipple", 0)
+            s.add_path("/Alarms/Fan", 0)
+
             # IP22 firmware does not implement VREG 0x0200; /Mode stays
             # read-only.  Tell gui-v2 not to expose a "Charger off" toggle
             # — the rotary switch on the front panel is the only off

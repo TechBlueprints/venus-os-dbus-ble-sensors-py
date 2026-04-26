@@ -5,6 +5,35 @@ The IP22 is published as a standard `com.victronenergy.charger.*` D-Bus
 service that participates in the DVCC contract — `dbus-systemcalc-py`
 treats it the same as a USB-connected VE.Direct IP43 reference unit.
 
+## Charger alarms
+
+`/ErrorCode` carries the raw `victron_ble.ChargerError` enum value as
+the source of truth.  On every `_publish` / `_publish_off_state` call,
+`_publish_alarms()` translates that code into the charger-side
+`/Alarms/*` paths (severity 0=ok, 1=warning, 2=alarm) per the
+`_CHARGER_ERROR_TO_ALARMS` map:
+
+| ChargerError | Alarm path | Severity |
+|---|---|---|
+| 1 TEMPERATURE_BATTERY_HIGH | `/Alarms/HighBatteryTemperature` | 2 |
+| 2 VOLTAGE_HIGH | `/Alarms/HighVoltage` | 2 |
+| 11 HIGH_RIPPLE | `/Alarms/HighRipple` | 2 |
+| 14 TEMPERATURE_BATTERY_LOW | `/Alarms/LowBatteryTemperature` | 1 (warn — protective) |
+| 17 / 22 / 23 / 26 (charger / internal-temp / overheated) | `/Alarms/HighTemperature` | 2 |
+| 24 FAN | `/Alarms/Fan` | 2 |
+
+The off-state path clears all six paths to 0 so a stale alarm doesn't
+linger after the unit is switched off.
+
+Battery-monitor / inverter alarm paths (`/Alarms/LowVoltage`,
+`/Alarms/LowSoc`, `/Alarms/Overload`, `/Alarms/Ripple`,
+`/Alarms/LoadDisconnect`, `/Alarms/VecanDisconnected`) are
+intentionally **not** published — they are not properties of an AC
+charger.  Errors that don't have a dedicated alarm path on a charger
+(18 over-current, 20 bulk-time, 21 current-sensor, 27 short-circuit,
+28 converter-issue) remain visible via `/ErrorCode` and gui-v2's
+`ChargerError::getDescription()`.
+
 ## Identity, settings, and history
 
 - `/Serial` is populated lazily from the BlueZ-advertised name on first
