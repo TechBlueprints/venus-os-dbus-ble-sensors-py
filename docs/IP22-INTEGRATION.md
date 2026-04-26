@@ -40,6 +40,39 @@ GATT writer pushes onto `0xEDF7` / `0xEDF0` (with the one-shot
 `0xEDF1=USER` guard for `0xEDF7`).  When the BMS releases control,
 `/State` falls back to the advertised value automatically.
 
+### How a BMS actually stops charging (and why this works on the IP22)
+
+In real Victron deployments the primary DVCC lever is
+**`/Link/ChargeVoltage`**, not `/Link/ChargeCurrent`.  When a BMS
+needs to stop charging — full cell, temperature out of range, fault,
+disconnect signal — it lowers `ChargeVoltage` to at or below the
+battery's resting voltage.  The charger sees its target is already
+met and tapers off naturally.  `ChargeCurrent` is the maximum-allowed
+envelope; the BMS treats it as a ceiling, not as a stop control.
+
+This works **completely on the IP22** through our existing wiring:
+
+- `/Link/ChargeVoltage` → VREG `0xEDF7` accepts any value the IP22
+  can resolve (10 mV resolution).  Drop the target to e.g. 12.5 V on
+  a 12 V system and the IP22 stops actively pushing energy in within
+  one charge-cycle tick.  Restore it to 14.4 V and charging resumes.
+- The 0.05 V deadband won't get in the way of "stop" transitions —
+  every realistic BMS voltage change (full → idle, idle → resume)
+  is well above 50 mV.
+- The IP22's lack of a dedicated remote-on/off VREG (`0x0200` /
+  `0x0202` are not implemented on this firmware) is therefore not a
+  practical limitation — the standard BMS off-mechanism doesn't need
+  one.  `/Capabilities/HasNoDeviceOffMode = 1` is published mainly so
+  gui-v2 doesn't expose a manual off-toggle that doesn't exist on
+  this hardware.
+
+`ChargeCurrent` clamping (the IP22 won't accept a max-current below
+~7.5 A on the 12/30 SKU) is therefore a non-issue for BMS control:
+the BMS stops the charger via voltage, not by trying to set
+`ChargeCurrent = 0`.  We still pass the BMS-supplied current envelope
+straight through to `0xEDF0` so the charger respects the BMS's max
+when it *is* charging.
+
 ## Charger alarms
 
 `/ErrorCode` carries the raw `victron_ble.ChargerError` enum value as
