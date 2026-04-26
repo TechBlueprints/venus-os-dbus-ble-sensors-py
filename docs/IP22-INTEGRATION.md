@@ -15,24 +15,35 @@ the source of truth.  On every `_publish` / `_publish_off_state` call,
 
 | ChargerError | Alarm path | Severity |
 |---|---|---|
-| 1 TEMPERATURE_BATTERY_HIGH | `/Alarms/HighBatteryTemperature` | 2 |
 | 2 VOLTAGE_HIGH | `/Alarms/HighVoltage` | 2 |
 | 11 HIGH_RIPPLE | `/Alarms/HighRipple` | 2 |
-| 14 TEMPERATURE_BATTERY_LOW | `/Alarms/LowBatteryTemperature` | 1 (warn — protective) |
 | 17 / 22 / 23 / 26 (charger / internal-temp / overheated) | `/Alarms/HighTemperature` | 2 |
 | 24 FAN | `/Alarms/Fan` | 2 |
 
-The off-state path clears all six paths to 0 so a stale alarm doesn't
+The off-state path clears all four paths to 0 so a stale alarm doesn't
 linger after the unit is switched off.
 
-Battery-monitor / inverter alarm paths (`/Alarms/LowVoltage`,
-`/Alarms/LowSoc`, `/Alarms/Overload`, `/Alarms/Ripple`,
-`/Alarms/LoadDisconnect`, `/Alarms/VecanDisconnected`) are
-intentionally **not** published — they are not properties of an AC
-charger.  Errors that don't have a dedicated alarm path on a charger
-(18 over-current, 20 bulk-time, 21 current-sensor, 27 short-circuit,
-28 converter-issue) remain visible via `/ErrorCode` and gui-v2's
-`ChargerError::getDescription()`.
+**Intentionally not published:**
+
+- `/Alarms/HighBatteryTemperature`, `/Alarms/LowBatteryTemperature` —
+  these are *battery-monitor / BMS* paths (the thing that owns battery
+  state).  When the charger sees a battery-temperature error
+  (`ChargerError 1` or `14`) it suspends charging and surfaces that
+  through `/State` and `/ErrorCode`; gui-v2's
+  `ChargerError::getDescription()` already turns those codes into
+  "Battery temperature too high / too low" text in the alarms-and-errors
+  panel.  The charger isn't the authority on battery state, so it
+  shouldn't republish a battery-state condition as a charger-side
+  alarm.
+- `/Alarms/LowVoltage`, `/Alarms/LowSoc`, `/Alarms/Overload`,
+  `/Alarms/Ripple`, `/Alarms/LoadDisconnect`,
+  `/Alarms/VecanDisconnected` — battery-monitor / VE.Bus / inverter
+  alarms; not properties of an AC charger.
+
+Other charger errors without a dedicated alarm path on the charger
+contract (`18` over-current, `20` bulk-time, `21` current-sensor, `27`
+short-circuit, `28` converter-issue) remain visible via `/ErrorCode`
+and gui-v2's description table.
 
 ## Identity, settings, and history
 

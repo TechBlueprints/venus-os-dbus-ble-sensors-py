@@ -74,16 +74,21 @@ class BleRoleCharger(BleRole):
             s.add_path("/History/Cumulative/User/OperationTime", 0)
             s.add_path("/History/Cumulative/User/ChargedAh", 0.0)
 
-            # /Alarms/* — charger-side alarms only.  Severity 0=ok,
-            # 1=warning, 2=alarm.  Battery-monitor / inverter alarms
-            # (LowVoltage, LowSoc, Overload, Ripple, LoadDisconnect,
-            # VecanDisconnected) are intentionally absent — they are
-            # not properties of an AC charger.  See the
-            # _CHARGER_ERROR_TO_ALARMS table in ble_device_ip22_charger
-            # for the ChargerError -> alarm-path mapping.
+            # /Alarms/* — charger-side alarms only (the charger's *own*
+            # failure modes).  Severity 0=ok, 1=warning, 2=alarm.
+            #
+            # Intentionally absent:
+            #   /Alarms/{High,Low}BatteryTemperature — battery-monitor /
+            #     BMS paths; charger surfaces battery-temp errors via
+            #     /ErrorCode (codes 1, 14) and suspends via /State
+            #     instead of claiming authority over battery state.
+            #   /Alarms/{LowVoltage, LowSoc, Overload, Ripple,
+            #     LoadDisconnect, VecanDisconnected} — battery-monitor
+            #     or VE.Bus / inverter paths.
+            #
+            # See the _CHARGER_ERROR_TO_ALARMS table in
+            # ble_device_ip22_charger for the ChargerError -> path map.
             s.add_path("/Alarms/HighTemperature", 0)
-            s.add_path("/Alarms/HighBatteryTemperature", 0)
-            s.add_path("/Alarms/LowBatteryTemperature", 0)
             s.add_path("/Alarms/HighVoltage", 0)
             s.add_path("/Alarms/HighRipple", 0)
             s.add_path("/Alarms/Fan", 0)

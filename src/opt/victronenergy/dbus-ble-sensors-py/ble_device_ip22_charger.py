@@ -119,32 +119,33 @@ _HISTORY_FLUSH_INTERVAL_S = 60.0
 # /ErrorCode and gui-v2's ChargerError::getDescription() text.
 #
 # Severity: 0 = OK, 1 = Warning, 2 = Alarm (Venus convention).
-# Low-battery-temperature is a *warning* because the charger has
-# proactively protected the cells; high-temperature/over-voltage/ripple
-# are real alarms.
 #
-# Battery-monitor / inverter alarms (LowVoltage, LowSoc, Overload,
-# Ripple, LoadDisconnect, VecanDisconnected) are intentionally absent —
-# they are not properties of an AC charger.
+# What does NOT belong here:
+#   - /Alarms/{High,Low}BatteryTemperature: those are battery-monitor /
+#     BMS paths.  The charger sees a battery temperature error, decides
+#     to suspend charging, and reflects that through /State and
+#     /ErrorCode (codes 1, 14 -> "Battery temperature too high/low" via
+#     ChargerError::getDescription()).  It is not the authority on
+#     battery state, so it doesn't republish that condition as a
+#     charger-side alarm.
+#   - Battery-monitor paths (LowVoltage, LowSoc), inverter paths
+#     (Overload, Ripple, LoadDisconnect, VecanDisconnected): not
+#     properties of an AC charger.
 _CHARGER_ALARM_PATHS: tuple[str, ...] = (
-    "/Alarms/HighTemperature",
-    "/Alarms/HighBatteryTemperature",
-    "/Alarms/LowBatteryTemperature",
-    "/Alarms/HighVoltage",
-    "/Alarms/HighRipple",
-    "/Alarms/Fan",
+    "/Alarms/HighTemperature",   # charger's own heatsink / internal temp
+    "/Alarms/HighVoltage",       # battery-bus over-voltage at charger output
+    "/Alarms/HighRipple",        # AC-input ripple at charger input stage
+    "/Alarms/Fan",               # cooling-fan failure
 )
 # Map: charger_error_code -> {alarm_path: severity}
 _CHARGER_ERROR_TO_ALARMS: dict[int, dict[str, int]] = {
-    1:  {"/Alarms/HighBatteryTemperature": 2},
     2:  {"/Alarms/HighVoltage": 2},
     11: {"/Alarms/HighRipple": 2},
-    14: {"/Alarms/LowBatteryTemperature": 1},
-    17: {"/Alarms/HighTemperature": 2},
-    22: {"/Alarms/HighTemperature": 2},
-    23: {"/Alarms/HighTemperature": 2},
+    17: {"/Alarms/HighTemperature": 2},   # TEMPERATURE_CHARGER
+    22: {"/Alarms/HighTemperature": 2},   # INTERNAL_TEMPERATURE_A
+    23: {"/Alarms/HighTemperature": 2},   # INTERNAL_TEMPERATURE_B
     24: {"/Alarms/Fan": 2},
-    26: {"/Alarms/HighTemperature": 2},
+    26: {"/Alarms/HighTemperature": 2},   # OVERHEATED
 }
 
 def _alarms_for_error(error_code: int) -> dict[str, int]:
