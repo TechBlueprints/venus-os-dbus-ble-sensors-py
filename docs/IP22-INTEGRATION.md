@@ -5,6 +5,41 @@ The IP22 is published as a standard `com.victronenergy.charger.*` D-Bus
 service that participates in the DVCC contract — `dbus-systemcalc-py`
 treats it the same as a USB-connected VE.Direct IP43 reference unit.
 
+## External-control mode (BMS-driven systems)
+
+When a BMS is in the system and DVCC is dictating setpoints, the
+gui-v2 and `dbus-systemcalc-py` contract is for the charger to
+publish `/State = 252` (`OperationMode.EXTERNAL_CONTROL`).  The IP22
+firmware itself doesn't know it's externally controlled — from its
+point of view we're just bumping `0xEDF0` (max current) and `0xEDF7`
+(absorption voltage) — so the override has to happen on the publish
+side.
+
+Implementation:
+
+- `_dvcc_engaged` flips to `True` whenever any of the following
+  arrives on D-Bus: `/Link/NetworkMode != 0`, `/Settings/BmsPresent ==
+  1`, `/Link/ChargeCurrent`, `/Link/ChargeVoltage`.
+- `_set_dvcc_engaged()` flips `/Link/NetworkStatus` between `4`
+  (stand-alone) and `1` (active) and **immediately re-derives**
+  `/State` using the last advertised state — no waiting for the next
+  telemetry adv (which on this device can be ~20 s away).
+- `_derive_published_state(advertised)` returns `252` when DVCC is
+  engaged and the device is powered (advertised state != 0); off
+  stays off regardless.
+- The internal history accumulators (`OperationTime`, `ChargedAh`)
+  are still ticked from the **real** advertised state, not the
+  overridden value, so they keep counting correctly while externally
+  controlled.
+
+End-to-end behaviour from gui-v2's point of view: a BMS arrival
+flips `/Settings/BmsPresent` to 1, `/Link/NetworkStatus` to 1, and
+`/State` to 252 within one D-Bus round-trip.  DVCC then writes
+`/Link/ChargeVoltage` and `/Link/ChargeCurrent`, which the queued
+GATT writer pushes onto `0xEDF7` / `0xEDF0` (with the one-shot
+`0xEDF1=USER` guard for `0xEDF7`).  When the BMS releases control,
+`/State` falls back to the advertised value automatically.
+
 ## Charger alarms
 
 `/ErrorCode` carries the raw `victron_ble.ChargerError` enum value as
@@ -78,6 +113,7 @@ two that map to writable VREGs through a per-device GATT write queue:
 | D-Bus path | Direction | IP22 backing |
 |---|---|---|
 | `/Link/NetworkStatus` | read | published; flips between `4` (stand-alone) and `1` (DVCC active) when `/Link/NetworkMode != 0`, `/Settings/BmsPresent == 1`, or any `/Link/ChargeCurrent`/`/Link/ChargeVoltage` write arrives |
+| `/State` | read | published; while DVCC is active and the device is on, **overridden to `252` (`OperationMode.EXTERNAL_CONTROL`)** so gui-v2 / dbus-systemcalc-py see "externally controlled" instead of bulk/abs/float — see "External-control mode" below |
 | `/Link/NetworkMode` | write | stored only — IP22 has no consumer VREG |
 | `/Link/ChargeCurrent` | write | GATT → VREG `0xEDF0` (u16 LE, 0.1 A); 0.1 A deadband |
 | `/Link/ChargeVoltage` | write | GATT → VREG `0xEDF7` (u16 LE, 0.01 V); 0.05 V deadband |

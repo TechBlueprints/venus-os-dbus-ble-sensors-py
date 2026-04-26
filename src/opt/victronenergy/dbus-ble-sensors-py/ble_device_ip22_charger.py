@@ -148,6 +148,12 @@ _CHARGER_ERROR_TO_ALARMS: dict[int, dict[str, int]] = {
     26: {"/Alarms/HighTemperature": 2},   # OVERHEATED
 }
 
+# victron_ble.OperationMode.EXTERNAL_CONTROL — the value gui-v2 and
+# dbus-systemcalc-py recognise as "this charger is externally
+# controlled by the GX / a BMS, not running its own state machine".
+# Hard-coded so we don't drag the enum import down a hot path.
+_STATE_EXTERNAL_CONTROL = 252
+
 def _alarms_for_error(error_code: int) -> dict[str, int]:
     """Return the {path: severity} dict to apply for a ChargerError code.
     Paths not present in the result should be cleared to 0 by the
@@ -401,6 +407,11 @@ class BleDeviceIP22Charger(BleDevice):
         # /Link/ChargeCurrent, /Link/ChargeVoltage or /Settings/BmsPresent.
         # Reset to 4 if BmsPresent goes back to 0 and NetworkMode is 0.
         self._dvcc_engaged = False
+        # Last advertised /State value from victron_ble — kept so
+        # _set_dvcc_engaged() can re-derive /State immediately when DVCC
+        # engages or disengages, instead of waiting for the next
+        # advertisement tick (which on this device may be ~20 s away).
+        self._last_advertised_state: int = 0
         # History accumulators (ChargedAh integrates positive battery
         # current over time; OperationTime ticks while /State != off).
         self._history_op_time_s: float = 0.0
@@ -721,7 +732,10 @@ class BleDeviceIP22Charger(BleDevice):
             if serial:
                 self.info["serial"] = serial
 
+        self._last_advertised_state = 0
         for role_service in list(self._role_services.values()):
+            # Off stays off regardless of DVCC engagement — there's no
+            # power flowing for "external control" to claim.
             role_service["/State"] = 0
             role_service["/Dc/0/Current"] = 0.0
             role_service["/Dc/0/Power"] = 0.0
@@ -768,8 +782,20 @@ class BleDeviceIP22Charger(BleDevice):
             if model and not model.startswith("<Unknown"):
                 role_service["/ProductName"] = model
             role_service["/ProductId"] = self.info["product_id"]
-            role_service["/State"] = st
             err = int(parsed["charger_error"])
+            # When a BMS / GX is dictating setpoints (DVCC engaged), the
+            # gui-v2 + dbus-systemcalc-py contract is to publish /State
+            # = 252 (EXTERNAL_CONTROL) so the rest of the system shows
+            # the charger as "externally controlled" instead of as a
+            # stand-alone unit happening to be in bulk/abs/float.  The
+            # IP22 firmware itself doesn't know it's externally
+            # controlled — it just sees us bumping 0xEDF0 / 0xEDF7 — so
+            # the override has to happen here, on the publish side.  We
+            # still pass the *real* advertised state to _tick_history()
+            # below so OperationTime / ChargedAh keep accumulating
+            # correctly while externally controlled.
+            self._last_advertised_state = st
+            role_service["/State"] = self._derive_published_state(st)
             role_service["/ErrorCode"] = err
             self._publish_alarms(role_service, err)
 
@@ -1107,6 +1133,16 @@ class BleDeviceIP22Charger(BleDevice):
     # /Link/NetworkStatus dynamic update — tracks DVCC engagement.
     # ------------------------------------------------------------------
 
+    def _derive_published_state(self, advertised_state: int) -> int:
+        """Return the value that should appear on /State right now.
+        252 (EXTERNAL_CONTROL) when DVCC is engaged and the device is
+        powered, otherwise the raw advertised state.  Off stays off."""
+        if advertised_state == 0:
+            return 0
+        if self._dvcc_engaged:
+            return _STATE_EXTERNAL_CONTROL
+        return advertised_state
+
     def _set_dvcc_engaged(self, role_service: DbusRoleService,
                           engaged: bool) -> None:
         # 1 = DVCC / GX in control; 4 = stand-alone (factory default).
@@ -1117,9 +1153,22 @@ class BleDeviceIP22Charger(BleDevice):
             current = role_service["/Link/NetworkStatus"]
         except Exception:
             current = None
+        was_engaged = self._dvcc_engaged
         self._dvcc_engaged = engaged
         if current != new_status:
             role_service["/Link/NetworkStatus"] = new_status
+
+        # Mid-cycle engagement / disengagement: flip /State immediately
+        # using the last advertised state, instead of waiting for the
+        # next telemetry adv (which on this device can be ~20 s away).
+        if was_engaged != engaged:
+            new_state = self._derive_published_state(self._last_advertised_state)
+            try:
+                if role_service["/State"] != new_state:
+                    role_service["/State"] = new_state
+            except Exception:
+                logger.debug("%s: /State refresh on engage-change failed",
+                             self._plog)
 
     def _ip22_on_link_network_mode_write(self,
                                           role_service: DbusRoleService,
