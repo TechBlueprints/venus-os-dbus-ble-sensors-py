@@ -351,6 +351,27 @@ PIN) and returned a valid advertisement key.
   filtering); if it grows but length-21 advs never appear, the HCI
   tap parser is dropping them.  Either localises the bug.
 
+  **Status as of 2026-04-27 deep-dive:** the `_on_advertisement`
+  dedup at `dbus_ble_sensors.py:347-364` keys on MAC alone and stores
+  the last forwarded raw bytes for that MAC.  Identical bytes within
+  `DEDUP_KEEPALIVE_SECONDS` (900 s) are dropped — correct behaviour
+  for repeated short beacons (which are byte-identical) but also the
+  reason only the *first* short-beacon reaches the driver after
+  service start.  Encrypted telemetry advs have a rotating counter so
+  every byte is unique, so the dedup does not suppress them — if
+  they're not arriving, the issue is upstream (HCI tap parser or
+  BlueZ).  The HCI tap parser at `hci_advertisement_tap.py:248-249`
+  drops extended-adv reports with `data_status != 0` (chained or
+  truncated payloads); this only matters for chained extended advs
+  which Victron BLE chargers don't appear to use — legacy advs
+  delivered via the extended-report mechanism carry `data_status =
+  0` regardless.
+
+  Re-confirming the bug requires the bench unit to be actively
+  charging (full-telemetry advs leaving the device).  In the current
+  bench state ED:47 emits only short beacons — the dedup correctly
+  forwards one off-state snapshot and suppresses the rest.
+
 - **Optional charge-profile settings not yet wired.**
   `/Settings/{EqualizationVoltage, EqualizationDuration,
   AbsorptionMaxTime, BulkMaxTime, RebulkVoltage}` are reachable on
