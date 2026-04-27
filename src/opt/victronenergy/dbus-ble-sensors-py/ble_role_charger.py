@@ -52,10 +52,16 @@ class BleRoleCharger(BleRole):
             s.add_path("/Ac/In/L1/I", None)
             s.add_path("/Ac/In/CurrentLimit", None)
 
-            # Status
+            # Status.  /Mode and /DeviceOffReason are intentionally NOT
+            # published on this role: the IP22 firmware has no writable
+            # remote-on/off VREG, so a /Mode toggle would be decorative
+            # at best and lie to the user at worst.  gui-v2's PageAcCharger
+            # ListSwitch is gated on `dataItem.valid`, so omitting /Mode
+            # makes the Switch row disappear cleanly instead of needing
+            # a (charger-page-ignored) /Capabilities/HasNoDeviceOffMode
+            # hint.
             s.add_path("/State", 0)
             s.add_path("/ErrorCode", 0)
-            s.add_path("/DeviceOffReason", 0)
             s.add_path("/Relay/0/State", 0)
 
             # /Serial — populated lazily on first telemetry tick from the
@@ -96,13 +102,6 @@ class BleRoleCharger(BleRole):
             s.add_path("/Alarms/HighVoltage", 0)
             s.add_path("/Alarms/HighRipple", 0)
             s.add_path("/Alarms/Fan", 0)
-
-            # IP22 firmware does not implement VREG 0x0200; /Mode stays
-            # read-only.  Tell gui-v2 not to expose a "Charger off" toggle
-            # — the rotary switch on the front panel is the only off
-            # control on this hardware.
-            s.add_path("/Mode", 1)
-            s.add_path("/Capabilities/HasNoDeviceOffMode", 1)
 
             # ----------------------------------------------------------
             # DVCC contract — paths dbus-systemcalc-py writes onto a

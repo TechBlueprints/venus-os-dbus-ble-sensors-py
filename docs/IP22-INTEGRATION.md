@@ -62,9 +62,10 @@ This works **completely on the IP22** through our existing wiring:
 - The IP22's lack of a dedicated remote-on/off VREG (`0x0200` /
   `0x0202` are not implemented on this firmware) is therefore not a
   practical limitation — the standard BMS off-mechanism doesn't need
-  one.  `/Capabilities/HasNoDeviceOffMode = 1` is published mainly so
-  gui-v2 doesn't expose a manual off-toggle that doesn't exist on
-  this hardware.
+  one.  Because the firmware can't be remotely switched, the role
+  also intentionally omits `/Mode` from the D-Bus surface; gui-v2's
+  `PageAcCharger.qml` ListSwitch is gated on `dataItem.valid`, so the
+  Switch row disappears cleanly when the path is absent.
 
 `ChargeCurrent` clamping (the IP22 won't accept a max-current below
 ~7.5 A on the 12/30 SKU) is therefore a non-issue for BMS control:
@@ -155,8 +156,14 @@ two that map to writable VREGs through a per-device GATT write queue:
 | `/Link/BatteryCurrent` | write | stored only |
 | `/Settings/BmsPresent` | write | stored only |
 | `/Settings/ChargeCurrentLimit` | write | GATT → VREG `0xEDF0` (user-set cap; same VREG as the DVCC override) |
-| `/Mode` | read | fixed `1`; see "On/off mechanism" below |
-| `/Capabilities/HasNoDeviceOffMode` | read | `1` — gui-v2 hides the "Charger off" toggle |
+
+`/Mode` is intentionally **not** published on the role surface.  The
+IP22 firmware doesn't expose a writable on/off VREG, so a `/Mode` path
+would be a decoration that lies to the user — gui-v2 wires its Switch
+widget straight to `/Mode` and a write would never reach hardware.
+Omitting the path entirely makes the gui-v2 Switch row disappear
+cleanly (it gates on `dataItem.valid`).  See "On/off mechanism" below
+for the full reasoning.
 
 Voltage writes on the IP22 require `VREG 0xEDF1` (battery type) to be
 `0xFF` (USER); otherwise `0xEDF7` rejects with ack code `02`.  The
@@ -208,13 +215,17 @@ without modification.  Fields surfaced today:
 
 ## GATT control path
 
-`BleDeviceIP22Charger._ip22_on_mode_write` funnels `/Mode` writes through
-the shared `AsyncGATTWriter` → VREG `0x0200` (`DEVICE_MODE`).  Accepted
-values match the Orion-TR driver: `1` = On, `4` = Off.  Other values are
-rejected at the D-Bus layer.
+GATT writes from this driver land on the charge-profile VREGs only —
+absorption voltage (`0xEDF7`), float voltage (`0xEDF6`), battery type
+(`0xEDF1`), and battery max current (`0xEDF0`).  All of them go through
+the per-device write queue in `ChargerCommonMixin._enqueue_write`,
+which pauses the passive scan loop, opens a GATT session, drains the
+slot, and resumes scanning.
 
-Writes pause the passive scan loop, connect, write, disconnect, and
-resume scanning — identical to the Orion-TR path.
+There is no `/Mode` write path — the firmware probed (`fw 0.162` on
+the bench unit) does not implement `0x0200` (`DEVICE_MODE`) or any
+other writable on/off register, so the role intentionally omits
+`/Mode`.  See "On/off mechanism" below.
 
 ## Key provisioning
 
@@ -230,131 +241,48 @@ PIN) and returned a valid advertisement key.
 
 ## Known gaps / future work
 
-- **`/Mode` writes are a no-op on this firmware.**  A direct probe of
-  `ED:47:4D:2A:7C:2A` (firmware `fc00c140`, advertised as `0.162`)
-  confirmed that writing VREG `0x0200` with either opcode `0x06` (Set)
-  or `0x26` (privileged Set), payload `= 1` or `= 4`, returns the
-  application-layer error `09 00 19 02 00 01` on `DATA_LAST` — i.e.
-  "register not writable" for every value.  The earlier bench
-  observation that `/Mode = 4` caused the unit to drop to the short
-  product-id-only advertisement was a coincidence: subsequent writes
-  do not move the state machine either direction.
+- **No remote on/off VREG on this firmware.**  Direct GATT probes
+  against the bench unit (firmware `0.162`) covered every plausible
+  register:
 
-  DEVICE_MODE is effectively read-only on IP22 charger firmware
-  on a different VREG (or using a mechanism outside the plain CBOR
-  Set op); finding it is deferred until there's a reason to pursue
-  on/off control beyond telemetry.
+  | VREG | Read | Write | Notes |
+  |---|---|---|---|
+  | `0x0100` | ✓ | n/a | Product id `0x00FFA330` (BSC IP22 12/30) |
+  | `0x0102` | ✓ | n/a | App version `0x365FF` ≈ fw 3.65 |
+  | `0x010A` | ✓ | n/a | Serial (`HQ2133XMU6Y`) |
+  | `0x010B` | ✓ | n/a | Model name |
+  | `0x010C` | ✓ | n/a | Long name |
+  | `0x0140` | ✓ | n/a | Capabilities bitmask `0x40C100FC` |
+  | `0x0200` (DEVICE_MODE) | ✗ code 1 | ✗ code 1 | **Not implemented** — the Orion-TR uses this; IP22 firmware has no equivalent |
+  | `0x0201` | ✓ | ✗ code 3 | Device State — read-only |
+  | `0x0202` | ✗ code 1 | ✗ code 1 | **Not implemented** (BlueSolar remote-control mask) |
+  | `0x0207` (DeviceOffReason) | ✓ | ✗ code 3 | Read-only on this firmware |
+  | `0xEDF0` | ✓ | ✓ (clamps) | **Battery max current**, 0.1 A; writes ≥ ~7.5 A take, lower values clamp to the firmware minimum |
+  | `0xEDF1` | ✓ | ✓ | Battery type; `0xFF` = USER (gates voltage writes) |
+  | `0xEDF6` | ✓ | ✓ when `EDF1=USER` | Float voltage, 0.01 V |
+  | `0xEDF7` | ✓ | ✓ when `EDF1=USER` | Absorption voltage, 0.01 V |
+  | `0xEDFC` | ✓ | ✓ | Bulk time limit |
+  | `0xEDFE` | ✓ | ✗ code 3 | Adaptive mode — read-only |
 
-  Progress notes from a live GATT probe against ED:47:
+  Range scans across `0x0000`-`0x02FF`, `0x0E00`-`0x0FFF`,
+  `0xEC00`-`0xECFF`, and `0xEDA0`-`0xEDFF` surfaced no other writable
+  on/off candidate.  CBOR-layer error codes observed are `1` =
+  unknown register, `2` = bad value / size, `3` = read-only.
 
-  | VREG | SetValue=01 response | Meaning |
-  |---|---|---|
-  | `0x0200` (DEVICE_MODE) | `09 00 19 02 00 01` | code `01` = **unknown** (not in VREG table) |
-  | `0x0101` (COMMAND) | `09 00 19 01 01 03` | code `03` = **readonly** (exists, but rejected) |
-  | `0xEDE0`-`0xEDE1` | no ACK / session drop | device doesn't respond |
-
-  So on this firmware `0x0200` simply isn't implemented — the Orion-TR
-  path is a dead end here.  `0x0101` exists but isn't writable either.
-
-  - The CTRL char returns `00 01 00 01 50 14 00` on a `ReadValue` —
-    byte 0 is the "Flags" field, and `0x00` means **path protocol
-    not supported** on this firmware.  The opcode-10 / opcode-11 /
-    opcode-12 path tree (see `vesmart-server/gattserver.py`) is the
-    interface modern devices expose; IP22 fw `0.162` predates it.
-    `0x00208c10`, size ~24 KB) is where the app falls back to a
-    hard-coded **VBusItem-path ↔ VREG** map per device family.  The
-    decoder tables from its caller — those callers are what register
-    the SmartCharger-specific mappings.  Those data tables aren't
-    extractable with `strings` / static scanning alone; the path-string
-    through the GOT, not directly encoded in the call-site bytes.
-  - Probed `0xEDE0`-`EDFC`, `EDFA-FD`, `EDF8` on IP22 with PUK+PIN
-    auth + every opcode variant I could think of (`0x06`, `0x26`,
-    `0x46`, `0x66`): all return code `02` ("encryption not supported")
-    on 1-byte writes, and get no ACK at all on 2-byte writes.  So
-    the IP22 has a real write-privilege class above what bond + PUK
-    + PIN provides, or the correct register is in a different range
-    entirely — most likely the latter given the unambiguous "unknown
-    register" response on `0x0200`.
-
-  Next time this is pursued, the pragmatic move is to capture a BLE
-  The write frame on `306b0003` will reveal both the VREG and the
-  opcode in one shot, sidestepping the stripped-binary archaeology.
-
-  path (`/Link/Command`, `/Mode`, `/Settings/Function`, `/Bpc/...`,
-  `/Settings/PowerSupplyModeVoltage`, etc.) in `.rodata`.
-
-  The path↔VREG map is **not** stored as a static C++ array — no
-  `.data.rel.ro` or `.rodata` location holds 32-bit pointers to the
-  QSL headers paired with VREG immediates.  The map is built at
-  the caller passes in, and `init()` itself has no direct callers in
-  the symbol graph (it's reached only through Qt's virtual dispatch).
-  None of the candidate VREGs yielded a writable register class via
-  any opcode tried after PUK + PIN authentication.
-
-  Conclusion: the static analysis available without runtime
-  not sufficient to recover the IP22 on/off VREG.  A `btsnoop_hci.log`
-  the unit will show the write directly and is the clearly cheaper
-  next step.
-
-  that the global tables are:
-
-    (3568 entries)
-  - `pathsByVreg`  = `QMultiHash<ushort, std::pair<Path*, int>>`
-    (1199 entries — keyed by VREG directly)
-    (1199 entries — name-keyed, not vreg-keyed despite the symbol)
-
-  (144-byte Spans: 128 ctrl bytes + Entry* + alloc/nextFree).  Walking
-  pathsByPath with 32-byte stride correctly yields path strings,
-  including all 14 SmartCharger paths we care about.  pathsByVreg's
-  per-entry layout for `QMultiHash<ushort, pair<Path*, int>>` did NOT
-  yield readable (vreg, Path*) pairs with strides 16/24/32 — Path*
-  values stored there are byte-distinct from the Path* values in
-  pathsByPath, so the cross-reference scan came up empty in some runs
-  and inconsistent in others.
-
-  A few more hours of either (a) Qt-6-internal layout reconstruction
-  HCI snoop log path is still strictly cheaper.
-
-  **April 2026 — confirmed register set and writability via direct GATT
-  probe of ED:47** (firmware 3.65, app version VREG `0x0102`):
-
-  | VREG | Type | Read | Write | Notes |
-  |---|---|---|---|---|
-  | `0x0100` | u32 | ✓ | n/a | product id `0x00FFA330` (BSC IP22 12/30) |
-  | `0x0102` | u16 | ✓ | n/a | application version `0x365FF` ≈ fw 3.65 |
-  | `0x010A` | str | ✓ | n/a | serial `HQ2133XMU6Y` |
-  | `0x010B` | str | ✓ | n/a | "BSC IP22 12/30 (1)" |
-  | `0x010C` | str | ✓ | n/a | "BSC IP22 12/30…HQ2133XMU6Y" (long name) |
-  | `0x010F` | — | ✗ code 1 | — | not implemented |
-  | `0x0140` | u32 | ✓ | n/a | capabilities `0x40C100FC` |
-  | `0x0200` | — | ✗ code 1 | ✗ code 1 | **not implemented on IP22** (Orion-TR uses this) |
-  | `0x0201` | u8 | ✓ | ✗ code 3 | Device State (read-only) — `0x03=Bulk`, `0x04=Absorption`, etc. |
-  | `0x0202` | — | ✗ code 1 | ✗ code 1 | **not implemented on IP22** (BlueSolar remote-control mask) |
-  | `0x0207` | u32 | ✓ | ✗ code 3 | Device off reason — read-only (re-probed Apr 2026) |
-  | `0xEDF0` | u16 | ✓ | ✓ (clamped) | **Battery max current** in 0.1A; writes accepted but device clamps to ≥7.5A |
-  | `0xEDF1` | u8 | ✓ | ✓ | Battery type; `0xFF`=USER unlocks voltage writes |
-  | `0xEDF7` | u16 | ✓ | ✓ when `EDF1=USER` | Absorption voltage in 0.01V |
-  | `0xEDF6` | u16 | ✓ | ✓ | Float voltage |
-  | `0xEDFC` | u16 | ✓ | ✓ | Bulk time limit |
-  | `0xEDFE` | u8 | ✓ | ✗ code 3 | Adaptive mode (read-only on this fw) |
-  | `0xEDFF` | u8 | ✓ | ? | Batterysafe mode |
-  | (~22 more `0xEDxx` settings) | | ✓ | ✓ when unlocked | per BlueSolar doc |
-
-  Error code interpretation observed on this BLE CBOR layer:
-  `1` = unknown register, `2` = bad value/size, `3` = read-only.
-
-  **No on/off VREG was found.**  The IP22 firmware does not expose
-  `0x0200`/`0x0202`, and `0x0207` (off-reason) appears read-only on
-  this firmware (writes accepted silently but state doesn't change).
-  Both [pvtex/Victron_BlueSmart_IP22](https://github.com/pvtex/Victron_BlueSmart_IP22)
+  Both the [pvtex/Victron_BlueSmart_IP22](https://github.com/pvtex/Victron_BlueSmart_IP22)
   and [wasn-eu/Victron_BlueSmart_IP22](https://github.com/wasn-eu/Victron_BlueSmart_IP22)
-  achieve "remote control" by manipulating `0xEDF0` (charge-current
-  limit) only.  That's the practical control surface this driver should
-  expose.
+  open-source drivers reach the same conclusion: the only practical
+  BLE control over an IP22 is the charge-current limit (`0xEDF0`).
+  This driver therefore omits `/Mode` from the role surface (so
+  gui-v2 doesn't draw a Switch widget that wouldn't reach hardware)
+  and relies on `/Link/ChargeVoltage` → `0xEDF7` for BMS-style stop
+  control — see "On/off mechanism" above for why voltage drop is the
+  real off-mechanism on Victron-style chargers.
 
-- **Charger vs Power Supply mode toggle.** On VE.Direct IP43 chargers
-  service, so no standard path exists.  A VREG enumeration pass may
-  surface one — pending exploration.
+- **Charger vs Power Supply mode toggle.**  On VE.Direct IP43
+  chargers this is only exposed through the vendor's mobile app, not
+  over the D-Bus service, so no standard path exists.  A VREG
+  enumeration pass may surface one — pending exploration.
 - **Charge-setpoint writes.** `/Settings/ChargeCurrentLimit` is now
   wired through `BleDeviceIP22Charger._ip22_on_charge_current_limit_write`
   → VREG `0xEDF0` (commit `aa7c137`).  Setting it to a value at or below
@@ -374,17 +302,20 @@ PIN) and returned a valid advertisement key.
 - **On/off mechanism (final answer).**  The IP22 firmware on the bench
   unit (3.65, advertised as `0.162`) does not implement `0x0200`
   (`DEVICE_MODE`) or `0x0202` (BlueSolar remote-control mask).  `0x0207`
-  (`DeviceOffReason`) is read-only (returns `09 00 19 02 07 03` for any
-  write).  No alternative writable on/off VREG was found over multiple
-  range probes (0x0000–0x02FF, 0x0E00–0x0FFF, 0xEC00–0xECFF,
-  0xEDA0–0xEDFF, 0x0140–0x017F).  Both the
+  (`DeviceOffReason`) is read-only.  No alternative writable on/off
+  VREG was found over multiple range probes (`0x0000`-`0x02FF`,
+  `0x0E00`-`0x0FFF`, `0xEC00`-`0xECFF`, `0xEDA0`-`0xEDFF`,
+  `0x0140`-`0x017F`).  Both the
   [pvtex](https://github.com/pvtex/Victron_BlueSmart_IP22) and
   [wasn-eu](https://github.com/wasn-eu/Victron_BlueSmart_IP22) reference
   drivers come to the same conclusion: the only practical control over
   IP22 BLE is the charge-current limit (`0xEDF0`), which is what this
-  driver exposes via `/Settings/ChargeCurrentLimit`.  `/Mode` remains
-  read-only; gui-v2 should rely on `/Capabilities/HasNoDeviceOffMode = 1`
-  if it gets exposed in a future revision.
+  driver exposes via `/Settings/ChargeCurrentLimit`.  `/Mode` is
+  intentionally absent from the role surface so gui-v2's PageAcCharger
+  Switch widget (gated on `dataItem.valid`) hides cleanly instead of
+  rendering a toggle that doesn't reach hardware.  BMS-style stop
+  control still works through `/Link/ChargeVoltage` → `0xEDF7` — see
+  the "On/off mechanism" section earlier.
 - **Marginal-RSSI pairing.** The second IP22 on the bench (F2:86, RSSI
   -80 dBm) consistently fails Pair() with `AuthenticationCanceled`.
   Moving it closer to the cerbo or using a USB BLE adapter with a

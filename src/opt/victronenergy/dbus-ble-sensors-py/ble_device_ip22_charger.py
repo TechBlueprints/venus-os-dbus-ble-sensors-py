@@ -73,20 +73,16 @@ VICTRON_MANUFACTURER_ID = 0x02E1
 IP22_PRODUCT_ID_MIN = 0xA330
 IP22_PRODUCT_ID_MAX = 0xA33F
 
-# IP22 (BSC firmware 3.65) does NOT implement VREG 0x0200 (Device mode) or
-# 0x0202 (Remote control mask) — both return the "unknown register" error
-# (ack code 1) on this firmware.  The only verified-writable real-control
-# register is 0xEDF0 (Battery max current, u16 LE in 0.1A units).  Both
-# the open-source pvtex/Victron_BlueSmart_IP22 and wasn-eu/Victron_BlueSmart_IP22
-# drivers control the charger by manipulating only this register; the
-# device clamps writes below ~7.5A to the minimum hardware limit.
-#
-# /Mode on/off via the Orion-TR-style 0x0200 write is NOT viable here.
+# IP22 firmware has no writable remote on/off register: the only
+# verified-writable real-control register is 0xEDF0 (Battery max
+# current).  /Mode / DeviceOffReason are therefore not published on the
+# role at all — see ble_role_charger.py for the reasoning.  BMS-style
+# control (drop /Link/ChargeVoltage to taper off) works fully through
+# 0xEDF7 without needing an on/off VREG.
 VREG_BATTERY_MAX_CURRENT = 0xEDF0   # u16 LE, 0.1 A
 VREG_BATTERY_TYPE        = 0xEDF1   # u8;  0xFF = USER (unlocks voltage writes)
 VREG_FLOAT_VOLTAGE       = 0xEDF6   # u16 LE, 0.01 V
 VREG_ABSORPTION_VOLTAGE  = 0xEDF7   # u16 LE, 0.01 V
-VREG_DEVICE_MODE = 0x0200    # legacy alias retained for back-compat in code paths
 
 # Optional charge-profile VREGs that the standard Victron solar /
 # Phoenix Smart layout puts in this range — equalize voltage /
@@ -277,7 +273,6 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         self._dbus_settings = DbusSettingsService()
         self._pairing_passkey: int = resolve_pairing_passkey(
             self._dbus_settings)
-        self._mode_busy = False
         self._last_provision_attempt: float = 0.0
         self._stored_key_invalid = False
         self._last_daily_refresh_date: Optional[str] = None
@@ -609,7 +604,15 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
 
     def _publish_off_state(self) -> None:
         """Publish a minimal snapshot when the device is advertising the
-        short power-off frame (no encrypted payload)."""
+        short power-off frame (no encrypted payload).
+
+        We deliberately publish ``None`` for ``/Dc/0/{Voltage,Current,
+        Power,Temperature}`` instead of ``0.0``: the IP22's short beacon
+        carries no measurements, and an off / unconnected unit isn't
+        actually measuring 0 V / 0 A — it has nothing to report.  None
+        is the honest signal; gui-v2 then renders "---" instead of
+        confidently fabricated "0.00V | 0.0A" rows.
+        """
         # Tick history with zero current so OperationTime freezes but
         # ChargedAh stops integrating.
         self._tick_history(state=0, current_a=0.0)
@@ -627,10 +630,14 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             # Off stays off regardless of DVCC engagement — there's no
             # power flowing for "external control" to claim.
             role_service["/State"] = 0
-            role_service["/Dc/0/Current"] = 0.0
-            role_service["/Dc/0/Power"] = 0.0
-            if not self._mode_busy:
-                role_service["/Mode"] = 4
+            # Actively clear measurement paths.  Without this, a stale
+            # value from the last decoded telemetry tick would persist
+            # and read like live data.
+            role_service["/Dc/0/Voltage"] = None
+            role_service["/Dc/0/Current"] = None
+            role_service["/Dc/0/Power"] = None
+            role_service["/Dc/0/Temperature"] = None
+            role_service["/Ac/In/L1/I"] = None
             if battery_v is not None:
                 role_service["/Settings/BatteryVoltage"] = battery_v
             if self.info.get("serial"):
@@ -652,12 +659,15 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             st = int(parsed["device_state"])
             v1 = parsed.get("output_voltage1")
             i1 = parsed.get("output_current1")
-            if v1 is not None:
-                role_service["/Dc/0/Voltage"] = v1
-            if i1 is not None:
-                role_service["/Dc/0/Current"] = i1
-            if v1 is not None and i1 is not None:
-                role_service["/Dc/0/Power"] = round(v1 * i1, 2)
+            # Always assign — assigning None on a missing reading clears
+            # any stale value from a previous tick, so gui-v2 stops
+            # rendering yesterday's voltage as if it were live.
+            role_service["/Dc/0/Voltage"] = v1
+            role_service["/Dc/0/Current"] = i1
+            role_service["/Dc/0/Power"] = (
+                round(v1 * i1, 2) if v1 is not None and i1 is not None
+                else None
+            )
 
             for idx, out in enumerate(("2", "3")):
                 vk = f"output_voltage{out}"
@@ -718,8 +728,9 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 outputs = 3
             role_service["/NrOfOutputs"] = outputs
 
-            if not self._mode_busy:
-                role_service["/Mode"] = 4 if st == 0 else 1
+            # /Mode is intentionally not published — see the role file
+            # for why (firmware doesn't support remote on/off, and
+            # PageAcCharger.qml gates the Switch on dataItem.valid).
 
             # History accumulators — tick before publishing so the
             # values reflect the current sample window.
@@ -728,17 +739,6 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             self._publish_history(role_service)
 
             role_service.connect()
-
-    # ------------------------------------------------------------------
-    # /Mode write (GATT)
-    # ------------------------------------------------------------------
-
-    def _ip22_on_mode_write(self,
-                            role_service: DbusRoleService,
-                            value: int) -> bool:
-        # Disabled: the IP22 BLE firmware does not implement VREG 0x0200.
-        # See docs/IP22-INTEGRATION.md for the register-probe matrix.
-        return False
 
     # ------------------------------------------------------------------
     # /Settings/ChargeCurrentLimit write (GATT) — VREG 0xEDF0, u16 LE in 0.1A

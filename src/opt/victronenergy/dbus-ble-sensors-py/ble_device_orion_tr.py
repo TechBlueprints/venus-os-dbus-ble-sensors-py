@@ -116,9 +116,7 @@ ORION_PRODUCT_ID_MAX = 0xA3DF
 # Probe sweeps of 0xEDF0-0xEDFF returned no responses on this firmware,
 # suggesting the Orion-TR uses a different layout than the IP22 (likely
 # 0xEDDx / 0xEDEx given which VREGs *did* respond).  The constants
-# or a more thorough live probe — see also
-# sample-driver/research/IP22-CHARGER-BLE-PROTOCOL.md §10 for the
-# matching IP22 reference.
+# below are placeholders pending a more thorough live probe.
 VREG_DEVICE_MODE = 0x0200
 # Charge-profile VREGs — mapped via direct GATT write/read probes on the
 # bench unit (FF:13:42:2B:7A:4B, firmware 1.10).  Layout matches the
@@ -132,7 +130,9 @@ BATTERY_TYPE_USER = 0xFF
 # 0xEDEE) — Orion-TR firmware 1.10 returns ack code 1 (unknown register)
 # for 0xEDF0 (the IP22's charge-current VREG) and exposes no equivalent
 # at any tested address.  The hardware max is fixed by the model
-# "Current limit" field maps somewhere we haven't located.  Until found,
+# variant (15 A on the 12V/24V-15A bench unit); the "Current limit"
+# field exposed by the vendor app maps somewhere we haven't located.
+# Until found,
 # /Settings/ChargeCurrentLimit and /Link/ChargeCurrent are persisted to
 # settings and surfaced on D-Bus, but no GATT write is emitted — see
 # _orion_persist_only_write below.  The DVCC stop-charging mechanism
