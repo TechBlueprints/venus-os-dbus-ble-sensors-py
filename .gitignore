@@ -1,5 +1,16 @@
 **/__pycache__/
-**/ext/
+**/*.pyc
+**/ext/*
+# Exception: vendored victron_ble (Unlicense / public domain).  Sourced
+# from PyPI victron-ble 0.9.3 with a local cryptography-backend patch.
+# See ext/victron_ble/VENDORED.md for the rationale and patch details.
+# velib_python is still excluded — install.sh fetches it at runtime.
+!src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble
+!src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/**
+# Re-ignore byte-compile caches inside the vendored package (the
+# !ext/victron_ble/** exception above is broad enough to allow them).
+src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/**/__pycache__/
+src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/**/*.pyc
 *.iml
 .idea/
 *.code-workspace

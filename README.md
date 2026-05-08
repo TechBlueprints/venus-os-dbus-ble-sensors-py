@@ -102,3 +102,11 @@ In short devices can be enabled/disabled in *Settings* -> *Integrations* -> *Blu
 ## Development
 
 For technical info and guide to add new devices, see [dedicated developer page](DEVELOPMENT.md).
+
+## Vendored dependencies
+
+This fork bundles a copy of [keshavdv/victron-ble](https://github.com/keshavdv/victron-ble) (version 0.9.3) under `src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/`.  It is used by the IP22 and Orion-TR drivers to decrypt Victron Instant Readout advertisements.
+
+`victron-ble` is released into the public domain under [The Unlicense](https://unlicense.org/) — credit goes to Keshav Varma and contributors.
+
+The vendored copy carries one local change in `devices/base.py`: AES-CTR decryption can fall back to Python's standard `cryptography` library (which ships with Venus OS as `python3-cryptography`) when `PyCryptodome` is not available.  The two code paths produce byte-identical output and a unit test in `tests/test_vendored_victron_ble.py` enforces this.  See `ext/victron_ble/VENDORED.md` for details.

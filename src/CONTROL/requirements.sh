@@ -7,7 +7,8 @@ wget -O "$SCRIPT_DIR/../opt/victronenergy/dbus-ble-sensors-py/ext/velib_python/v
 wget -O "$SCRIPT_DIR/../opt/victronenergy/dbus-ble-sensors-py/ext/velib_python/logger.py" https://raw.githubusercontent.com/victronenergy/velib_python/refs/heads/master/logger.py
 wget -O "$SCRIPT_DIR/../opt/victronenergy/dbus-ble-sensors-py/ext/velib_python/ve_utils.py" https://raw.githubusercontent.com/victronenergy/velib_python/refs/heads/master/ve_utils.py
 
-# victron_ble: used by the Orion-TR driver for advertisement decryption.
-# Install from PyPI then patch base.py to use cryptography (shipped in
-# Venus OS) instead of PyCryptodome (not available).
-pip3 install victron-ble --no-deps --target "$SCRIPT_DIR/../opt/victronenergy/dbus-ble-sensors-py/ext/"
+# victron_ble (used by the IP22 / Orion-TR drivers for Instant Readout
+# advertisement decryption) is vendored in-tree at
+# ext/victron_ble/, with a patch to prefer python3-cryptography (shipped
+# in Venus OS) over PyCryptodome (not available).  See
+# ext/victron_ble/VENDORED.md for the rationale.
