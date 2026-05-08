@@ -14,14 +14,12 @@ from dbus_settings_service import DbusSettingsService
 
 logger = logging.getLogger(__name__)
 
-
 def _mac_key(dev_mac: str) -> str:
     """``dev_mac`` as used elsewhere in dbus-ble-sensors-py (12 hex chars, no colons)."""
     s = dev_mac.lower().replace(":", "")
     if not re.fullmatch(r"[0-9a-f]{12}", s):
         raise ValueError(f"invalid dev_mac: {dev_mac!r}")
     return s
-
 
 def advertisement_key_setting_path(dev_mac: str) -> str:
     """Silent setting path for a device's 16-byte advertisement key.
@@ -36,7 +34,6 @@ def advertisement_key_setting_path(dev_mac: str) -> str:
     mk = _mac_key(dev_mac)
     return f"/Settings/Devices/orion_tr_{mk}/AdvertisementKey"
 
-
 def get_advertisement_key(settings: DbusSettingsService, dev_mac: str) -> Optional[str]:
     path = advertisement_key_setting_path(dev_mac)
     raw = settings.try_get_value(path)
@@ -46,7 +43,6 @@ def get_advertisement_key(settings: DbusSettingsService, dev_mac: str) -> Option
     if len(s) != 32 or any(c not in "0123456789abcdef" for c in s):
         return None
     return s
-
 
 def set_advertisement_key(settings: DbusSettingsService, dev_mac: str, key_hex: str) -> None:
     """Store 32-character hex key (16 bytes) into ``com.victronenergy.settings``.
@@ -68,11 +64,9 @@ def set_advertisement_key(settings: DbusSettingsService, dev_mac: str, key_hex: 
     settings.set_value(path, s)
     logger.info("Stored Orion-TR advertisement key for %s", mk)
 
-
 def firmware_version_setting_path(dev_mac: str) -> str:
     """Silent setting path for the cached firmware version string."""
     return f"/Settings/Devices/orion_tr_{_mac_key(dev_mac)}/FirmwareVersion"
-
 
 def get_firmware_version(settings: DbusSettingsService,
                         dev_mac: str) -> Optional[str]:
@@ -83,10 +77,8 @@ def get_firmware_version(settings: DbusSettingsService,
     s = str(raw).strip()
     return s or None
 
-
 def preferred_adapter_setting_path(dev_mac: str) -> str:
     return f"/Settings/Devices/orion_tr_{_mac_key(dev_mac)}/PreferredAdapter"
-
 
 def get_preferred_adapter(settings: DbusSettingsService,
                           dev_mac: str) -> Optional[str]:
@@ -96,7 +88,6 @@ def get_preferred_adapter(settings: DbusSettingsService,
         return None
     s = str(raw).strip()
     return s or None
-
 
 def set_preferred_adapter(settings: DbusSettingsService,
                           dev_mac: str, adapter: str) -> None:
@@ -109,7 +100,6 @@ def set_preferred_adapter(settings: DbusSettingsService,
     settings.set_item(path, s, 0, 0, silent=True)
     settings.set_value(path, s)
     logger.info("Stored preferred adapter %s for Orion-TR %s", s, mk)
-
 
 def set_firmware_version(settings: DbusSettingsService,
                          dev_mac: str, version: str) -> None:

@@ -12,7 +12,6 @@ Two hardware variants exist, distinguished by manufacturer ID:
   BTP3 (Cypress)   MFG ID 305  (0x0131)
   BTP7 (SeeLevel)  MFG ID 3264 (0x0CC0)
 
-
 BLE Packet Formats
 ------------------
 
@@ -30,7 +29,6 @@ BTP7 payload (14 bytes):
                 Order: Fresh, Wash, Toilet, Fresh2, Wash2, Toilet2, Wash3, LPG
     Byte  11    Battery voltage * 10 (e.g. 130 = 13.0 V)
     Bytes 12-13 Unused
-
 
 Sensor Numbers
 --------------
@@ -52,7 +50,6 @@ Sensor Numbers
      12     Chemical 2          -
      13     Battery (voltage*10) -
 
-
 Status / Error Codes
 --------------------
 
@@ -72,7 +69,6 @@ BTP7: tank byte values > 100 are error codes:
     110  Tank disabled
     111  Tank init
 
-
 Unit Conversions
 ----------------
 
@@ -80,7 +76,6 @@ Unit Conversions
     Temperature     (°F - 32) * 5/9 = °C
     Battery Voltage Value / 10 = Volts
     Tank Capacity   Gallons * 0.00378541 = m³  (if volume desired)
-
 
 Victron D-Bus Mappings
 ----------------------
@@ -97,7 +92,6 @@ Fluid Types:
     LPG          8  (FLUID_TYPE_LPG)
     Chemical     0  (custom)
 
-
 References
 ----------
 
@@ -110,7 +104,6 @@ References
 from ve_types import *
 from ble_device import BleDevice
 import logging
-
 
 class BleDeviceSeeLevel(BleDevice):
     """

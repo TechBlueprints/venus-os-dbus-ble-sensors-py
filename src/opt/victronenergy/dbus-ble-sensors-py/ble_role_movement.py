@@ -1,7 +1,6 @@
 from ble_role import BleRole
 from ve_types import *
 
-
 class BleRoleMovement(BleRole):
     """
     Movement sensor role class.

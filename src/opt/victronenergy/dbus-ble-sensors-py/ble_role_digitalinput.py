@@ -3,7 +3,6 @@ import logging
 from gi.repository import GLib
 from ve_types import *
 
-
 class BleRoleDigitalInput(BleRole):
     """
     Digital input sensor role class.

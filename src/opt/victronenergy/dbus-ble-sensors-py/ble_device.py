@@ -9,7 +9,6 @@ from dbus_role_service import DbusRoleService
 from ble_role import BleRole
 from ve_types import *
 
-
 class BleDevice(object):
     """
     Device base class.

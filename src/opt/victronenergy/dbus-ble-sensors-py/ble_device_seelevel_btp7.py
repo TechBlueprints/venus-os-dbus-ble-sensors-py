@@ -1,7 +1,6 @@
 from seelevel_common import BleDeviceSeeLevel
 import logging
 
-
 class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
     """
     SeeLevel 709-BTP7 tank/battery monitor.

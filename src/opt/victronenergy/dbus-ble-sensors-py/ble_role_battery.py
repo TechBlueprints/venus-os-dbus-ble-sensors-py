@@ -1,6 +1,5 @@
 from ble_role import BleRole
 
-
 class BleRoleBattery(BleRole):
     """
     Battery voltage monitor role class.

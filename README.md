@@ -28,6 +28,31 @@ Devices currently supported :
 | Ruuvi          | Ruuvi Air                  | https://ruuvi.com/air/                                                                                         |
 | Garnet         | SeeLevel 709-BTP3          | https://www.garnetinstruments.com/document/709-btp3-seelevel-ii-tank-monitor-2/                                |
 | Garnet         | SeeLevel 709-BTP7          | https://www.garnetinstruments.com/document/709-btp7-seelevel-ii-tank-monitor/                                  |
+| Victron Energy | Orion-TR Smart DC-DC       | https://www.victronenergy.com/dc-dc-converters/orion-tr-smart-dc-dc-charger-isolated                           |
+| Victron Energy | Blue Smart IP22 Charger    | https://www.victronenergy.com/chargers/blue-smart-ip22-charger                                                 |
+
+The two Victron chargers (Orion-TR Smart, Blue Smart IP22) are
+**fully integrated chargers** from `dbus-systemcalc-py`'s point of
+view — they participate in DVCC (`/Link/{ChargeCurrent,
+ChargeVoltage, NetworkMode, NetworkStatus, *Sense, BatteryCurrent}`),
+publish charger-side `/Alarms/*`, accumulate
+`/History/Cumulative/User/*`, and persist user-set
+`/Settings/{ChargeCurrentLimit, AbsorptionVoltage, FloatVoltage}`
+to `com.victronenergy.settings`.  A real Victron BMS controls them
+the same way it controls a USB-attached Phoenix Smart IP43.
+
+Implementation notes:
+
+- [`docs/IP22-INTEGRATION.md`](docs/IP22-INTEGRATION.md) — IP22
+  driver, role, DVCC contract, alarm derivation, history accumulators
+- [`docs/ORION-TR-INTEGRATION.md`](docs/ORION-TR-INTEGRATION.md) —
+  Orion-TR driver, dcdc ↔ alternator role swap, integrated-charger
+  surface on both roles
+- `tests/` — self-contained pytest suite covering the shared
+  infrastructure (`ble_charger_common`) and per-driver dispatch.
+  Run via `./tests/run.sh` — no D-Bus, BlueZ, or hardware needed.
+- `scripts/probe_charger_vregs.py` — VREG-discovery tool for
+  extending support to new SKUs or firmware versions.
 
 ## Installation
 

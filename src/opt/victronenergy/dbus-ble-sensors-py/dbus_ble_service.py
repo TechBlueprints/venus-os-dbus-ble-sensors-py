@@ -6,7 +6,6 @@ from dbus_bus import get_bus
 from dbus_settings_service import DbusSettingsService
 from vedbus import VeDbusService, VeDbusItemImport, VeDbusItemExport
 
-
 class DbusBleService(object):
     """
     Main service listing and enabling/disabling scan settings and device role services through the UI.

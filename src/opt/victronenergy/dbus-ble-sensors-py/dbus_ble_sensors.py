@@ -10,6 +10,10 @@ from dbus.mainloop.glib import DBusGMainLoop
 from argparse import ArgumentParser
 from ble_device import BleDevice
 from ble_device_orion_tr import BleDeviceOrionTR, is_orion_tr_manufacturer_data
+from ble_device_ip22_charger import (
+    BleDeviceIP22Charger,
+    is_ip22_charger_manufacturer_data,
+)
 from ble_role import BleRole
 from dbus_bus import get_bus
 from dbus_ble_service import DbusBleService
@@ -47,7 +51,6 @@ _MONITOR_PROPS = {
     'Patterns': dbus.Array([_CATCH_ALL_PATTERN], signature='(yyay)'),
 }
 
-
 class _MonitorApp(dbus.service.Object):
     """ObjectManager root that exposes AdvertisementMonitor children to BlueZ.
 
@@ -67,7 +70,6 @@ class _MonitorApp(dbus.service.Object):
                 _MONITOR_IFACE: dbus.Dictionary(_MONITOR_PROPS, signature='sv'),
             }, signature='sa{sv}'),
         }, signature='oa{sa{sv}}')
-
 
 class _AdvMonitor(dbus.service.Object):
     """AdvertisementMonitor1 implementation for passive BLE scanning.
@@ -118,7 +120,6 @@ class _AdvMonitor(dbus.service.Object):
         if interface == _MONITOR_IFACE:
             return dbus.Dictionary(_MONITOR_PROPS, signature='sv')
         return dbus.Dictionary({}, signature='sv')
-
 
 class DbusBleSensors(object):
     """
@@ -264,9 +265,11 @@ class DbusBleSensors(object):
             if dev_mac not in self._known_mac:
                 self.snif_data(man_id, man_data)
 
-                # Victron manufacturer id 0x02E1: Orion-TR Smart vs SolarSense
+                # Victron manufacturer id 0x02E1: Orion-TR Smart, IP22 charger or SolarSense
                 if man_id == 0x02E1 and is_orion_tr_manufacturer_data(man_data):
                     device_class = BleDeviceOrionTR
+                elif man_id == 0x02E1 and is_ip22_charger_manufacturer_data(man_data):
+                    device_class = BleDeviceIP22Charger
                 else:
                     device_class = BleDevice.DEVICE_CLASSES.get(man_id, None)
                 if device_class is None:
@@ -438,7 +441,6 @@ class DbusBleSensors(object):
         man_name = MAN_NAMES.get(man_id, hex(man_id).upper())
         SNIF_LOGGER.info(f"{man_name!r}: {man_data!r}")
 
-
 class DatedDict(MutableMapping):
     """
     Dict keeping timestamps for each entries so that older ones can be purged.
@@ -486,7 +488,6 @@ class DatedDict(MutableMapping):
     def keys(self):
         return self._store.keys()
 
-
 def main():
     parser = ArgumentParser(description=sys.argv[0])
     parser.add_argument('--version', '-v', action='version', version=PROCESS_VERSION)
@@ -519,7 +520,6 @@ def main():
 
     logging.info('Starting service')
     GLib.MainLoop().run()
-
 
 if __name__ == "__main__":
     main()

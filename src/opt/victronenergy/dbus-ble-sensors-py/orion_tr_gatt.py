@@ -33,7 +33,6 @@ OPCODE_READY_TO_RECV = 0xF9
 
 AGENT_INTERFACE = "org.bluez.Agent1"
 
-
 def _cbor_uint(n: int) -> bytes:
     if n < 24:
         return bytes([n])
@@ -44,17 +43,14 @@ def _cbor_uint(n: int) -> bytes:
     return bytes([0x1A, (n >> 24) & 0xFF, (n >> 16) & 0xFF,
                   (n >> 8) & 0xFF, n & 0xFF])
 
-
 def _cbor_array(items: list) -> bytes:
     return bytes([0x9F]) + b"".join(items) + bytes([0xFF])
-
 
 def _cbor_bstr(data: bytes) -> bytes:
     n = len(data)
     if n < 24:
         return bytes([0x40 | n]) + data
     return bytes([0x58, n]) + data
-
 
 class _PairingAgent(dbus.service.Object):
     """BlueZ D-Bus pairing agent that provides the Victron default passkey."""
@@ -88,7 +84,6 @@ class _PairingAgent(dbus.service.Object):
     def Cancel(self):
         pass
 
-
 def _find_bluez_device(bus, mac):
     """Find (device_path, adapter_path) for *mac* across all BlueZ adapters."""
     om = dbus.Interface(
@@ -102,7 +97,6 @@ def _find_bluez_device(bus, mac):
             adapter_path = s[:s.index(suffix)]
             return s, adapter_path
     return "/org/bluez/hci0" + suffix, "/org/bluez/hci0"
-
 
 class AsyncGATTWriter:
     """
@@ -527,7 +521,6 @@ class AsyncGATTWriter:
                 error_handler=lambda e: None)
         except Exception:
             pass
-
 
 def _write_char(bus, char_paths: dict, char_uuid: str, data: bytes):
     path = char_paths[char_uuid]

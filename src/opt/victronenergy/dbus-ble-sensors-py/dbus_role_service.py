@@ -7,7 +7,6 @@ from functools import partial
 from conf import PROCESS_NAME, PROCESS_VERSION
 from vedbus import VeDbusService, VeDbusItemImport, VeDbusItemExport
 
-
 class DbusRoleService(object):
     """
     Role service class. Responsible for holding and sharing data through a dedicated dbus service.

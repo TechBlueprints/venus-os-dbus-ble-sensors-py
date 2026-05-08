@@ -7,7 +7,6 @@ import logging
 import unittest
 from ble_role_tank import BleRoleTank
 
-
 class TestBleRoleTank(unittest.TestCase):
     # To be executed with command : python3 -m unittest test_ble_role_tank.py
 

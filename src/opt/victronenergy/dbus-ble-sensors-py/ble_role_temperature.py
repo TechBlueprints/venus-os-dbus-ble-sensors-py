@@ -2,7 +2,6 @@ from ble_role import BleRole
 from ve_types import *
 import logging
 
-
 class BleRoleTemperature(BleRole):
     """
     Temperature sensor role class.

@@ -4,7 +4,6 @@ import logging
 from dbus_bus import get_bus
 from vedbus import VeDbusItemImport, VeDbusItemExport
 
-
 class DbusSettingsService(object):
     """
     Inspired from SettingsDevice class of settingsdevice.py file of velib_python, but :
