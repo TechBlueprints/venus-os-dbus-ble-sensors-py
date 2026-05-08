@@ -38,23 +38,40 @@ def _pkcs7_pad16(data: bytes) -> bytes:
     return data + bytes([pad_len]) * pad_len
 
 
+_AES_BLOCK_SIZE = 16
+_CTR_MASK_128 = (1 << 128) - 1
+
+
 def _aes_ctr_decrypt(key: bytes, iv_le_u16: int, ciphertext: bytes) -> bytes:
     """AES-128-CTR decrypt with a 128-bit little-endian counter.
 
-    The Victron Instant Readout payload is almost always a single 16-byte
-    AES block, so counter-increment semantics don't matter in practice
-    -- but we still mirror PyCryptodome's ``Counter.new(..., little_endian=True)``
-    for robustness.
+    Mirrors PyCryptodome's ``Counter.new(128, initial_value=iv, little_endian=True)``.
+    The cryptography library only offers a big-endian CTR mode (per
+    NIST SP 800-38A), so when that backend is selected we drive AES-ECB
+    manually, generating each keystream block from a little-endian-encoded
+    counter ourselves.  The Victron Instant Readout payload is almost
+    always a single 16-byte AES block in practice, but the LE counter
+    is still honoured across blocks for correctness.
     """
+    padded = _pkcs7_pad16(ciphertext)
     if _HAVE_CRYPTOGRAPHY:
-        nonce = iv_le_u16.to_bytes(16, "little")
-        decryptor = _CgCipher(_cg_algorithms.AES(key),
-                              _cg_modes.CTR(nonce)).decryptor()
-        return decryptor.update(_pkcs7_pad16(ciphertext)) + decryptor.finalize()
-    # PyCryptodome fallback (upstream reference)
+        encryptor = _CgCipher(_cg_algorithms.AES(key),
+                              _cg_modes.ECB()).encryptor()
+        out = bytearray()
+        counter = iv_le_u16
+        for i in range(0, len(padded), _AES_BLOCK_SIZE):
+            block_nonce = counter.to_bytes(_AES_BLOCK_SIZE, "little")
+            keystream = encryptor.update(block_nonce)
+            end = i + _AES_BLOCK_SIZE
+            block = padded[i:end]
+            out += bytes(b ^ k for b, k in zip(block, keystream))
+            counter = (counter + 1) & _CTR_MASK_128
+        encryptor.finalize()
+        return bytes(out)
+    # PyCryptodome reference implementation
     ctr = Counter.new(128, initial_value=iv_le_u16, little_endian=True)
     cipher = AES.new(key, AES.MODE_CTR, counter=ctr)
-    return cipher.decrypt(_pkcs7_pad16(ciphertext))
+    return cipher.decrypt(padded)
 
 
 from victron_ble.exceptions import AdvertisementKeyMismatchError

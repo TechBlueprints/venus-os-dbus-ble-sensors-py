@@ -53,7 +53,8 @@ def test_cryptography_patch_present() -> None:
 
 
 def test_aes_ctr_backends_agree_when_both_present() -> None:
-    """If both backends import, they must produce identical output."""
+    """If both backends import, they must produce identical output
+    across single block, multiple blocks, and a counter-carry boundary."""
     from victron_ble.devices import base
     if not (base._HAVE_CRYPTOGRAPHY and base._HAVE_PYCRYPTODOME):
         import pytest
@@ -64,14 +65,23 @@ def test_aes_ctr_backends_agree_when_both_present() -> None:
     from Crypto.Util.Padding import pad as _pycd_pad
 
     key = bytes(range(16))
-    iv = 0xABCD
-    plaintext = b"victron-ble-vendored-test-vector"
 
-    ctr = Counter.new(128, initial_value=iv, little_endian=True)
-    ref = AES.new(key, AES.MODE_CTR, counter=ctr).decrypt(_pycd_pad(plaintext, 16))
+    # iv = 0xABCD, single block (most common case in production)
+    # iv = 0xABCD, 16 full blocks (exercises counter increment)
+    # iv = 0xFF, 3 blocks (forces low-byte LE carry on first increment)
+    cases = [
+        (0xABCD, b"victron-ble-test"),
+        (0xABCD, bytes(range(256))),
+        (0xFF, bytes(range(48))),
+    ]
 
-    got = base._aes_ctr_decrypt(key, iv, plaintext)
-
-    assert ref == got, (
-        f"backend mismatch: cryptography={got.hex()} pycryptodome={ref.hex()}"
-    )
+    for iv, plaintext in cases:
+        ctr = Counter.new(128, initial_value=iv, little_endian=True)
+        ref = AES.new(key, AES.MODE_CTR, counter=ctr).decrypt(
+            _pycd_pad(plaintext, 16)
+        )
+        got = base._aes_ctr_decrypt(key, iv, plaintext)
+        assert got == ref, (
+            f"backend mismatch (iv={iv:#x} len={len(plaintext)}): "
+            f"cryptography={got.hex()} pycryptodome={ref.hex()}"
+        )
