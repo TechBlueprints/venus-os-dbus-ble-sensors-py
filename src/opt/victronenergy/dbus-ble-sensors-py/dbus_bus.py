@@ -23,19 +23,15 @@ import os
 import dbus
 import dbus.bus
 
-
 class SystemBus(dbus.bus.BusConnection):
     def __new__(cls):
         return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SYSTEM)
-
 
 class SessionBus(dbus.bus.BusConnection):
     def __new__(cls):
         return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SESSION)
 
-
 _bus_instances: dict[str, dbus.bus.BusConnection] = {}
-
 
 def get_bus(cache_key: str) -> dbus.bus.BusConnection:
     """Return a cached bus connection for *cache_key*, creating one if needed.

@@ -3,7 +3,6 @@ from ble_device import BleDevice
 import logging
 from dbus_role_service import DbusRoleService
 
-
 class BleDeviceMopeka(BleDevice):
     """
     Mopeka devices class managing :

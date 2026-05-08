@@ -43,7 +43,6 @@ C3_UUID = "97580003-ddf1-48be-b73e-182664615d8e"
 
 AGENT_INTERFACE = "org.bluez.Agent1"
 
-
 class _PairingAgent(dbus.service.Object):
     """BlueZ pairing agent that returns the Victron device passkey."""
 
@@ -76,10 +75,8 @@ class _PairingAgent(dbus.service.Object):
     def Cancel(self):
         pass
 
-
 def _err(*a):
     print(*a, file=sys.stderr, flush=True)
-
 
 def _cbor_uint(n):
     if n < 24:
@@ -91,10 +88,8 @@ def _cbor_uint(n):
     return bytes([0x1A, (n >> 24) & 0xFF, (n >> 16) & 0xFF,
                   (n >> 8) & 0xFF, n & 0xFF])
 
-
 def _cbor_array(items):
     return bytes([0x9F]) + b"".join(items) + bytes([0xFF])
-
 
 def _scan_for_key(blobs):
     target = bytes([0x19, 0xEC, 0x65, 0x50])
@@ -103,7 +98,6 @@ def _scan_for_key(blobs):
     if idx >= 0 and idx + 4 + 16 <= len(joined):
         return joined[idx + 4 : idx + 4 + 16]
     return None
-
 
 def _scan_for_vreg(blobs, vreg: int):
     """Extract the byte string that a Push response carries for *vreg*.
@@ -131,7 +125,6 @@ def _scan_for_vreg(blobs, vreg: int):
                 return joined[start : start + blen]
         idx = after
 
-
 def _find_bluez_device(bus, mac):
     """Find the BlueZ device object path + adapter path across all adapters."""
     om = dbus.Interface(bus.get_object("org.bluez", "/"),
@@ -146,7 +139,6 @@ def _find_bluez_device(bus, mac):
     # Fallback: construct from hci0
     return ("/org/bluez/hci0" + suffix,
             "/org/bluez/hci0")
-
 
 def _ensure_device_known(bus, mac, dev_path, adapter_path, pump_fn,
                          scan_s=8.0):
@@ -186,7 +178,6 @@ def _ensure_device_known(bus, mac, dev_path, adapter_path, pump_fn,
             f"{mac}: BlueZ never re-created Device1 on {dev_path} "
             f"after {scan_s:.0f}s scan")
     _err(f"Device1 restored on {dev_path}")
-
 
 def _ensure_paired(bus, dev_path, passkey, pump_fn, timeout_s=45.0):
     """If device isn't already paired, register a KeyboardDisplay agent
@@ -264,7 +255,6 @@ def _ensure_paired(bus, dev_path, passkey, pump_fn, timeout_s=45.0):
     _err(f"Paired with {dev_path}")
     return (agent, agent_path, agent_mgr)
 
-
 def _cleanup_agent(agent_info):
     if not agent_info:
         return
@@ -273,7 +263,6 @@ def _cleanup_agent(agent_info):
         agent_mgr.UnregisterAgent(dbus.ObjectPath(agent_path))
     except Exception:
         pass
-
 
 def provision(mac, passkey, timeout_s, preferred_adapter=None):
     bus = dbus.SystemBus()
@@ -853,7 +842,6 @@ def provision(mac, passkey, timeout_s, preferred_adapter=None):
         "adapter": used_adapter,
     }
 
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("mac")
@@ -871,7 +859,6 @@ def main():
     sys.stdout.write(json.dumps(result) + "\n")
     sys.stdout.flush()
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

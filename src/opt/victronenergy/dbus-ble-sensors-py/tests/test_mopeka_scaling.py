@@ -27,7 +27,6 @@ from ble_device_mopeka import BleDeviceMopeka
 from ble_role_tank import BleRoleTank
 from ble_role import BleRole
 
-
 # Raw advertisement captures from btmon (manufacturer_id=0x0059 payload only)
 # Sensor: Mopeka Pro LPG, HW ID 3
 RAW_STEEL_R = [
@@ -50,7 +49,6 @@ RAW_STEEL_L = [
     bytes.fromhex('03593bdc80a3daf40619'),
     bytes.fromhex('03593bdd80a3daf40419'),
 ]
-
 
 class TestMopekaRegisterParsing(unittest.TestCase):
     """Test that register parsing extracts correct values from raw bytes."""
@@ -158,7 +156,6 @@ class TestMopekaRegisterParsing(unittest.TestCase):
             voltages.add(parsed['tank']['BatteryVoltage'])
         self.assertTrue(len(voltages) >= 2,
                         f"Expected battery voltage variation, got {voltages}")
-
 
 class TestMopekaScaling(unittest.TestCase):
     """Test the temperature-dependent polynomial scaling of RawValue."""
@@ -272,7 +269,6 @@ class TestMopekaScaling(unittest.TestCase):
         self.assertNotEqual(parsed_r['tank']['Temperature'],
                             parsed_l['tank']['Temperature'],
                             "Steel R and L must have different temperatures")
-
 
 class TestMopekaEndToEnd(unittest.TestCase):
     """Test the full pipeline: raw bytes → scaling → level calculation."""
@@ -395,7 +391,6 @@ class TestMopekaEndToEnd(unittest.TestCase):
         )
         self.assertEqual(level_correct, 21,
                          "Scaled RawValue should give ~21%")
-
 
 if __name__ == '__main__':
     unittest.main()

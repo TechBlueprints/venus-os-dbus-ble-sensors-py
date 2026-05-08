@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 CERBO_BLE_SERVICE_PINCODE = "/Settings/Ble/Service/Pincode"
 
-
 def _parse_ini_pin() -> Optional[int]:
     path = ORION_OPTIONAL_INI
     if not path or not os.path.isfile(path):
@@ -40,7 +39,6 @@ def _parse_ini_pin() -> Optional[int]:
         logger.exception("Failed to read optional Orion pairing pin from %r", path)
         return None
 
-
 def _coerce_pin_value(raw) -> Optional[int]:
     if raw is None:
         return None
@@ -56,7 +54,6 @@ def _coerce_pin_value(raw) -> Optional[int]:
         return int(digits)
     except ValueError:
         return None
-
 
 def resolve_pairing_passkey(settings: DbusSettingsService) -> int:
     override = _parse_ini_pin()

@@ -3,7 +3,6 @@ import inspect
 import logging
 import importlib.util
 
-
 class BleRole(object):
     """
     Base class representing a type/kind/class of device.

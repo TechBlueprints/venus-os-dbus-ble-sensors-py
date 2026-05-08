@@ -55,7 +55,6 @@ _FRAME_HDR_SIZE = _FRAME_HDR.size  # 6
 # ── Receive buffer ────────────────────────────────────────────────────────
 _RECV_BUF = 4096
 
-
 # ── ctypes structure for sockaddr_hci ─────────────────────────────────────
 # Python's socket.bind() for AF_BLUETOOTH/BTPROTO_HCI only accepts (dev_id,)
 # and cannot set hci_channel (CPython issue 36132).  We call libc.bind()
@@ -68,7 +67,6 @@ class _HciSocketAddress(ctypes.Structure):
         ("channel", ctypes.c_ushort),
     ]
 
-
 @dataclass(slots=True)
 class TappedAdvertisement:
     """One parsed BLE advertisement from the monitor channel."""
@@ -78,11 +76,9 @@ class TappedAdvertisement:
     rssi: int
     manufacturer_data: dict[int, bytes] = field(default_factory=dict)
 
-
 def _format_mac(addr_bytes: bytes) -> str:
     """Convert 6 little-endian address bytes to lowercase hex (no separators)."""
     return addr_bytes[::-1].hex()
-
 
 def create_tap_socket() -> socket.socket:
     """Open a raw HCI socket bound to the monitor channel.
@@ -118,7 +114,6 @@ def create_tap_socket() -> socket.socket:
     sock.setblocking(False)
     return sock
 
-
 def _walk_ad_structures(data: bytes,
                         mfg_filter: frozenset[int] | None = None) -> dict[int, bytes]:
     """Parse AD structures and extract manufacturer-specific data entries.
@@ -149,7 +144,6 @@ def _walk_ad_structures(data: bytes,
                 result[company] = bytes(data[pos + 3 : pos + ad_len])
         pos += ad_len
     return result
-
 
 def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
                           mfg_filter: frozenset[int] | None = None,
@@ -201,7 +195,6 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
                 manufacturer_data=mfg,
             ))
     return results
-
 
 def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
                             mfg_filter: frozenset[int] | None = None,
@@ -270,7 +263,6 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
             ))
     return results
 
-
 def parse_monitor_frame(raw: bytes,
                         mfg_filter: frozenset[int] | None = None,
                         ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
@@ -307,7 +299,6 @@ def parse_monitor_frame(raw: bytes,
         return _parse_extended_reports(payload, 3, adapter_idx, mfg_filter, ignored_macs)
 
     return []
-
 
 def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
                  mfg_filter: frozenset[int] | None = None,

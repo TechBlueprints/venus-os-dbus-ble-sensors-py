@@ -3,7 +3,6 @@ from ve_types import *
 import logging
 import time
 
-
 class BleRoleTank(BleRole):
     """
     Tank level sensor role class.

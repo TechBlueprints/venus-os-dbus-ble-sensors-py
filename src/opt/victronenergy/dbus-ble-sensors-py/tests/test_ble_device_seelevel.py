@@ -20,7 +20,6 @@ import unittest
 from ble_device_seelevel_btp3 import BleDeviceSeeLevelBTP3
 from ble_device_seelevel_btp7 import BleDeviceSeeLevelBTP7
 
-
 # ===================================================================
 # Raw captures
 # ===================================================================
@@ -57,7 +56,6 @@ BTP3_BATTERY_13V7      = b'\x8d\x95i\r1370000000'     # sensor 13, val "137"
 
 BTP7_CAPTURE = bytes.fromhex('9104001900006e6e6e6e6e820000')
 
-
 # ===================================================================
 # Helpers
 # ===================================================================
@@ -69,7 +67,6 @@ class _NullRole:
     def update_data(self, role_service, sensor_data):
         pass
 
-
 def _get_alarm_low_state(role_service) -> int:
     if role_service['/Alarms/Low/Enable']:
         alarm_state = bool(role_service['/Alarms/Low/State'])
@@ -77,14 +74,12 @@ def _get_alarm_low_state(role_service) -> int:
         return int(float(role_service['Level']) < threshold)
     return 0
 
-
 def _get_alarm_high_state(role_service) -> int:
     if role_service['/Alarms/High/Enable']:
         alarm_state = bool(role_service['/Alarms/High/State'])
         threshold = role_service[f"/Alarms/High/{'Restore' if alarm_state else 'Active'}"]
         return int(float(role_service['Level']) > threshold)
     return 0
-
 
 class _MockTankRole:
     """Stub tank role with framework alarm definitions."""
@@ -97,7 +92,6 @@ class _MockTankRole:
 
     def update_data(self, role_service, sensor_data):
         pass
-
 
 class MockRoleService(dict):
     """Dict-like stand-in for DbusRoleService (no D-Bus required)."""
@@ -123,7 +117,6 @@ class MockRoleService(dict):
     def get_dbus_id(self):
         return 'test_dev/tank'
 
-
 def _make_device(cls, mac='00a0508d9569'):
     """Instantiate a SeeLevel device without D-Bus, wiring up minimal state."""
     dev = cls.__new__(cls)
@@ -145,7 +138,6 @@ def _make_device(cls, mac='00a0508d9569'):
     }
     return dev
 
-
 def _mock_create_service(dev, role_type, index, device_name=None, defaults=None):
     """Register a MockRoleService in the device's _role_services dict."""
     key = f'{role_type}_{index:02d}'
@@ -153,7 +145,6 @@ def _mock_create_service(dev, role_type, index, device_name=None, defaults=None)
     svc._device_name = device_name
     dev._role_services[key] = svc
     return svc
-
 
 # ===================================================================
 # BTP3 — check_manufacturer_data
@@ -187,7 +178,6 @@ class TestBTP3CheckManufacturerData(unittest.TestCase):
         # synthetic: sensor number 14 does not exist
         self.assertFalse(self.dev.check_manufacturer_data(
             b'\x8d\x95i\x0e0000000000'))
-
 
 # ===================================================================
 # BTP3 — handle_manufacturer_data
@@ -523,7 +513,6 @@ class TestBTP3HandleManufacturerData(unittest.TestCase):
         self.assertNotIn('Level', svc)
         self.assertFalse(svc.connected)
 
-
 # ===================================================================
 # BTP3 — service creation from raw captures (end-to-end)
 # ===================================================================
@@ -620,7 +609,6 @@ class TestBTP3ServiceCreation(unittest.TestCase):
         self.assertEqual(self.configs['tank_02'], {'custom_name': 'Wash Water', 'fluid_type': 2})
         self.assertEqual(self.configs['battery_13'], {'custom_name': 'SeeLevel Voltage'})
 
-
 # ===================================================================
 # BTP7 — service creation from raw capture (end-to-end)
 # ===================================================================
@@ -707,7 +695,6 @@ class TestBTP7ServiceCreation(unittest.TestCase):
             svc = self.dev._role_services[key]
             self.assertEqual(svc._device_name, name, f"{key} should be named {name!r}")
 
-
 # ===================================================================
 # BTP7 — check_manufacturer_data
 # ===================================================================
@@ -728,7 +715,6 @@ class TestBTP7CheckManufacturerData(unittest.TestCase):
     def test_rejects_11_bytes(self):
         """11 bytes is too short (missing battery byte)."""
         self.assertFalse(self.dev.check_manufacturer_data(BTP7_CAPTURE[:11]))
-
 
 # ===================================================================
 # BTP7 — handle_manufacturer_data (real capture)
@@ -904,7 +890,6 @@ class TestBTP7HandleManufacturerData(unittest.TestCase):
         svc = self.dev._role_services['battery_08']
         self.assertNotIn('/Dc/0/Voltage', svc)
 
-
 # ===================================================================
 # Sensor mapping consistency
 # ===================================================================
@@ -932,7 +917,6 @@ class TestSensorMappings(unittest.TestCase):
     def test_btp3_roles_include_all_three(self):
         for role in ('tank', 'temperature', 'battery'):
             self.assertIn(role, BleDeviceSeeLevelBTP3.ROLES)
-
 
 if __name__ == '__main__':
     unittest.main()

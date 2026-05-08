@@ -5,7 +5,6 @@ import logging
 import math
 from dbus_role_service import DbusRoleService
 
-
 class BleDeviceRuuvi(BleDevice):
     """
     Ruuvi devices class managing :

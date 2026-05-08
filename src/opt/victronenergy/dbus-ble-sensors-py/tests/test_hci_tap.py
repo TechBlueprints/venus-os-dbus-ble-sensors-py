@@ -28,11 +28,9 @@ from hci_advertisement_tap import (
     _AD_TYPE_MANUFACTURER,
 )
 
-
 def _build_monitor_frame(opcode: int, adapter_idx: int, payload: bytes) -> bytes:
     """Build a complete monitor channel frame with the 6-byte header."""
     return _FRAME_HDR.pack(opcode, adapter_idx, len(payload)) + payload
-
 
 def _build_legacy_hci_event(reports: list[tuple[int, int, bytes, bytes, int]]) -> bytes:
     """Build a complete HCI LE Meta Event with legacy advertising reports.
@@ -49,19 +47,16 @@ def _build_legacy_hci_event(reports: list[tuple[int, int, bytes, bytes, int]]) -
     event = bytes([_EVT_LE_META, len(body) + 1, _SUB_ADV_REPORT]) + body
     return event
 
-
 def _build_mfg_ad(company_id: int, payload: bytes) -> bytes:
     """Build a manufacturer-specific AD structure."""
     company_le = struct.pack("<H", company_id)
     ad_payload = company_le + payload
     return bytes([len(ad_payload) + 1, _AD_TYPE_MANUFACTURER]) + ad_payload
 
-
 def _mac_bytes(mac_str: str) -> bytes:
     """Convert 'AA:BB:CC:DD:EE:FF' to 6 little-endian bytes."""
     parts = mac_str.split(":")
     return bytes(int(p, 16) for p in reversed(parts))
-
 
 class TestWalkAdStructures(unittest.TestCase):
     def test_single_manufacturer_data(self):
@@ -106,7 +101,6 @@ class TestWalkAdStructures(unittest.TestCase):
         result = _walk_ad_structures(mfg1 + mfg2)
         self.assertIn(0x0059, result)
         self.assertIn(0x004C, result)
-
 
 class TestParseLegacyReports(unittest.TestCase):
     def test_single_report_with_manufacturer_data(self):
@@ -169,7 +163,6 @@ class TestParseLegacyReports(unittest.TestCase):
         body = bytes([1, 0x00, 0x01])  # num=1 but only 2 bytes of report
         results = _parse_legacy_reports(body, 0, adapter_idx=0)
         self.assertEqual(results, [])
-
 
 class TestParseExtendedReports(unittest.TestCase):
     def _build_ext_report(self, mac: str, ad_data: bytes, rssi: int = -60,
@@ -234,7 +227,6 @@ class TestParseExtendedReports(unittest.TestCase):
         results = _parse_extended_reports(b'', 0, adapter_idx=0)
         self.assertEqual(results, [])
 
-
 class TestParseMonitorFrame(unittest.TestCase):
     def test_legacy_adv_report(self):
         mac = "AA:BB:CC:DD:EE:FF"
@@ -273,7 +265,6 @@ class TestParseMonitorFrame(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].manufacturer_data[0x0059], b'\x03\xC3\x05\x00\x60\x40')
         self.assertEqual(results[0].rssi, -68)
-
 
 class TestMacLevelFiltering(unittest.TestCase):
     """Tests for the ignored_macs MAC-level pre-filter."""
@@ -426,7 +417,6 @@ class TestMacLevelFiltering(unittest.TestCase):
         results = _parse_legacy_reports(body, 0, adapter_idx=0, ignored_macs=ignored)
         self.assertEqual(len(results), 0)
 
-
 class TestRunTapLoop(unittest.TestCase):
     def test_stop_event_exits_loop(self):
         """run_tap_loop should exit promptly when stop_event is set."""
@@ -442,7 +432,6 @@ class TestRunTapLoop(unittest.TestCase):
         run_tap_loop(r, cb, stop)
         w.close()
         # Should not block or raise
-
 
 class TestTappedAdvertisement(unittest.TestCase):
     def test_dataclass_fields(self):
@@ -460,7 +449,6 @@ class TestTappedAdvertisement(unittest.TestCase):
     def test_default_manufacturer_data(self):
         adv = TappedAdvertisement(adapter_index=0, mac="A", address_type=0, rssi=0)
         self.assertEqual(adv.manufacturer_data, {})
-
 
 if __name__ == '__main__':
     unittest.main()

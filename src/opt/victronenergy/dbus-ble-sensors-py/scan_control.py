@@ -25,13 +25,11 @@ logger = logging.getLogger(__name__)
 
 _refs = 0
 
-
 def pause_scanning(reason: str = "") -> None:
     global _refs
     _refs += 1
     if _refs == 1:
         logger.info("BLE scan loop paused (%s)", reason or "unspecified")
-
 
 def resume_scanning(reason: str = "") -> None:
     global _refs
@@ -42,7 +40,6 @@ def resume_scanning(reason: str = "") -> None:
     _refs -= 1
     if _refs == 0:
         logger.info("BLE scan loop resumed (%s)", reason or "unspecified")
-
 
 def is_scanning_paused() -> bool:
     return _refs > 0

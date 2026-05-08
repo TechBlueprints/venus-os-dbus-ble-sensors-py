@@ -1,7 +1,6 @@
 from seelevel_common import BleDeviceSeeLevel
 import logging
 
-
 class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
     """
     SeeLevel 709-BTP3 (Cypress) tank/temperature/battery monitor.

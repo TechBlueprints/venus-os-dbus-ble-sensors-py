@@ -5,14 +5,12 @@ from unittest.mock import patch
 import dbus_bus
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def clear_cache():
     """Clear the connection cache between tests."""
     dbus_bus._bus_instances.clear()
     yield
     dbus_bus._bus_instances.clear()
-
 
 class FakeBus:
     """Minimal stand-in for dbus.bus.BusConnection."""
@@ -22,7 +20,6 @@ class FakeBus:
 
     def get_is_connected(self):
         return self._connected
-
 
 class TestGetBus:
     def test_returns_same_connection_for_same_key(self):
