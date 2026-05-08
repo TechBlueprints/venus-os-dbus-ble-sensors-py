@@ -56,7 +56,10 @@ Implementation notes:
 
 ## Installation
 
-### Quick Install (curl)
+> **Note:** This fork is installed via curl only.  The upstream opkg
+> feed does not carry the changes in this fork, so `opkg install
+> dbus-ble-sensors-py` will not work here.  See [PR #8](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/8)
+> for the rationale behind the curl-based installer.
 
 Run this one-liner on your Venus OS device (SSH as root):
 
@@ -64,9 +67,11 @@ Run this one-liner on your Venus OS device (SSH as root):
 curl -fsSL https://raw.githubusercontent.com/TechBlueprints/venus-os-dbus-ble-sensors-py/main/install.sh | bash
 ```
 
-This installs to `/data/apps/dbus-ble-sensors-py/` which persists across firmware updates automatically. If an existing opkg installation is detected, it will be cleanly removed and replaced (all device settings are preserved).
+This installs to `/data/apps/dbus-ble-sensors-py/`, which persists across firmware updates automatically.  If an existing opkg-based installation is detected, it will be cleanly removed and replaced — all device settings are preserved.
 
-To update, re-run the same command. To disable:
+To update, re-run the same command.
+
+To disable:
 
 ``` bash
 bash /data/apps/dbus-ble-sensors-py/disable.sh
@@ -83,18 +88,6 @@ To fully remove:
 ``` bash
 bash /data/apps/dbus-ble-sensors-py/disable.sh
 rm -rf /data/apps/dbus-ble-sensors-py
-```
-
-### Alternative: opkg Install
-
-Add the [venus-os-configuration opkg feed](https://github.com/ldenisey/venus-os-configuration/blob/main/docs/VenusOS-Opkg_configuration.md#adding-custom-feed), then :
-``` bash
-opkg install dbus-ble-sensors-py
-```
-
-To make it persistent to Venus OS firmware upgrades, you can [install mod-persist](https://github.com/ldenisey/venus-os-mod-persist/tree/main?tab=readme-ov-file#installation) then :
-``` bash
-persist-opkg install dbus-ble-sensors-py
 ```
 
 ## Usage
