@@ -169,6 +169,43 @@ chmod +x "$INSTALL_DIR"/service-launcher/run 2>/dev/null || true
 chmod +x "$INSTALL_DIR"/service-launcher/log/run 2>/dev/null || true
 chmod +x "$INSTALL_DIR"/*.sh 2>/dev/null || true
 
+# Take down a service tree cleanly before we replace it.
+#
+# daemontools normally responds to `svc -d` on the parent service, but the
+# log sub-service runs its own `multilog` process which holds an fcntl lock
+# on /var/log/$svc_name/.  If we just `rm -rf /service/$svc_name` while
+# multilog is still alive, the lock survives and the *new* multilog can
+# never start, leaving the new service running with no log output.
+#
+# Belt and suspenders:
+#   1. svc -d the log service first so multilog gets SIGTERM
+#   2. svc -d the parent service
+#   3. pkill any multilog whose argv references our log dir, in case the
+#      log service entry was missing/broken (i.e. supervise wasn't
+#      managing it any more so svc -d was a no-op)
+stop_service_tree() {
+    local svc_name="$1"
+    local link="/service/$svc_name"
+    local log_dir="/var/log/$svc_name"
+
+    if [ -e "$link" ]; then
+        if [ -d "$link/log" ] || [ -L "$link/log" ]; then
+            svc -d "$link/log" 2>/dev/null || true
+        fi
+        svc -d "$link" 2>/dev/null || true
+        sleep 1
+    fi
+
+    if pgrep -f "multilog .* $log_dir\$" >/dev/null 2>&1; then
+        pkill -f "multilog .* $log_dir\$" 2>/dev/null || true
+        sleep 1
+        if pgrep -f "multilog .* $log_dir\$" >/dev/null 2>&1; then
+            pkill -KILL -f "multilog .* $log_dir\$" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+}
+
 # Create or update service symlinks
 for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME"; do
     link="/service/$svc_name"
@@ -178,11 +215,9 @@ for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME"; do
         target="$INSTALL_DIR/service-launcher"
     fi
 
-    if [ -L "$link" ]; then
-        rm "$link"
-    elif [ -d "$link" ]; then
-        svc -d "$link" 2>/dev/null || true
-        sleep 1
+    stop_service_tree "$svc_name"
+
+    if [ -L "$link" ] || [ -e "$link" ]; then
         rm -rf "$link"
     fi
     ln -s "$target" "$link"
@@ -209,23 +244,97 @@ else
 fi
 echo ""
 
-# --- Step 8: Start or restart ---
+# --- Step 8: Start services ---
+#
+# Step 6 always takes the existing service tree down (so multilog can
+# release the log-dir lock) and then re-creates the /service/ symlinks.
+# That means at this point the launcher and service are guaranteed to
+# be down, regardless of whether the install was a fresh clone or a
+# no-op upgrade.  `svstat` reports e.g. "down 5 seconds, normally up"
+# so we can't pattern-match for the literal word "up" -- we look for
+# "up (pid", which only appears when the service is actively running.
+
+is_service_up() {
+    svstat "$1" 2>/dev/null | grep -q "up (pid"
+}
 
 echo "Step 8: Starting services..."
 
-if [ "$NEEDS_RESTART" = true ] || ! svstat "/service/$SERVICE_NAME" 2>/dev/null | grep -q "up"; then
-    svc -u "/service/$LAUNCHER_NAME" 2>/dev/null || true
-    sleep 3
+# Bring up each service tree explicitly.  daemontools does not
+# recursively manage the log sub-service: `svc -u /service/x` only
+# starts /service/x/run, not /service/x/log.  The log sub-service is
+# its own supervise instance and needs its own `svc -u` call,
+# otherwise multilog never starts and the log file stays stale.
+for svc_name in "$LAUNCHER_NAME" "$SERVICE_NAME"; do
+    svc -u "/service/$svc_name/log" 2>/dev/null || true
+done
+svc -u "/service/$LAUNCHER_NAME" 2>/dev/null || true
 
-    if svstat "/service/$SERVICE_NAME" 2>/dev/null | grep -q "up"; then
-        echo "  Service started successfully"
-    else
-        echo "  Service may still be starting (launcher controls lifecycle)"
+# Wait up to 10 seconds for the worker to be supervised "up (pid ...)".
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if is_service_up "/service/$SERVICE_NAME"; then
+        echo "  Service started successfully (after ${i}s)"
+        break
     fi
+    sleep 1
+done
+
+if ! is_service_up "/service/$SERVICE_NAME"; then
+    echo "  Service did not come up within 10s — launcher may be"
+    echo "  waiting on /Settings/Services/BleSensors=1 or hardware."
+fi
+echo ""
+
+# --- Step 9: Post-install verification ---
+#
+# Confirms the service is actually running from $INSTALL_DIR (not a leftover
+# /opt/ install) and that multilog is appending to the log file.  Surfaces
+# the most common silent-fail modes that would otherwise look healthy in
+# `svstat`.
+
+echo "Step 9: Verifying installation..."
+
+verify_install() {
+    sleep 4  # give the service time to import + start logging
+
+    local pid
+    pid=$(pgrep -f "$INSTALL_DIR/.*dbus_ble_sensors.py" 2>/dev/null | head -n 1)
+
+    if [ -z "$pid" ]; then
+        echo "  WARN: no dbus_ble_sensors.py process running from $INSTALL_DIR"
+        echo "        check 'tail /var/log/$SERVICE_NAME/current'"
+        return 1
+    fi
+
+    echo "  Service running as pid $pid"
+
+    local log_file="/var/log/$SERVICE_NAME/current"
+    if [ ! -f "$log_file" ]; then
+        echo "  WARN: log file $log_file does not exist yet"
+        return 1
+    fi
+
+    local now
+    local mtime
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$log_file" 2>/dev/null || echo 0)
+    local age=$((now - mtime))
+
+    if [ "$age" -lt 60 ]; then
+        echo "  Log file is fresh (last write ${age}s ago)"
+    else
+        echo "  WARN: log file last modified ${age}s ago"
+        echo "        a stale multilog may be holding the lock; check"
+        echo "        'pgrep -af multilog | grep $SERVICE_NAME'"
+        return 1
+    fi
+}
+
+if verify_install; then
+    echo "  All checks passed"
 else
-    svc -t "/service/$SERVICE_NAME" 2>/dev/null || true
-    sleep 2
-    echo "  Service restarted"
+    echo "  Some checks did not pass — install may still recover, but"
+    echo "  inspect the log path above before relying on the install."
 fi
 echo ""
 
