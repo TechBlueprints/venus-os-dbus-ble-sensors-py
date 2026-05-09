@@ -41,16 +41,47 @@ fi
 echo ""
 
 # --- Step 2: Ensure git is available ---
+#
+# Venus OS ships with rootfs (/) mounted read-only.  When git is missing
+# we temporarily remount rw, install via opkg, and revert to ro.  An EXIT
+# trap guarantees the rootfs is restored to ro even if opkg fails, the
+# script is interrupted, or a later step exits non-zero.
 
 echo "Step 2: Checking for git..."
 if ! command -v git >/dev/null 2>&1; then
-    echo "  Git not found. Installing..."
-    opkg update >/dev/null 2>&1 || true
-    if ! opkg install git; then
-        echo "Error: Failed to install git."
+    echo "  Git not found. Installing via opkg (temporary remount,rw)..."
+
+    # Only remount if rootfs is currently mounted ro.  On a system that
+    # already happens to have / mounted rw (developer device, etc.) we
+    # leave the mount state alone.
+    if grep -qE '^[^ ]+ / [^ ]+ ro[, ]' /proc/mounts; then
+        if ! mount -o remount,rw /; then
+            echo "Error: Could not remount / read-write to install git."
+            exit 1
+        fi
+        # Restore ro on any exit path (success, opkg failure, ^C, later
+        # step failure).  Mount may already be back to ro by then; that's
+        # fine, the second remount is a no-op.
+        trap 'mount -o remount,ro / 2>/dev/null || true' EXIT
+        REMOUNTED_FOR_GIT=true
+    else
+        REMOUNTED_FOR_GIT=false
+    fi
+
+    if ! opkg update; then
+        echo "Error: opkg update failed.  Check the device's network."
         exit 1
     fi
-    echo "  Git installed"
+    if ! opkg install git; then
+        echo "Error: Failed to install git via opkg."
+        exit 1
+    fi
+
+    if [ "$REMOUNTED_FOR_GIT" = true ]; then
+        mount -o remount,ro / 2>/dev/null || true
+        trap - EXIT
+    fi
+    echo "  Git installed (rootfs returned to read-only)"
 else
     echo "  Git already available"
 fi
