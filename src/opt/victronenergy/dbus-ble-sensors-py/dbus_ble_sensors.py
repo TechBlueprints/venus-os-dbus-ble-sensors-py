@@ -20,6 +20,7 @@ from conf import IGNORED_DEVICES_TIMEOUT, DEVICE_SERVICES_TIMEOUT, PROCESS_VERSI
 from hci_advertisement_tap import (
     create_tap_socket, run_tap_loop, TappedAdvertisement,
 )
+from ble_advertisement_router import BleAdvertisementRouter
 
 ADV_LOG_QUIET_PERIOD = 1800
 SILENCE_WARNING_SECONDS = 300
@@ -153,7 +154,8 @@ class DbusBleSensors(object):
         BleRole.load_classes(os.path.abspath(__file__))
         BleDevice.load_classes(os.path.abspath(__file__))
 
-        self._known_mfg_ids: frozenset[int] = frozenset(BleDevice.DEVICE_CLASSES.keys())
+        self._internal_mfg_ids: frozenset[int] = frozenset(BleDevice.DEVICE_CLASSES.keys())
+        self._known_mfg_ids: set[int] = set(self._internal_mfg_ids)
         self._last_mfg_data: dict[str, tuple[bytes, float]] = {}
         self._tap_seen_macs: dict[str, float] = {}
         self._tap_ignored_macs: set[str] = set()
@@ -169,6 +171,12 @@ class DbusBleSensors(object):
         )
 
         self._list_adapters()
+
+        self._router = BleAdvertisementRouter(
+            self._dbus,
+            version=PROCESS_VERSION,
+            on_registrations_changed=self._on_registrations_changed,
+        )
 
     def _list_adapters(self):
         self._dbus.add_signal_receiver(
@@ -250,26 +258,38 @@ class DbusBleSensors(object):
     def _on_monitor_register_failed(self, adapter_name: str, exc):
         logging.warning(f"{adapter_name}: failed to register monitor: {exc}")
 
-    def _process_advertisement(self, dev_mac: str, manufacturer_data: dict[int, bytes]):
-        """Process a single BLE advertisement (called on the GLib main thread)."""
+    def _process_advertisement(self, dev_mac: str, manufacturer_data: dict[int, bytes],
+                               adapter_index: int = 0, rssi: int = 0):
+        """Process a single BLE advertisement (called on the GLib main thread).
+
+        Each (mfg_id, data) pair is offered to both the internal device class
+        system and the external advertisement router.  A MAC is only added to
+        the ignore list when *neither* system is interested.
+        """
         if dev_mac in self._ignored_mac:
             if dev_mac not in self._known_mac:
                 return
             del self._ignored_mac[dev_mac]
             logging.debug(f"{dev_mac}: recovered known device from ignored list")
 
+        adapter_name = f"hci{adapter_index}"
+
         for man_id, man_data in manufacturer_data.items():
+            routed = self._router.process_advertisement(
+                dev_mac, man_id, man_data, rssi, adapter_name)
+
             if dev_mac not in self._known_mac:
                 self.snif_data(man_id, man_data)
 
                 device_class = BleDevice.DEVICE_CLASSES.get(man_id, None)
                 if device_class is None:
-                    now = time.monotonic()
-                    if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
-                        logging.info(f"{dev_mac}: ignoring manufacturer {man_id:#06x}, no device class")
-                    self._last_adv_seen[dev_mac] = now
-                    self._ignored_mac[dev_mac] = True
-                    self._tap_ignored_macs.add(dev_mac)
+                    if not routed:
+                        now = time.monotonic()
+                        if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+                            logging.info(f"{dev_mac}: ignoring manufacturer {man_id:#06x}, no device class")
+                        self._last_adv_seen[dev_mac] = now
+                        self._ignored_mac[dev_mac] = man_id
+                        self._tap_ignored_macs.add(dev_mac)
                     continue
 
                 logging.info(f"{dev_mac}: initializing device with class {device_class}")
@@ -279,8 +299,9 @@ class DbusBleSensors(object):
                         logging.info(
                             f"{dev_mac}: manufacturer data check failed for "
                             f"{device_class.__name__}, ignoring")
-                        self._ignored_mac[dev_mac] = True
-                        self._tap_ignored_macs.add(dev_mac)
+                        if not routed:
+                            self._ignored_mac[dev_mac] = man_id
+                            self._tap_ignored_macs.add(dev_mac)
                         continue
                     dev_instance.configure(man_data)
                     dev_instance.init()
@@ -288,13 +309,15 @@ class DbusBleSensors(object):
                 except ValueError as exc:
                     logging.info(f"{dev_mac}: device configuration invalid for "
                                  f"{device_class.__name__}: {exc}")
-                    self._ignored_mac[dev_mac] = True
-                    self._tap_ignored_macs.add(dev_mac)
+                    if not routed:
+                        self._ignored_mac[dev_mac] = man_id
+                        self._tap_ignored_macs.add(dev_mac)
                     continue
                 except Exception:
                     logging.exception(f"{dev_mac}: unexpected error during device initialization")
-                    self._ignored_mac[dev_mac] = True
-                    self._tap_ignored_macs.add(dev_mac)
+                    if not routed:
+                        self._ignored_mac[dev_mac] = man_id
+                        self._tap_ignored_macs.add(dev_mac)
                     continue
             else:
                 dev_instance = self._known_mac[dev_mac]
@@ -313,7 +336,8 @@ class DbusBleSensors(object):
     def _glib_process_tap(self, adv: TappedAdvertisement):
         """GLib idle callback — bridges from tap thread to main thread."""
         try:
-            self._process_advertisement(adv.mac, adv.manufacturer_data)
+            self._process_advertisement(adv.mac, adv.manufacturer_data,
+                                        adv.adapter_index, adv.rssi)
         except Exception:
             logging.exception(f"Error processing tap advertisement from {adv.mac}")
         return False
@@ -372,7 +396,51 @@ class DbusBleSensors(object):
     def start(self):
         """Start the service: open the tap immediately, begin pruning timer."""
         self._start_tap()
+        self._router.start()
         GLib.timeout_add_seconds(30, self._prune_tick)
+
+    def _on_registrations_changed(self):
+        """Called by the router when external registrations change.
+
+        Mutates the tap manufacturer-ID filter in place (the tap thread holds
+        a reference to the same set object) and clears MACs from the
+        suppression lists when a new MAC-level registration matches them.
+
+        Only MAC-based registrations unsuppress previously-ignored MACs.
+        Manufacturer-level registrations don't unsuppress because
+        advertisements from ignored MACs already pass through the router
+        before the internal device-class check (so the router will see them
+        once they naturally re-appear after TTL expiry).  Unsuppressing by
+        manufacturer ID would cause a storm of re-evaluation for devices
+        that share a company ID with the registrant but have no matching
+        product ID.
+        """
+        external_ids = self._router.get_registered_mfg_ids()
+        new_ids = self._internal_mfg_ids | external_ids
+        self._known_mfg_ids.update(new_ids)
+        stale = self._known_mfg_ids - new_ids
+        if stale:
+            self._known_mfg_ids.difference_update(stale)
+        logging.info("Tap mfg filter updated: %d IDs (%d internal + %d external)",
+                     len(self._known_mfg_ids), len(self._internal_mfg_ids),
+                     len(external_ids))
+
+        registered_macs = self._router.get_registered_macs()
+        if not registered_macs:
+            return
+
+        to_unsuppress: list[str] = []
+        for mac in list(self._ignored_mac):
+            if mac in registered_macs:
+                to_unsuppress.append(mac)
+
+        for mac in to_unsuppress:
+            del self._ignored_mac[mac]
+            self._tap_ignored_macs.discard(mac)
+            self._last_mfg_data.pop(mac, None)
+
+        if to_unsuppress:
+            logging.info("Unsuppressed %d MAC(s) due to new MAC registrations", len(to_unsuppress))
 
     def _prune_tick(self):
         """GLib timer callback — prune caches, check tap health."""
