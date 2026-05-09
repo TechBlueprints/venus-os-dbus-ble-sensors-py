@@ -120,7 +120,7 @@ def create_tap_socket() -> socket.socket:
 
 
 def _walk_ad_structures(data: bytes,
-                        mfg_filter: frozenset[int] | None = None) -> dict[int, bytes]:
+                        mfg_filter: frozenset[int] | set[int] | None = None) -> dict[int, bytes]:
     """Parse AD structures and extract manufacturer-specific data entries.
 
     AD structure format (Bluetooth Core Spec Supplement, Part A):
@@ -152,7 +152,7 @@ def _walk_ad_structures(data: bytes,
 
 
 def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
-                          mfg_filter: frozenset[int] | None = None,
+                          mfg_filter: frozenset[int] | set[int] | None = None,
                           ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
     """Parse LE Advertising Report (subevent 0x02).
 
@@ -204,7 +204,7 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
 
 
 def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
-                            mfg_filter: frozenset[int] | None = None,
+                            mfg_filter: frozenset[int] | set[int] | None = None,
                             ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
     """Parse LE Extended Advertising Report (subevent 0x0D).
 
@@ -272,7 +272,7 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
 
 
 def parse_monitor_frame(raw: bytes,
-                        mfg_filter: frozenset[int] | None = None,
+                        mfg_filter: frozenset[int] | set[int] | None = None,
                         ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
     """Parse one monitor channel datagram into advertisement(s).
 
@@ -310,7 +310,7 @@ def parse_monitor_frame(raw: bytes,
 
 
 def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
-                 mfg_filter: frozenset[int] | None = None,
+                 mfg_filter: frozenset[int] | set[int] | None = None,
                  ignored_macs: set[str] | None = None):
     """Read monitor frames and invoke callback for each parsed advertisement.
 
