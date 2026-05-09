@@ -168,51 +168,44 @@ echo ""
 # stable BLE scanning impossible without a patch.
 #
 # We vendor TechBlueprints/victron-bluetooth-safety into
-# ext/victron-bluetooth-safety/ and use its inline snippet
-# (vesmart-safety.sh / ensure_vesmart_safe), which patches by method
-# name via Python regex.  This is version-agnostic across Venus OS
-# releases, unlike the full unified-diff patches in
-# victron-bluetooth-safety.sh which are pinned to specific upstream
-# versions and fail to apply when Victron edits gattserver.py.
+# ext/victron-bluetooth-safety/ and run its installer in `--mode patch`.
+# The fix is applied entirely with `mount --bind` -- the rootfs is
+# never modified -- and a `/data/rc.local` boot hook re-establishes it
+# on every reboot (including after Venus OS firmware updates).
 #
-# The full installer is still copied to /data/victron-bluetooth-safety/
-# for advanced users who want the per-GATT-client tracking variant
-# (sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh install).
-# service/run also re-sources the inline snippet on every (re)start so
-# a firmware update that reverts the patch self-heals automatically.
+# See ext/victron-bluetooth-safety/VENDORED.md for the design rationale
+# and the alternative `--mode disable` for setups that don't use
+# VictronConnect over BLE.
 
 echo "Step 5.5: Applying vesmart-server safety patch..."
 
 VBS_SRC="$INSTALL_DIR/$APP_DIR/ext/victron-bluetooth-safety"
 VBS_DEST="/data/victron-bluetooth-safety"
 
-if [ ! -f "$VBS_SRC/vesmart-safety.sh" ]; then
+if [ ! -f "$VBS_SRC/victron-bluetooth-safety.sh" ]; then
     echo "  WARN: vendored ext/victron-bluetooth-safety/ not found — skipping"
-    echo "        ($VBS_SRC/vesmart-safety.sh missing)"
+    echo "        ($VBS_SRC/victron-bluetooth-safety.sh missing)"
 else
-    mkdir -p "$VBS_DEST/patches"
-    cp "$VBS_SRC/vesmart-safety.sh"           "$VBS_DEST/"
+    mkdir -p "$VBS_DEST"
     cp "$VBS_SRC/victron-bluetooth-safety.sh" "$VBS_DEST/"
-    cp "$VBS_SRC/patches/gattserver.py.patch" "$VBS_DEST/patches/"
-    cp "$VBS_SRC/patches/vesmart_server.py.patch" "$VBS_DEST/patches/"
-    chmod +x "$VBS_DEST/victron-bluetooth-safety.sh"
+    cp "$VBS_SRC/patcher.py"                  "$VBS_DEST/"
+    cp "$VBS_SRC/noop-run"                    "$VBS_DEST/"
+    chmod +x "$VBS_DEST/victron-bluetooth-safety.sh" \
+             "$VBS_DEST/patcher.py" \
+             "$VBS_DEST/noop-run"
 
-    # Source and call the version-agnostic inline patcher.  It's a
-    # no-op when already patched, and on first apply it patches
-    # gattserver.py by method name (works across Venus OS releases).
-    # shellcheck disable=SC1090
-    . "$VBS_DEST/vesmart-safety.sh"
-    if ensure_vesmart_safe 2>&1 | sed 's/^/  /'; then
-        :
-    fi
+    # Run the unified installer.  It writes the /data/rc.local hook,
+    # bind-mounts a patched gattserver.py over the upstream file, and
+    # restarts vesmart-server.  Idempotent on re-run.
+    sh "$VBS_DEST/victron-bluetooth-safety.sh" install --mode patch 2>&1 | sed 's/^/  /'
 
-    # Verify the patch actually landed (or was already there).
-    if grep -q '# vesmart-safety' /opt/victronenergy/vesmart-server/gattserver.py 2>/dev/null; then
-        echo "  vesmart-server patched"
+    # Verify the bind mount is active.
+    if awk '$2 == "/opt/victronenergy/vesmart-server/gattserver.py" {found=1} END {exit !found}' /proc/mounts; then
+        echo "  vesmart-server patched (bind mount active)"
     else
         echo "  WARN: vesmart-server is NOT patched (60s mass-disconnect still active)"
         echo "        BLE scans will be disrupted every minute until patched."
-        echo "        Check: . $VBS_DEST/vesmart-safety.sh && ensure_vesmart_safe"
+        echo "        Check: sh $VBS_DEST/victron-bluetooth-safety.sh status"
     fi
 fi
 echo ""

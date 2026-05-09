@@ -119,17 +119,13 @@ This fork also bundles [TechBlueprints/victron-bluetooth-safety](https://github.
 
 It patches Venus OS's `vesmart-server` to stop a hardcoded 60-second timer that disconnects **every** connected BLE device on **every** adapter — see [victronenergy/venus#1587](https://github.com/victronenergy/venus/issues/1587).  Without this patch, third-party BLE services (this one included) cannot maintain stable scans or connections on a Cerbo running `vesmart-server`.
 
-The default code path uses the **version-agnostic inline snippet** (`vesmart-safety.sh`), which patches `gattserver.py` by method name via Python regex and works across Venus OS releases.  It self-heals two ways:
+The fix is applied entirely with `mount --bind` — the rootfs is **never modified**.  A `/data/rc.local` boot hook re-establishes the bind mount on every reboot, including after Venus OS firmware updates, by re-deriving a patched copy from whatever upstream `gattserver.py` is currently shipping.  This follows the [Venus OS wiki guidance](https://github.com/victronenergy/venus/wiki/howto-add-a-driver-to-Venus#how-to-make-changes-that-dont-get-lost-on-a-firmware-update) for persistent customizations.
 
-1. `install.sh` sources the snippet and calls `ensure_vesmart_safe` once during installation.
-2. `service/run` re-sources the snippet on every (re)start of `dbus-ble-sensors-py`, so a firmware update that reverts the patch is fixed up automatically the next time the service starts.
-
-The full installer with per-GATT-client tracking is also vendored for advanced users:
+`install.sh` runs the bundled installer in `--mode patch` (preserves VictronConnect over BLE).  An alternative `--mode disable` is documented in `ext/victron-bluetooth-safety/VENDORED.md` for setups that don't need VictronConnect.
 
 ``` bash
-sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh install
 sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh status
 sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh uninstall
 ```
 
-The full installer applies version-pinned unified diffs in `patches/` and may fail on Venus OS releases other than the one the patches were generated against.  See `ext/victron-bluetooth-safety/VENDORED.md` for the source SHA, the difference between the two approaches, and the update procedure.
+Uninstall is a single `umount` plus removal of the `rc.local` block — there is no patched file to revert.  See `ext/victron-bluetooth-safety/VENDORED.md` for the source SHA and update procedure.
