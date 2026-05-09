@@ -16,6 +16,12 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
 
     Cf.
     - https://github.com/TechBlueprints/victron-seelevel-python
+
+    Attribution:
+        BTP7 advertisement-format decoding originally contributed by
+        Andreas Tillack (@atillack) at
+        https://github.com/atillack/victron-seelevel-python (merged
+        upstream as PR #2 of TechBlueprints/victron-seelevel-python).
     """
 
     MANUFACTURER_ID = 0x0CC0  # 3264
