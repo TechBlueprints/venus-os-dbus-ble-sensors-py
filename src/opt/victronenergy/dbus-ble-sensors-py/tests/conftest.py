@@ -30,6 +30,9 @@ _dbus_stub.SystemBus = lambda **kw: None
 _dbus_stub.SessionBus = lambda **kw: None
 _dbus_stub.Interface = lambda *a, **kw: None
 _dbus_stub.String = str
+_dbus_stub.UInt16 = int
+_dbus_stub.Int16 = int
+_dbus_stub.Array = lambda data, signature=None: list(data)
 _dbus_stub.Bus = type('Bus', (), {})
 
 _dbus_bus_stub = sys.modules['dbus.bus']
@@ -40,6 +43,30 @@ _dbus_bus_stub.BusConnection = type('BusConnection', (), {
     'get_is_connected': lambda self: True,
 })
 _dbus_stub.bus = _dbus_bus_stub
+
+# Wire dbus.service so subclassing dbus.service.Object works under the stub
+# (used by the BLE advertisement router and any future D-Bus object).
+_dbus_service_stub = sys.modules['dbus.service']
+
+
+class _FakeDbusObject:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def _fake_dbus_decorator(*args, **kwargs):
+    def _wrap(fn):
+        return fn
+    return _wrap
+
+
+_dbus_service_stub.Object = _FakeDbusObject
+_dbus_service_stub.BusName = type('BusName', (), {
+    '__new__': lambda cls, *a, **kw: object.__new__(cls),
+})
+_dbus_service_stub.method = _fake_dbus_decorator
+_dbus_service_stub.signal = _fake_dbus_decorator
+_dbus_stub.service = _dbus_service_stub
 
 # GLib stub with enough surface for BleRoleDigitalInput (timeout_add_seconds)
 _gi_repo = sys.modules['gi.repository']
