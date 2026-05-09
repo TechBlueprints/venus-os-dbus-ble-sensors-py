@@ -99,6 +99,15 @@ References
 - BTP7 btmon capture: https://github.com/TechBlueprints/victron-seelevel-python/issues/1
 - BTP7 PR discussion: https://github.com/TechBlueprints/victron-seelevel-python/pull/2
 - Original Python impl: https://github.com/TechBlueprints/victron-seelevel-python
+
+Attribution
+-----------
+
+BTP7 advertisement-format decoding (manufacturer ID 0x0CC0, byte
+layout above, error codes 101-111) was originally contributed by
+Andreas Tillack (@atillack) at
+https://github.com/atillack/victron-seelevel-python and merged
+upstream as PR #2 of TechBlueprints/victron-seelevel-python.
 """
 
 from ve_types import *
