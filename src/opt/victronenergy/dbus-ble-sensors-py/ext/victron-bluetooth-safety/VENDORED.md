@@ -3,7 +3,7 @@
 ## Source
 
 - Repository: https://github.com/TechBlueprints/victron-bluetooth-safety
-- Commit: `f0c95eacc060a8f0e2087275932b7afc942e06d5`
+- Commit: `97c6fae2ebd7b90c92e7ea778c98cbbdbb1cb9b8`
 - License: Apache 2.0 (see `LICENSE`)
 
 ## What this is
