@@ -27,15 +27,6 @@ if [ "$(get_setting /Settings/Services/BleSensors)" != 1 ]; then
   exit 1
 fi
 
-# Re-apply the vesmart-server safety patch if a firmware update reverted
-# it.  ensure_vesmart_safe is idempotent and a fast no-op when already
-# patched (just one grep) so it's cheap to call on every (re)start.
-# See ext/victron-bluetooth-safety/VENDORED.md for the rationale.
-if [ -f /data/victron-bluetooth-safety/vesmart-safety.sh ]; then
-  . /data/victron-bluetooth-safety/vesmart-safety.sh
-  ensure_vesmart_safe || echo "Note: ensure_vesmart_safe returned non-zero (continuing)"
-fi
-
 # AdvertisementMonitor1 passive scanning requires bluetoothd with --experimental.
 # Start it if not running; log a note if running without -E.
 if ! pidof bluetoothd > /dev/null 2>&1; then

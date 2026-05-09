@@ -1,6 +1,6 @@
 #!/bin/sh
-# victron-bluetooth-safety.sh — Patch vesmart-server to only disconnect its own GATT clients
-# Version: 1.0.0
+# victron-bluetooth-safety.sh — Stop vesmart-server from mass-disconnecting BLE
+# Version: 2.0.0
 #
 # Copyright 2026 TechBlueprints
 #
@@ -16,262 +16,280 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Patches vesmart-server on Venus OS so that its keep-alive timer only
-# disconnects devices that have actually interacted with the VE.Smart
-# GATT service (i.e., VictronConnect clients), instead of disconnecting
-# ALL BLE devices on ALL adapters.
+# Venus OS upstream issue:
+#   https://github.com/victronenergy/venus/issues/1587
 #
-# This allows vesmart-server to continue running (preserving VictronConnect
-# BLE access) while preventing it from interfering with third-party BLE
-# connections (battery monitors, sensors, etc.).
+# This installer follows the Venus OS wiki pattern for persistent
+# customizations (data partition + /data/rc.local boot hook) and applies
+# its fix using bind mounts, so the rootfs is never modified.
 #
-# See: https://github.com/victronenergy/venus/issues/1587
+#   patch    bind-mount a regex-patched gattserver.py over the upstream
+#            file. vesmart-server keeps running; VictronConnect over BLE
+#            keeps working; only the 60s mass-disconnect timer is neutered.
 #
-# Usage:
-#   sh victron-bluetooth-safety.sh install    # apply patch + set up rc.local
-#   sh victron-bluetooth-safety.sh uninstall  # revert patch + remove rc.local hook
-#   sh victron-bluetooth-safety.sh status     # check if patch is applied
+#   disable  bind-mount a no-op run script over vesmart-server's service
+#            run script. vesmart-server never starts. Lose VictronConnect
+#            over BLE; gain a fully version-agnostic fix.
 #
-# The patch is stored on /data (survives firmware updates) and is
-# reapplied automatically on boot via /data/rc.local.
+# Usage (on the Cerbo, after copying this directory to /data):
+#   sh victron-bluetooth-safety.sh install [--mode patch|disable]
+#   sh victron-bluetooth-safety.sh uninstall
+#   sh victron-bluetooth-safety.sh status
+#   sh victron-bluetooth-safety.sh apply        # invoked from rc.local
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 INSTALL_DIR="/data/victron-bluetooth-safety"
-VESMART_DIR="/opt/victronenergy/vesmart-server"
+RUN_DIR="/run/victron-bluetooth-safety"
 RC_LOCAL="/data/rc.local"
-RC_MARKER="# victron-bluetooth-safety"
+RC_MARKER_BEGIN="# victron-bluetooth-safety BEGIN"
+RC_MARKER_END="# victron-bluetooth-safety END"
+
+GATTSERVER_PATH="/opt/victronenergy/vesmart-server/gattserver.py"
+SERVICE_RUN_LIVE="/service/vesmart-server/run"
+SERVICE_RUN_CANONICAL="/opt/victronenergy/service/vesmart-server/run"
 
 _log() { echo "[bt-safety] $*"; }
 
-is_venus_os() {
-    [ -f /opt/victronenergy/version ]
+_is_venus_os() { [ -f /opt/victronenergy/version ]; }
+
+_is_bind_mounted() {
+    # Match the path as a mount target in /proc/mounts. The path appears
+    # as the second field; use awk to avoid pathname-as-substring issues.
+    awk -v p="$1" '$2 == p {found=1} END {exit !found}' /proc/mounts
 }
 
-_require_venus_os() {
-    if ! is_venus_os; then
-        _log "ERROR: This does not appear to be a Venus OS system."
+_resolve_run_target() {
+    # Return the path that daemontools is actually reading. Prefer the
+    # live tmpfs path if it resolves to a real file; fall back to the
+    # canonical /opt path so disable mode still works pre-overlay.
+    if [ -e "$SERVICE_RUN_LIVE" ]; then
+        readlink -f "$SERVICE_RUN_LIVE" 2>/dev/null || echo "$SERVICE_RUN_LIVE"
+    else
+        echo "$SERVICE_RUN_CANONICAL"
+    fi
+}
+
+_restart_vesmart() {
+    [ -d /service/vesmart-server ] && svc -t /service/vesmart-server 2>/dev/null
+}
+
+# ---------------------------------------------------------------- apply patch
+
+_apply_patch_mode() {
+    [ -f "$GATTSERVER_PATH" ] || { _log "vesmart-server not installed, nothing to do"; return 0; }
+
+    if _is_bind_mounted "$GATTSERVER_PATH"; then
+        _log "patch already active (bind mount present on $GATTSERVER_PATH)"
+        return 0
+    fi
+
+    mkdir -p "$RUN_DIR"
+    patched="$RUN_DIR/gattserver.py"
+
+    python3 "$INSTALL_DIR/patcher.py" "$GATTSERVER_PATH" "$patched"
+    rc=$?
+    case "$rc" in
+        0) ;;  # patched
+        1) _log "no patch needed (regex did not match — upstream may have fixed venus#1587)"; return 0 ;;
+        *) _log "ERROR: patcher failed (exit $rc)"; return 1 ;;
+    esac
+
+    chmod "$(stat -c %a "$GATTSERVER_PATH")" "$patched"
+
+    if mount --bind "$patched" "$GATTSERVER_PATH"; then
+        _log "patch applied: bind-mounted $patched -> $GATTSERVER_PATH"
+        _restart_vesmart
+    else
+        _log "ERROR: bind mount failed on $GATTSERVER_PATH"
         return 1
     fi
 }
 
-_is_root_ro() {
-    grep -q ' / .*\bro\b' /proc/mounts
+# -------------------------------------------------------------- apply disable
+
+_apply_disable_mode() {
+    target=$(_resolve_run_target)
+    [ -e "$target" ] || { _log "$target not present, nothing to do"; return 0; }
+
+    if _is_bind_mounted "$target"; then
+        _log "disable already active (bind mount present on $target)"
+        return 0
+    fi
+
+    chmod +x "$INSTALL_DIR/noop-run"
+
+    if mount --bind "$INSTALL_DIR/noop-run" "$target"; then
+        _log "disabled vesmart-server: bind-mounted noop-run -> $target"
+        _restart_vesmart
+    else
+        _log "ERROR: bind mount failed on $target"
+        return 1
+    fi
 }
 
-_DVB_DID_REMOUNT=0
+# -------------------------------------------------------------------- unmount
 
-_remount_root_rw() {
-    if _is_root_ro; then
-        _log "Remounting root filesystem read-write"
-        if mount -o remount,rw / 2>/dev/null; then
-            _DVB_DID_REMOUNT=1
-        else
-            _log "WARNING: Failed to remount root read-write."
-            return 1
+_unmount_all() {
+    # Try every path we might have bind-mounted onto. Ignore failures —
+    # umount of an unmounted path is the no-op we want.
+    any=0
+    for p in "$GATTSERVER_PATH" "$SERVICE_RUN_LIVE" "$SERVICE_RUN_CANONICAL"; do
+        if _is_bind_mounted "$p"; then
+            if umount "$p" 2>/dev/null; then
+                _log "unmounted $p"
+                any=1
+            else
+                _log "WARNING: umount $p failed"
+            fi
         fi
-    fi
+    done
+    [ "$any" = 1 ] && _restart_vesmart
+    return 0
 }
 
-_restore_root_ro() {
-    if [ "$_DVB_DID_REMOUNT" = 1 ]; then
-        _log "Restoring root filesystem to read-only"
-        mount -o remount,ro / 2>/dev/null || \
-            _log "WARNING: Failed to restore root to read-only."
-        _DVB_DID_REMOUNT=0
-    fi
-}
+# ------------------------------------------------------------------- rc.local
 
-_cleanup() {
-    _restore_root_ro
-}
-
-_is_patched() {
-    grep -q '_gatt_clients' "$VESMART_DIR/gattserver.py" 2>/dev/null
-}
-
-_install_patches_to_data() {
-    mkdir -p "$INSTALL_DIR"
-
-    if [ ! -f "$INSTALL_DIR/gattserver.py.patch" ]; then
-        _log "ERROR: Patch files not found in $INSTALL_DIR"
-        _log "       Copy the patches/ directory contents to $INSTALL_DIR first."
-        return 1
-    fi
-}
-
-_apply_patches() {
-    if _is_patched; then
-        _log "Patch already applied to gattserver.py"
-        return 0
-    fi
-
-	_log "Applying gattserver.py patch"
-	if ! (cd / && patch -p1 -N < "$INSTALL_DIR/gattserver.py.patch") 2>/dev/null; then
-		_log "ERROR: Failed to apply gattserver.py patch"
-		return 1
-	fi
-
-	_log "Applying vesmart_server.py patch"
-	if ! (cd / && patch -p1 -N < "$INSTALL_DIR/vesmart_server.py.patch") 2>/dev/null; then
-		_log "ERROR: Failed to apply vesmart_server.py patch"
-		return 1
-	fi
-
-    _log "Patches applied successfully"
-}
-
-_revert_patches() {
-    if ! _is_patched; then
-        _log "Patch not currently applied"
-        return 0
-    fi
-
-	_log "Reverting gattserver.py patch"
-	(cd / && patch -p1 -R < "$INSTALL_DIR/gattserver.py.patch") 2>/dev/null || \
-		_log "WARNING: Failed to revert gattserver.py patch"
-
-	_log "Reverting vesmart_server.py patch"
-	(cd / && patch -p1 -R < "$INSTALL_DIR/vesmart_server.py.patch") 2>/dev/null || \
-		_log "WARNING: Failed to revert vesmart_server.py patch"
-
-    _log "Patches reverted"
-}
-
-_add_rc_local() {
-    if [ -f "$RC_LOCAL" ] && grep -q "$RC_MARKER" "$RC_LOCAL" 2>/dev/null; then
+_install_rc_hook() {
+    if [ -f "$RC_LOCAL" ] && grep -q "$RC_MARKER_BEGIN" "$RC_LOCAL"; then
         _log "rc.local hook already present"
         return 0
     fi
 
-    _log "Adding boot hook to $RC_LOCAL"
     if [ ! -f "$RC_LOCAL" ]; then
-        echo "#!/bin/sh" > "$RC_LOCAL"
+        printf '#!/bin/sh\n' > "$RC_LOCAL"
         chmod +x "$RC_LOCAL"
     fi
 
-    cat >> "$RC_LOCAL" << 'RCEOF'
-# victron-bluetooth-safety
-if [ -f /data/victron-bluetooth-safety/gattserver.py.patch ]; then
-    mount -o remount,rw / 2>/dev/null && \
-        (cd / && patch -p1 -N < /data/victron-bluetooth-safety/gattserver.py.patch) >/dev/null 2>&1
-    (cd / && patch -p1 -N < /data/victron-bluetooth-safety/vesmart_server.py.patch) >/dev/null 2>&1
-    mount -o remount,ro / 2>/dev/null
-    svc -t /service/vesmart-server 2>/dev/null
-fi
-# end victron-bluetooth-safety
+    cat >> "$RC_LOCAL" <<RCEOF
+$RC_MARKER_BEGIN
+[ -x $INSTALL_DIR/victron-bluetooth-safety.sh ] && \\
+    $INSTALL_DIR/victron-bluetooth-safety.sh apply
+$RC_MARKER_END
 RCEOF
-    _log "Boot hook added"
+    _log "rc.local hook installed"
 }
 
-_remove_rc_local() {
-    if [ ! -f "$RC_LOCAL" ] || ! grep -q "$RC_MARKER" "$RC_LOCAL" 2>/dev/null; then
-        _log "No rc.local hook to remove"
+_uninstall_rc_hook() {
+    [ -f "$RC_LOCAL" ] && grep -q "$RC_MARKER_BEGIN" "$RC_LOCAL" || {
+        _log "no rc.local hook to remove"
         return 0
-    fi
-
-    _log "Removing boot hook from $RC_LOCAL"
-    sed -i '/# victron-bluetooth-safety/,/# end victron-bluetooth-safety/d' "$RC_LOCAL"
-    _log "Boot hook removed"
+    }
+    sed -i "/$RC_MARKER_BEGIN/,/$RC_MARKER_END/d" "$RC_LOCAL"
+    _log "rc.local hook removed"
 }
 
-_restart_vesmart() {
-    if [ -d "/service/vesmart-server" ]; then
-        _log "Restarting vesmart-server to pick up changes"
-        svc -t /service/vesmart-server 2>/dev/null
-        sleep 2
-        svstat /service/vesmart-server 2>/dev/null
-    fi
-}
+# ----------------------------------------------------------------- subcommands
 
 do_install() {
-    _require_venus_os || return 1
-    _install_patches_to_data || return 1
+    mode="${1:-patch}"
+    case "$mode" in patch|disable) ;; *) _log "ERROR: unknown mode '$mode'"; return 1 ;; esac
 
-    _remount_root_rw || return 1
-    trap _cleanup EXIT
+    _is_venus_os || { _log "ERROR: not Venus OS"; return 1; }
 
-    _apply_patches || { _restore_root_ro; trap - EXIT; return 1; }
+    [ -f "$INSTALL_DIR/patcher.py" ] || {
+        _log "ERROR: $INSTALL_DIR/patcher.py missing — copy this directory to $INSTALL_DIR first"
+        return 1
+    }
 
-    _restore_root_ro
-    trap - EXIT
+    chmod +x "$INSTALL_DIR/victron-bluetooth-safety.sh" "$INSTALL_DIR/noop-run" 2>/dev/null
 
-    _add_rc_local
-    _restart_vesmart
-    _log "Install complete. Patch will be reapplied after firmware updates."
+    # If switching modes, drop the previous bind mounts first.
+    _unmount_all
+
+    printf '%s\n' "$mode" > "$INSTALL_DIR/mode"
+    _log "mode=$mode written to $INSTALL_DIR/mode"
+
+    _install_rc_hook
+    do_apply
 }
 
 do_uninstall() {
-    _require_venus_os || return 1
+    _is_venus_os || { _log "ERROR: not Venus OS"; return 1; }
+    _uninstall_rc_hook
+    _unmount_all
+    rm -f "$INSTALL_DIR/mode"
+    _log "uninstalled. Files remain in $INSTALL_DIR — remove manually if desired."
+}
 
-    _remount_root_rw || return 1
-    trap _cleanup EXIT
-
-    _revert_patches
-
-    _restore_root_ro
-    trap - EXIT
-
-    _remove_rc_local
-    _restart_vesmart
-    _log "Uninstall complete. Original vesmart-server behavior restored."
+do_apply() {
+    mode=$(cat "$INSTALL_DIR/mode" 2>/dev/null)
+    case "$mode" in
+        patch)   _apply_patch_mode ;;
+        disable) _apply_disable_mode ;;
+        "")      _log "no mode configured ($INSTALL_DIR/mode missing) — skipping"; return 0 ;;
+        *)       _log "ERROR: unknown mode '$mode' in $INSTALL_DIR/mode"; return 1 ;;
+    esac
 }
 
 do_status() {
-    if _is_patched; then
-        _log "ACTIVE: vesmart-server is patched (GATT-client-only disconnects)"
+    _log "version $VERSION"
+    if [ -f "$INSTALL_DIR/mode" ]; then
+        _log "configured mode: $(cat "$INSTALL_DIR/mode")"
     else
-        _log "INACTIVE: vesmart-server is unpatched (disconnects all devices)"
+        _log "configured mode: (none — not installed)"
     fi
 
-    if [ -f "$RC_LOCAL" ] && grep -q "$RC_MARKER" "$RC_LOCAL" 2>/dev/null; then
-        _log "Boot hook: installed in $RC_LOCAL"
-    else
-        _log "Boot hook: not installed"
+    if _is_bind_mounted "$GATTSERVER_PATH"; then
+        _log "ACTIVE (patch): bind mount on $GATTSERVER_PATH"
     fi
+    for p in "$SERVICE_RUN_LIVE" "$SERVICE_RUN_CANONICAL"; do
+        if _is_bind_mounted "$p"; then
+            _log "ACTIVE (disable): bind mount on $p"
+        fi
+    done
 
-    if [ -f "$INSTALL_DIR/gattserver.py.patch" ]; then
-        _log "Patch files: present in $INSTALL_DIR"
+    if [ -f "$RC_LOCAL" ] && grep -q "$RC_MARKER_BEGIN" "$RC_LOCAL"; then
+        _log "rc.local hook: installed"
     else
-        _log "Patch files: NOT FOUND in $INSTALL_DIR"
+        _log "rc.local hook: not installed"
     fi
+}
+
+# ----------------------------------------------------------------------- main
+
+_usage() {
+    cat <<EOF
+victron-bluetooth-safety $VERSION
+
+Usage:
+  $0 install [--mode patch|disable]   default: patch
+  $0 uninstall
+  $0 status
+  $0 apply                            (invoked from /data/rc.local at boot)
+
+Modes:
+  patch    bind-mount a regex-patched gattserver.py over the upstream file.
+           Keeps VictronConnect BLE working; neutralizes only the 60s
+           mass-disconnect timer.
+  disable  bind-mount a no-op run script over vesmart-server's service
+           run script. Disables vesmart-server entirely (loses
+           VictronConnect BLE; simplest, fully version-agnostic).
+EOF
+}
+
+_parse_install_args() {
+    mode=patch
+    shift  # drop "install"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mode) mode="$2"; shift 2 ;;
+            --mode=*) mode="${1#--mode=}"; shift ;;
+            *) _log "ERROR: unexpected arg '$1'"; return 1 ;;
+        esac
+    done
+    do_install "$mode"
 }
 
 _main() {
     case "${1:-}" in
-        install)
-            do_install
-            ;;
-        uninstall|remove)
-            do_uninstall
-            ;;
-        status)
-            do_status
-            ;;
-        --version|-v|-V)
-            echo "victron-bluetooth-safety $VERSION"
-            ;;
-        --help|-h|"")
-            echo "victron-bluetooth-safety $VERSION"
-            echo "Usage: victron-bluetooth-safety.sh <install|uninstall|status>"
-            echo ""
-            echo "  install    Apply patch and set up boot hook"
-            echo "  uninstall  Revert patch and remove boot hook"
-            echo "  status     Check if patch is currently applied"
-            ;;
-        *)
-            _log "Unknown command: $1"
-            _log "Usage: victron-bluetooth-safety.sh <install|uninstall|status>"
-            return 1
-            ;;
+        install)             _parse_install_args "$@" ;;
+        uninstall|remove)    do_uninstall ;;
+        status)              do_status ;;
+        apply)               do_apply ;;
+        --version|-V)        echo "victron-bluetooth-safety $VERSION" ;;
+        --help|-h|"")        _usage ;;
+        *)                   _log "ERROR: unknown command '$1'"; _usage; return 1 ;;
     esac
 }
 
-if [ -n "${BASH_VERSION:-}" ]; then
-    if [ -z "${BASH_SOURCE:-}" ] || [ "${BASH_SOURCE}" = "$0" ]; then
-        _main "$@"
-    fi
-else
-    case "$(basename "$0")" in
-        victron-bluetooth-safety*|sh|dash|ash) _main "$@" ;;
-    esac
-fi
+_main "$@"
