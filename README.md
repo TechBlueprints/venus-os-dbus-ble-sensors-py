@@ -7,6 +7,7 @@
 > - [#6 Fix Mopeka tank level scaling](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/6) — execution order, butane formula, role consolidation
 > - [#7 Cache D-Bus connections](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/7) — prevent connection proliferation
 > - [#8 Add curl-based install method](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/8) — install without opkg or remounting the filesystem
+> - [#11 Add BLE advertisement router](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/11) — let external services receive routed BLE advertisements via D-Bus signals without standing up their own scanner; replaces the standalone `dbus-ble-advertisements` project
 
 Venus OS dbus service for BLE device support. Replaces and extends [official dbus ble service](https://github.com/victronenergy/dbus-ble-sensors/tree/master) which does not allow collaboration for new devices support.
 
@@ -43,11 +44,21 @@ the same way it controls a USB-attached Phoenix Smart IP43.
 
 Implementation notes:
 
+- [`docs/advertisement-router.md`](docs/advertisement-router.md) —
+  consumer guide for service authors building **new** Bluetooth
+  integrations on top of this service.  Subscribe to a D-Bus signal,
+  declare interest by manufacturer / product / MAC, and skip writing
+  any scanning code.  Drop-in replacement for the standalone
+  [TechBlueprints/dbus-ble-advertisements](https://github.com/TechBlueprints/dbus-ble-advertisements)
+  project.
 - [`docs/IP22-INTEGRATION.md`](docs/IP22-INTEGRATION.md) — IP22
   driver, role, DVCC contract, alarm derivation, history accumulators
 - [`docs/ORION-TR-INTEGRATION.md`](docs/ORION-TR-INTEGRATION.md) —
   Orion-TR driver, dcdc ↔ alternator role swap, integrated-charger
   surface on both roles
+- [`docs/hci-tap-architecture.md`](docs/hci-tap-architecture.md) —
+  the advertisement-processing pipeline, from raw HCI monitor frame to
+  device-class delivery
 - `tests/` — self-contained pytest suite covering the shared
   infrastructure (`ble_charger_common`) and per-driver dispatch.
   Run via `./tests/run.sh` — no D-Bus, BlueZ, or hardware needed.
