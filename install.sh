@@ -159,6 +159,45 @@ svc -d .' "$STOCK_START"
 disable_stock_service
 echo ""
 
+# --- Step 5.5: Apply vesmart-server safety patch ---
+#
+# Victron's vesmart-server has a hardcoded 60-second timer that, when
+# any BLE device connects, disconnects EVERY connected BLE device on
+# EVERY adapter -- including ours.  This is upstream bug
+# https://github.com/victronenergy/venus/issues/1587 and it makes
+# stable BLE scanning impossible without a patch.
+#
+# We vendor TechBlueprints/victron-bluetooth-safety into
+# ext/victron-bluetooth-safety/ and run its install command here.
+# The installer is idempotent (re-runs are no-ops on a patched system)
+# and sets up its own /data/rc.local hook so the patch is re-applied
+# automatically after a Venus OS firmware update.
+
+echo "Step 5.5: Applying vesmart-server safety patch..."
+
+VBS_SRC="$INSTALL_DIR/$APP_DIR/ext/victron-bluetooth-safety"
+VBS_DEST="/data/victron-bluetooth-safety"
+
+if [ ! -f "$VBS_SRC/victron-bluetooth-safety.sh" ]; then
+    echo "  WARN: vendored ext/victron-bluetooth-safety/ not found — skipping"
+    echo "        ($VBS_SRC/victron-bluetooth-safety.sh missing)"
+else
+    mkdir -p "$VBS_DEST/patches"
+    cp "$VBS_SRC/victron-bluetooth-safety.sh" "$VBS_DEST/"
+    cp "$VBS_SRC/vesmart-safety.sh"           "$VBS_DEST/"
+    cp "$VBS_SRC/patches/gattserver.py.patch" "$VBS_DEST/patches/"
+    cp "$VBS_SRC/patches/vesmart_server.py.patch" "$VBS_DEST/patches/"
+    chmod +x "$VBS_DEST/victron-bluetooth-safety.sh"
+
+    if sh "$VBS_DEST/victron-bluetooth-safety.sh" install 2>&1 | sed 's/^/  /'; then
+        :
+    else
+        echo "  WARN: vesmart safety installer returned non-zero"
+        echo "        check 'sh $VBS_DEST/victron-bluetooth-safety.sh status'"
+    fi
+fi
+echo ""
+
 # --- Step 6: Set up service ---
 
 echo "Step 6: Setting up services..."

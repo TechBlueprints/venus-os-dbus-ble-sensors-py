@@ -1,0 +1,87 @@
+--- a/opt/victronenergy/vesmart-server/gattserver.py
++++ b/opt/victronenergy/vesmart-server/gattserver.py
+@@ -165,6 +165,7 @@
+ 		self._isConnected = False
+ 		self._keepAliveTime = 0xFFFF
+ 		self._keepAliveTimer = None
++		self._gatt_clients = set()
+ 
+ 		self._validVregs = [i for i in range(0xE3D0, 0xE3E2)] + [
+ 		    VE_REG_PRODUCT_ID, VE_REG_APP_VER, VE_REG_BUILD_TIMESTAMP, VE_REG_PINCODE_STATUS, VE_REG_SERIAL_NUMBER,
+@@ -661,22 +662,17 @@
+ 		self._NotifyPathValue(pathCombo, value)
+ 
+ 	def _keep_alive_timer_timeout(self):
+-		logger.warn("Keep alive timeout. Disconnecting all devices.")
++		logger.warn("Keep alive timeout. Disconnecting GATT clients only.")
+ 		self._keepAliveTimer = None
+-		devices = bluezutils.get_devices(self.bus)
+-		for device in devices:
+-			device_path = device[0]
+-			device_properties = device[1][bluezutils.DEVICE_INTERFACE]
+-			if "Connected" in device_properties and device_properties["Connected"]:
+-				try:
+-					device = bluezutils.get_device_interface(self.bus, device_path)
+-					device.Disconnect()
+-					logger.info("Disconnected device %s", device_path)
+-				except Exception as e:
+-					logger.error("### Failure disconnecting device %s", device_path)
+-					logger.error("%s", e)
+-			else:
+-				logger.info("%s seem to be not Connected", device_path)
++		for device_path in list(self._gatt_clients):
++			try:
++				device = bluezutils.get_device_interface(self.bus, device_path)
++				device.Disconnect()
++				logger.info("Disconnected GATT client %s", device_path)
++			except Exception as e:
++				logger.error("### Failure disconnecting GATT client %s", device_path)
++				logger.error("%s", e)
++		self._gatt_clients.clear()
+ 		return False
+ 
+ 	def _cancel_keep_alive_timer(self):
+@@ -724,7 +720,6 @@
+ 	def connected(self):
+ 		logger.info("Device connected")
+ 		self._isConnected = True
+-		self._keepAliveTimer = GObject.timeout_add(60000, self._keep_alive_timer_timeout)
+ 
+ 	def disconnected(self):
+ 		logger.info("Device disconnected")
+@@ -733,8 +728,14 @@
+ 		self.maxAttLength = 20
+ 		self.control.init()
+ 		self._cancel_keep_alive_timer()
++		self._gatt_clients.clear()
+ 
++	def device_disconnected(self, device_path):
++		self._gatt_clients.discard(device_path)
++		if not self._gatt_clients:
++			self._cancel_keep_alive_timer()
+ 
++
+ class MyChr(Characteristic):
+ 	def __init__(self, bus, index, service):
+ 		self.flags = [ ]
+@@ -905,6 +906,13 @@
+ 		return '306b0002-b081-4037-83dc-e59fcc3cdfd0'
+ 
+ 	def read_value(self, options):
++		device_path = options.get("device")
++		if device_path and hasattr(self.service, '_gatt_clients'):
++			self.service._gatt_clients.add(str(device_path))
++			logger.info("GATT client registered: %s", device_path)
++			self.service._cancel_keep_alive_timer()
++			self.service._keepAliveTimer = GObject.timeout_add(
++				60000, self.service._keep_alive_timer_timeout)
+ 		mtu = options.get("mtu", 23)
+ 		self.service.maxAttLength = min(mtu - 3, 512)
+ 		logger.info("Control characteristic is read. maxAttLength is %d", self.service.maxAttLength)
+@@ -1026,3 +1034,6 @@
+ 
+ 	def disconnected(self):
+ 		self._veSmartService.disconnected()
++
++	def device_disconnected(self, device_path):
++		self._veSmartService.device_disconnected(device_path)

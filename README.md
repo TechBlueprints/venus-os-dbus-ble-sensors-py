@@ -105,8 +105,30 @@ For technical info and guide to add new devices, see [dedicated developer page](
 
 ## Vendored dependencies
 
+### victron-ble (Unlicense)
+
 This fork bundles a copy of [keshavdv/victron-ble](https://github.com/keshavdv/victron-ble) (version 0.9.3) under `src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/`.  It is used by the IP22 and Orion-TR drivers to decrypt Victron Instant Readout advertisements.
 
 `victron-ble` is released into the public domain under [The Unlicense](https://unlicense.org/) — credit goes to Keshav Varma and contributors.
 
 The vendored copy carries one local change in `devices/base.py`: AES-CTR decryption can fall back to Python's standard `cryptography` library (which ships with Venus OS as `python3-cryptography`) when `PyCryptodome` is not available.  The two code paths produce byte-identical output and a unit test in `tests/test_vendored_victron_ble.py` enforces this.  See `ext/victron_ble/VENDORED.md` for details.
+
+### victron-bluetooth-safety (Apache 2.0)
+
+This fork also bundles [TechBlueprints/victron-bluetooth-safety](https://github.com/TechBlueprints/victron-bluetooth-safety) under `src/opt/victronenergy/dbus-ble-sensors-py/ext/victron-bluetooth-safety/`.  `install.sh` deploys it to `/data/victron-bluetooth-safety/` and applies it during installation.
+
+It patches Venus OS's `vesmart-server` to stop a hardcoded 60-second timer that disconnects **every** connected BLE device on **every** adapter — see [victronenergy/venus#1587](https://github.com/victronenergy/venus/issues/1587).  Without this patch, third-party BLE services (this one included) cannot maintain stable scans or connections on a Cerbo running `vesmart-server`.
+
+The patch is idempotent and self-heals after firmware updates two ways:
+
+1. The vendored installer adds an `rc.local` entry that re-applies the patch on boot.
+2. `service/run` re-sources the inline snippet on every (re)start of `dbus-ble-sensors-py`.
+
+To check or revert:
+
+``` bash
+sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh status
+sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh uninstall
+```
+
+See `ext/victron-bluetooth-safety/VENDORED.md` for the source SHA and update procedure.
