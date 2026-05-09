@@ -36,23 +36,40 @@ work reliably alongside other BLE services on the Cerbo.
 
 ## How it gets applied
 
-`install.sh` (Step 6.5) copies this directory to
-`/data/victron-bluetooth-safety/` and runs:
+`install.sh` (Step 5.5) copies this directory to
+`/data/victron-bluetooth-safety/` and then sources the inline snippet:
+
+    . /data/victron-bluetooth-safety/vesmart-safety.sh
+    ensure_vesmart_safe
+
+This is the **version-agnostic** path: it patches `gattserver.py` by
+method name using a Python regex, so it works across Venus OS releases.
+It is idempotent (a fast `grep` no-op on an already-patched system).
+
+`service/run` also sources the same snippet on every (re)start of
+`dbus-ble-sensors-py`, so a Venus OS firmware update that reverts the
+patch is fixed up automatically the next time the service runs.
+
+### Optional: full installer with per-client tracking
+
+The full installer `victron-bluetooth-safety.sh` is also vendored.
+It applies the unified diffs in `patches/` to give per-GATT-client
+tracking (only disconnects clients that actually used the
+VictronConnect GATT service, instead of disabling disconnects
+entirely).  However, the patches are **version-pinned** and may
+fail to apply on Venus OS releases other than the one they were
+generated against.  Power users can run:
 
     sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh install
 
-That call:
+If the patch hunks fail to apply, regenerate them upstream against
+the new Venus OS source and update both the patches in the upstream
+repo and this vendored copy.  See "Updating" below.
 
-1. Remounts root rw.
-2. Applies `patches/gattserver.py.patch` and
-   `patches/vesmart_server.py.patch` to `/opt/victronenergy/vesmart-server/`.
-3. Adds an idempotent boot hook to `/data/rc.local` so the patch is
-   re-applied automatically after a Venus OS firmware update reverts
-   the changes.
-4. Restarts `/service/vesmart-server`.
+### Status / uninstall
 
-The installer is idempotent: re-running it on an already-patched system
-is a no-op.
+    sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh status
+    sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh uninstall
 
 ## Why we vendor instead of fetching
 
