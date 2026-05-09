@@ -140,4 +140,4 @@ class BleDeviceTeltonikaTests(BleDeviceBaseTests):
         with self.assertRaises(ValueError) as e:
             self._test_parsing(raw_data, expected_dict)
         self.assertEqual(str(e.exception),
-                         "7cd9f411427d - Teltonika Eye 11427D: Configuration 'roles' must have at least one element")
+                         "7cd9f411427d - Teltonika Eye: Configuration 'roles' must have at least one element")
