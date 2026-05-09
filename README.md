@@ -119,16 +119,17 @@ This fork also bundles [TechBlueprints/victron-bluetooth-safety](https://github.
 
 It patches Venus OS's `vesmart-server` to stop a hardcoded 60-second timer that disconnects **every** connected BLE device on **every** adapter — see [victronenergy/venus#1587](https://github.com/victronenergy/venus/issues/1587).  Without this patch, third-party BLE services (this one included) cannot maintain stable scans or connections on a Cerbo running `vesmart-server`.
 
-The patch is idempotent and self-heals after firmware updates two ways:
+The default code path uses the **version-agnostic inline snippet** (`vesmart-safety.sh`), which patches `gattserver.py` by method name via Python regex and works across Venus OS releases.  It self-heals two ways:
 
-1. The vendored installer adds an `rc.local` entry that re-applies the patch on boot.
-2. `service/run` re-sources the inline snippet on every (re)start of `dbus-ble-sensors-py`.
+1. `install.sh` sources the snippet and calls `ensure_vesmart_safe` once during installation.
+2. `service/run` re-sources the snippet on every (re)start of `dbus-ble-sensors-py`, so a firmware update that reverts the patch is fixed up automatically the next time the service starts.
 
-To check or revert:
+The full installer with per-GATT-client tracking is also vendored for advanced users:
 
 ``` bash
+sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh install
 sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh status
 sh /data/victron-bluetooth-safety/victron-bluetooth-safety.sh uninstall
 ```
 
-See `ext/victron-bluetooth-safety/VENDORED.md` for the source SHA and update procedure.
+The full installer applies version-pinned unified diffs in `patches/` and may fail on Venus OS releases other than the one the patches were generated against.  See `ext/victron-bluetooth-safety/VENDORED.md` for the source SHA, the difference between the two approaches, and the update procedure.
