@@ -1,12 +1,20 @@
 """
-Pin the ``try/finally`` guard around the ``self.info['dev_id']``
-mutation in ``BleDevice._create_indexed_role_service``.
+Pin the contract that ``BleDevice._create_indexed_role_service``
+**never mutates** ``self.info['dev_id']``.
 
-Without it, a single exception during role-service init on a
-multi-sensor device (e.g. SeeLevel BTP3 — sensor numbers 0..13
-broadcast in turn) triggers a runaway: each subsequent advertisement
-reads the already-mutated ``dev_id``, appends another ``_NN``, and
-registers a bloated path in ``com.victronenergy.settings``.
+The previous design temporarily wrote the indexed dev id into
+``self.info['dev_id']`` so that ``DbusRoleService.__init__`` would pick
+it up as a side channel.  Any exception during role-service init left
+the field corrupt; the next advertisement re-read the corrupt value as
+its "base" and appended yet another ``_NN`` — on a multi-sensor device
+broadcasting many indices a second (e.g. SeeLevel BTP3) the dev id
+grew unboundedly, registering hundreds of bloated paths in
+``com.victronenergy.settings``.
+
+The proper fix removes the mutation entirely.  ``DbusRoleService``
+takes the indexed dev id as an explicit constructor parameter;
+``self.info['dev_id']`` is only ever read, never written.  These tests
+assert that contract directly.
 """
 
 import importlib.util
@@ -23,7 +31,6 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), '..', 'ext'))
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), '..', 'ext', 'velib_python'))
 
 
-# Stub D-Bus / vedbus / inner services for off-device import.
 def _ensure_stub(name: str, attrs: dict):
     if name not in sys.modules:
         sys.modules[name] = types.ModuleType(name)
@@ -67,9 +74,6 @@ _spec.loader.exec_module(_real_ble_device)
 BleDevice = _real_ble_device.BleDevice
 
 
-# Bypass the heavy ``__init__`` of BleDevice — we want a direct test of
-# ``_create_indexed_role_service`` and need to control ``self.info``
-# without dragging in the full settings / D-Bus init.
 def _make_device(dev_id: str = 'seelevel_btp3_00a0508d9569') -> BleDevice:
     dev = BleDevice.__new__(BleDevice)
     dev.info = {
@@ -91,24 +95,23 @@ def _make_device(dev_id: str = 'seelevel_btp3_00a0508d9569') -> BleDevice:
     return dev
 
 
-class TryFinallyRestoresDevId(unittest.TestCase):
+class DevIdIsNeverMutated(unittest.TestCase):
 
-    def test_dev_id_restored_on_role_service_construction_failure(self):
+    def test_dev_id_unchanged_on_role_service_construction_failure(self):
         dev = _make_device()
         original = dev.info['dev_id']
 
-        # Force the role-service constructor to raise mid-init.
         with patch.object(_real_ble_device, 'BleRole') as mock_role_cls:
-            mock_role_cls.get_class.return_value = MagicMock()  # role class
+            mock_role_cls.get_class.return_value = MagicMock()
             with patch.object(_real_ble_device, 'DbusRoleService',
                               side_effect=RuntimeError('AddMatch budget exhausted')):
                 result = dev._create_indexed_role_service('tank', 0)
 
         self.assertIsNone(result, "should return None on failure")
         self.assertEqual(dev.info['dev_id'], original,
-            f"dev_id must be restored after exception; got {dev.info['dev_id']!r}")
+            f"dev_id must not be mutated; got {dev.info['dev_id']!r}")
 
-    def test_dev_id_restored_on_load_settings_failure(self):
+    def test_dev_id_unchanged_on_load_settings_failure(self):
         dev = _make_device()
         original = dev.info['dev_id']
 
@@ -125,9 +128,11 @@ class TryFinallyRestoresDevId(unittest.TestCase):
         self.assertEqual(dev.info['dev_id'], original)
 
     def test_repeated_failures_do_not_compound_corruption(self):
-        """The pre-fix bug: each failed creation appends ``_NN`` to the
-        already-mutated dev_id.  After 50 failed creations, dev_id grows
-        by ~150 chars.  The fix keeps it pinned at the original length."""
+        """The pre-refactor bug: each failed creation read the already-
+        mutated ``dev_id`` and appended another ``_NN``.  After 50 cycles
+        through the SeeLevel sensor sequence (4 indices each) the dev id
+        grew by ~600 chars.  With the refactor the field is never
+        written, so even 200 forced failures cannot corrupt it."""
         dev = _make_device()
         original = dev.info['dev_id']
 
@@ -135,7 +140,6 @@ class TryFinallyRestoresDevId(unittest.TestCase):
             mock_role_cls.get_class.return_value = MagicMock()
             with patch.object(_real_ble_device, 'DbusRoleService',
                               side_effect=RuntimeError('forced failure')):
-                # Simulate the SeeLevel sensor cycle: indices 0, 1, 2, 13 repeating.
                 for _ in range(50):
                     for idx in (0, 1, 2, 13):
                         dev._create_indexed_role_service('tank', idx)
@@ -144,9 +148,8 @@ class TryFinallyRestoresDevId(unittest.TestCase):
             f"dev_id grew under repeated failure; got len={len(dev.info['dev_id'])}: "
             f"{dev.info['dev_id'][:80]}...")
 
-    def test_success_path_restores_dev_id(self):
-        """Even on the happy path the mutation must be reverted so the
-        next index sees the canonical base dev_id."""
+    def test_dev_id_unchanged_on_success(self):
+        """Even the happy path must not touch ``self.info['dev_id']``."""
         dev = _make_device()
         original = dev.info['dev_id']
 
@@ -158,6 +161,29 @@ class TryFinallyRestoresDevId(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(dev.info['dev_id'], original)
+
+
+class IndexedDevIdPassedToConstructor(unittest.TestCase):
+    """Verify the constructor receives the indexed dev id as an
+    explicit ``dev_id=`` keyword, rather than reading it back from
+    ``ble_device.info['dev_id']`` (which would re-introduce the
+    side-channel coupling)."""
+
+    def test_constructor_called_with_indexed_dev_id_keyword(self):
+        dev = _make_device(dev_id='seelevel_btp3_00a0508d9569')
+
+        with patch.object(_real_ble_device, 'BleRole') as mock_role_cls:
+            mock_role_cls.get_class.return_value = MagicMock()
+            with patch.object(_real_ble_device, 'DbusRoleService',
+                              return_value=MagicMock()) as ctor:
+                dev._create_indexed_role_service('tank', 7)
+
+        ctor.assert_called_once()
+        kwargs = ctor.call_args.kwargs
+        self.assertIn('dev_id', kwargs,
+            f"DbusRoleService must be called with explicit dev_id kwarg; "
+            f"got args={ctor.call_args.args}, kwargs={kwargs}")
+        self.assertEqual(kwargs['dev_id'], 'seelevel_btp3_00a0508d9569_07')
 
 
 if __name__ == '__main__':
