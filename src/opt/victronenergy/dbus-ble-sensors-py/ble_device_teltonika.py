@@ -93,6 +93,7 @@ class BleDeviceTeltonika(BleDevice):
                 'scale': 100,
                 'flags': ['REG_FLAG_BIG_ENDIAN'],
                 'roles': ['temperature'],
+                'sensor_type': 'temperature',
             })
             self.info['roles']['temperature'] = {}
             offset = offset + 2
@@ -111,6 +112,7 @@ class BleDeviceTeltonika(BleDevice):
                 'offset': offset,
                 'flags': ['REG_FLAG_BIG_ENDIAN'],
                 'roles': ['temperature'],
+                'sensor_type': 'humidity',
             })
             self.info['roles']['temperature'] = {}
             offset = offset + 1
@@ -181,6 +183,7 @@ class BleDeviceTeltonika(BleDevice):
                 'offset': offset,
                 'scale': 1/10,
                 'bias': 2000,
+                'sensor_type': 'voltage',
             })
 
     def _get_low_battery_state(self, role_service: DbusRoleService) -> int:
