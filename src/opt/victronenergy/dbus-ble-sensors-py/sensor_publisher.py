@@ -62,13 +62,16 @@ class SensorPublisher:
         - *force* is True.
 
         Returns ``True`` if a write happened, ``False`` if skipped.
-        ``value=None`` is treated as 'invalid reading' and is skipped
-        without affecting the heartbeat clock — call sites that want
-        to clear a stale value with ``None`` should pass ``force=True``.
-        """
-        if value is None:
-            return False
 
+        ``value=None`` is published the same way any other value is:
+        if the cache already holds ``None`` for this path (and we're
+        inside the heartbeat window), the write is skipped; if the
+        cache holds a real value, ``None`` is written through to
+        clear the stale reading.  This matches what drivers like the
+        IP22 charger do when a device transitions to ``Off`` and we
+        want stale voltage/current readings to vanish from the GUI
+        rather than linger.
+        """
         rounded = self._policy.round_value(value, sensor_type, override)
 
         now = time.monotonic()
