@@ -117,6 +117,15 @@ class MockRoleService(dict):
     def get_dbus_id(self):
         return 'test_dev/tank'
 
+    # Match the real ``DbusRoleService`` context-manager surface so the
+    # batched-emit ``with role_service:`` block in
+    # ``BleDevice._update_dbus_data`` works under the mock.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
 def _make_device(cls, mac='00a0508d9569'):
     """Instantiate a SeeLevel device without D-Bus, wiring up minimal state."""
     dev = cls.__new__(cls)

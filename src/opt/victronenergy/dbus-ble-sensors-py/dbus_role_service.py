@@ -186,6 +186,17 @@ class DbusRoleService(object):
     def __delitem__(self, path: str):
         self._delete_item(path)
 
+    def __enter__(self):
+        # Delegate to the underlying ``VeDbusService`` so callers can
+        # batch many ``__setitem__`` calls into a single
+        # ``PropertiesChanged`` emit.  ``VeDbusService`` is refcounted,
+        # so nested ``with`` blocks compose correctly.
+        self._dbus_service.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._dbus_service.__exit__(exc_type, exc_val, exc_tb)
+
     def _set_proxy_callback(self, item_path: str, setting_item: VeDbusItemImport, callback=None):
         def _callback(change_path, new_value):
             if change_path != item_path:
