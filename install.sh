@@ -379,6 +379,56 @@ echo "Step 9: Verifying installation..."
 verify_install() {
     sleep 4  # give the service time to import + start logging
 
+    local rc=0
+
+    # Check 1: every service tree has a working supervise/ subdir.
+    #
+    # When `install.sh` re-creates the /service/ symlinks while a stale
+    # `supervise` from the previous install is still alive at the same
+    # target, svscan can end up unable to spawn a fresh supervise (it
+    # races with the old one and dies as a zombie before creating the
+    # supervise/ subdir).  The Python service may still appear to run,
+    # because the orphan process from before install keeps holding the
+    # bus name -- but it is no longer supervised, so it will not be
+    # auto-restarted on crash and `svc -d`/`svc -u` will fail.
+    # See issue #4 for the full pattern.
+    local missing_supervise=0
+    for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME"; do
+        local target
+        if [ "$svc_name" = "$SERVICE_NAME" ]; then
+            target="$INSTALL_DIR/service"
+        else
+            target="$INSTALL_DIR/service-launcher"
+        fi
+        if [ ! -d "$target/supervise" ]; then
+            echo "  WARN: $target/supervise missing -- service is not supervised"
+            missing_supervise=1
+        fi
+    done
+
+    if [ "$missing_supervise" = "1" ]; then
+        echo ""
+        echo "  Diagnostics:"
+        echo "    /service/$SERVICE_NAME:        $(svstat /service/$SERVICE_NAME 2>&1 | head -n 1)"
+        echo "    /service/$LAUNCHER_NAME: $(svstat /service/$LAUNCHER_NAME 2>&1 | head -n 1)"
+        local zombies
+        zombies=$(ps 2>/dev/null | grep -E "Z.*\[supervise\]" | wc -l)
+        if [ "$zombies" -gt 0 ]; then
+            echo "    zombie supervise processes: $zombies (parent svscan likely died)"
+        fi
+        echo ""
+        echo "  Recovery (no reboot required):"
+        echo "    pkill -f \"$INSTALL_DIR/.*dbus_ble_sensors.py\" || true"
+        echo "    SVS=\$(pgrep -f svscanboot); kill \$SVS 2>/dev/null"
+        echo "    sleep 2"
+        echo "    nohup /usr/bin/svscanboot >/var/log/svscanboot.log 2>&1 & disown"
+        echo "    sleep 8"
+        echo "    svstat /service/$SERVICE_NAME"
+        echo ""
+        rc=1
+    fi
+
+    # Check 2: the Python service is actually running from $INSTALL_DIR.
     local pid
     pid=$(pgrep -f "$INSTALL_DIR/.*dbus_ble_sensors.py" 2>/dev/null | head -n 1)
 
@@ -390,6 +440,7 @@ verify_install() {
 
     echo "  Service running as pid $pid"
 
+    # Check 3: the log file is being written to (multilog is alive).
     local log_file="/var/log/$SERVICE_NAME/current"
     if [ ! -f "$log_file" ]; then
         echo "  WARN: log file $log_file does not exist yet"
@@ -410,6 +461,8 @@ verify_install() {
         echo "        'pgrep -af multilog | grep $SERVICE_NAME'"
         return 1
     fi
+
+    return $rc
 }
 
 if verify_install; then
