@@ -65,7 +65,15 @@ _HEARTBEAT_SETTING_PATH = '/Settings/SensorRounding/HeartbeatSeconds'
 
 
 def _setting_path(sensor_type: str) -> str:
-    return f"/Settings/SensorRounding/{sensor_type.title()}"
+    """Convert ``snake_case`` sensor type to a CamelCase setting path.
+
+    ``.title()`` alone leaves underscores in (``'charger_voltage' ->
+    'Charger_Voltage'``) and Victron's ``AddSetting`` silently drops
+    names that contain underscores.  Split-and-join produces a clean
+    CamelCase name that the settings service accepts.
+    """
+    camel = ''.join(part.title() for part in sensor_type.split('_'))
+    return f"/Settings/SensorRounding/{camel}"
 
 
 class SensorRoundingPolicy:
