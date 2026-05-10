@@ -68,18 +68,13 @@ Implementation notes:
 
 ## Installation
 
-> **Note:** This fork is installed via curl only.  The upstream opkg
-> feed does not carry the changes in this fork, so `opkg install
-> dbus-ble-sensors-py` will not work here.  See [PR #8](https://github.com/ldenisey/venus-os-dbus-ble-sensors-py/pull/8)
-> for the rationale behind the curl-based installer.
-
 Run this one-liner on your Venus OS device (SSH as root):
 
 ``` bash
 curl -fsSL https://raw.githubusercontent.com/TechBlueprints/venus-os-dbus-ble-sensors-py/main/install.sh | bash
 ```
 
-This installs to `/data/apps/dbus-ble-sensors-py/`, which persists across firmware updates automatically.  If an existing opkg-based installation is detected, it will be cleanly removed and replaced — all device settings are preserved.
+This installs to `/data/apps/dbus-ble-sensors-py/`, which persists across firmware updates automatically.
 
 To update, re-run the same command.
 
