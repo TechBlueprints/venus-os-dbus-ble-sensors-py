@@ -245,16 +245,13 @@ class BleDevice(object):
             logging.error(f"{self._plog} ignoring {role_type} index {index}: {e}")
             return None
 
-        # Mutate ``dev_id`` so the role service registers under the
-        # indexed bus name, then restore it — including the exception
-        # path.  Without the try/finally, an exception in
-        # ``DbusRoleService`` / settings init would leave ``dev_id``
-        # mutated, and every subsequent call into this function would
-        # re-read the corrupt value and append yet another suffix.
-        base_dev_id = self.info['dev_id']
-        self.info['dev_id'] = f"{base_dev_id}_{index:02d}"
+        # Pass the indexed dev id explicitly to the role-service
+        # constructor.  ``self.info['dev_id']`` is read once to compute
+        # the override and never mutated; a failure during init
+        # therefore cannot leak partial state into subsequent calls.
+        indexed_dev_id = f"{self.info['dev_id']}_{index:02d}"
         try:
-            role_service = DbusRoleService(self, role)
+            role_service = DbusRoleService(self, role, dev_id=indexed_dev_id)
             role_service.load_settings()
 
             if device_name:
@@ -262,16 +259,15 @@ class BleDevice(object):
 
             self._role_services[key] = role_service
             DbusBleService.get().register_role_service(role_service)
-            logging.info(f"{self._plog} created indexed {role_type} service [{index:02d}]")
-            return role_service
         except Exception:
             logging.exception(
                 f"{self._plog} failed to create indexed {role_type} "
                 f"service [{index:02d}]"
             )
             return None
-        finally:
-            self.info['dev_id'] = base_dev_id
+
+        logging.info(f"{self._plog} created indexed {role_type} service [{index:02d}]")
+        return role_service
 
     def _is_indexed_role_enabled(self, role_type: str, index: int) -> bool:
         """Check if a specific indexed role service is enabled in the GUI."""
