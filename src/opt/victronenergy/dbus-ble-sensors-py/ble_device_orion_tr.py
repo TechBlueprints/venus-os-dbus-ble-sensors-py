@@ -770,12 +770,16 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
 
     def _publish(self, parsed) -> None:
         # Lazily populate the BlueZ-derived serial once per process —
-        # the encrypted advertisement payload doesn't carry one.
-        if not self.info.get("serial"):
-            serial = _orion_serial_from_advertised_name(
-                _orion_bluez_device_name(self.info["dev_mac"]))
-            if serial:
-                self.info["serial"] = serial
+        # the encrypted advertisement payload doesn't carry one.  Use
+        # the ``"serial" in self.info`` sentinel so a *negative* lookup
+        # (no Victron-format token in the BlueZ name — typical when the
+        # user has renamed the device in the BlueZ surface) is also
+        # cached.  The earlier ``if not self.info.get("serial")`` form
+        # re-fired forever in that case, paying a ``GetManagedObjects``
+        # round-trip per advertisement.
+        if "serial" not in self.info:
+            self.info["serial"] = _orion_serial_from_advertised_name(
+                _orion_bluez_device_name(self.info["dev_mac"])) or ""
 
         for role_service in list(self._role_services.values()):
             ble_svc = DbusBleService.get()

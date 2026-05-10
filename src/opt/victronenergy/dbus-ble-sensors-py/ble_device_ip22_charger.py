@@ -619,11 +619,18 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
 
         pid = self.info.get("product_id", 0)
         battery_v = _battery_voltage_for_product(None, pid)
-        if not self.info.get("serial"):
-            serial = _serial_from_advertised_name(
-                _bluez_device_name(self.info["dev_mac"]))
-            if serial:
-                self.info["serial"] = serial
+        # Lookup-once cache: ``"serial"`` key absence means we have not
+        # looked yet; presence (even empty string) means we have, and a
+        # subsequent advertisement must not re-query BlueZ.  The earlier
+        # ``if not self.info.get("serial")`` form re-fired forever
+        # whenever ``_bluez_device_name`` returned no Victron-format
+        # serial token (which happens whenever the user has renamed the
+        # BlueZ device — common on this gateway).  Each retry was a
+        # ``GetManagedObjects`` round-trip per advertisement; on a
+        # multi-charger setup that pegged ~5% of single-core CPU.
+        if "serial" not in self.info:
+            self.info["serial"] = _serial_from_advertised_name(
+                _bluez_device_name(self.info["dev_mac"])) or ""
 
         self._last_advertised_state = 0
         for role_service in list(self._role_services.values()):
@@ -699,16 +706,16 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             role_service["/ErrorCode"] = err
             self._publish_alarms(role_service, err)
 
-            # /Serial — populated lazily from the BlueZ-advertised name on
-            # first telemetry tick (the encrypted payload itself doesn't
-            # carry the serial).  Keeping the value cached on info means
-            # we don't hit the BlueZ ObjectManager every advertisement.
-            if not self.info.get("serial"):
-                serial = _serial_from_advertised_name(
-                    _bluez_device_name(self.info["dev_mac"]))
-                if serial:
-                    self.info["serial"] = serial
-            if self.info.get("serial"):
+            # /Serial — populated lazily from the BlueZ-advertised name
+            # on first telemetry tick (the encrypted payload itself
+            # doesn't carry the serial).  Use the ``"serial" in
+            # self.info`` sentinel so that a *negative* lookup (no
+            # Victron-format token in the BlueZ name) is also cached;
+            # otherwise this re-queried BlueZ for every advertisement.
+            if "serial" not in self.info:
+                self.info["serial"] = _serial_from_advertised_name(
+                    _bluez_device_name(self.info["dev_mac"])) or ""
+            if self.info["serial"]:
                 role_service["/Serial"] = self.info["serial"]
 
             # /Settings/BatteryVoltage — fixed per product id.  GUIs use
