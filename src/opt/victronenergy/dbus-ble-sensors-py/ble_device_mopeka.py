@@ -21,6 +21,13 @@ class BleDeviceMopeka(BleDevice):
 
     MANUFACTURER_ID = 0x0059 # 'Nordic Semiconductor ASA'
 
+    # Default FluidType for newly-discovered Mopeka tanks.  The user can
+    # override per-tank via the GUI, but the defaults below match each
+    # model's primary intended use:
+    #   8 = LPG (Liquid Petroleum Gas / propane) — most Mopeka SKUs
+    #   1 = Fresh water — only the H20 model
+    # FluidType=0 (Fuel) is the role-level default and is only used when a
+    # model dict explicitly opts in.
     MODELS = {
         3: {
             'device_name': 'Mopeka LPG',
@@ -35,15 +42,15 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}}
+            'roles': {'tank': {'fluid_type': 8}}
         },
         4: {
             'device_name': 'Mopeka Pro200',
-            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}}
+            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN'], 'fluid_type': 8}}
         },
         5: {
             'device_name': 'Mopeka H20',
-            'roles': {'tank': {}}
+            'roles': {'tank': {'fluid_type': 1}}
         },
         8: {
             'device_name': 'Mopeka PPB',
@@ -58,7 +65,7 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}}
+            'roles': {'tank': {'fluid_type': 8}}
         },
         9: {
             'device_name': 'Mopeka PPC',
@@ -73,15 +80,15 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}}
+            'roles': {'tank': {'fluid_type': 8}}
         },
         10: {
             'device_name': 'Mopeka TDB',
-            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}}
+            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN'], 'fluid_type': 8}}
         },
         11: {
             'device_name': 'Mopeka TDC',
-            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN']}}
+            'roles': {'tank': {'flags': ['TANK_FLAG_TOPDOWN'], 'fluid_type': 8}}
         },
         12: {
             'device_name': 'Mopeka Univ',
@@ -96,7 +103,7 @@ class BleDeviceMopeka(BleDevice):
                     },
                 }
             ],
-            'roles': {'tank': {}}
+            'roles': {'tank': {'fluid_type': 8}}
         }
     }
 

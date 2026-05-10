@@ -82,7 +82,9 @@ class BleDeviceMopekaStd(BleDevice):
             'product_name': 'Mopeka sensor',
             'device_name': device_name,
             'dev_prefix': 'mopeka_std',
-            'roles': {'tank': {}},
+            # Mopeka Standard / XL / eTrailer are all propane sensors;
+            # default FluidType = 8 (LPG).  User can override per-tank.
+            'roles': {'tank': {'fluid_type': 8}},
             'regs': [
                 # byte 1: sensor type (low 6 bits + high 2; bits 4-5 reserved)
                 {
