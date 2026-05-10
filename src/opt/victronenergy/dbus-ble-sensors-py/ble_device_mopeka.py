@@ -154,6 +154,7 @@ class BleDeviceMopeka(BleDevice):
                     'offset': 1,
                     'bits': 7,
                     'scale': 32,
+                    'sensor_type': 'voltage',
                     # .format	= &veUnitVolt2Dec,
                 },
                 {
@@ -164,6 +165,7 @@ class BleDeviceMopeka(BleDevice):
                     'scale': 1,
                     'bias': -40,
                     'roles': ['tank'],
+                    'sensor_type': 'temperature',
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {
