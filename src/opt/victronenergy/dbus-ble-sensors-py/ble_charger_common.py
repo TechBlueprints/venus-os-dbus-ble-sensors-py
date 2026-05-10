@@ -456,16 +456,18 @@ class ChargerCommonMixin:
                 self._history_charged_ah += (current_a * dt) / 3600.0
 
     def _publish_history(self, role_service) -> None:
-        role_service["/History/Cumulative/User/OperationTime"] = int(
-            self._history_op_time_s)
+        self._publish_value(
+            role_service, "/History/Cumulative/User/OperationTime",
+            int(self._history_op_time_s))
         # Only write /ChargedAh if we've actually seen current data —
         # see _history_has_current_data note in _init_charger_common.
         # Devices whose advertisement decoder doesn't expose current
         # (e.g. Orion-TR Smart) leave the path at its declared default
         # (None), which gui-v2 renders as "--" rather than "0 Ah".
         if self._history_has_current_data:
-            role_service["/History/Cumulative/User/ChargedAh"] = round(
-                self._history_charged_ah, 2)
+            self._publish_value(
+                role_service, "/History/Cumulative/User/ChargedAh",
+                round(self._history_charged_ah, 2))
 
         now = time.monotonic()
         if now - self._history_last_flush < HISTORY_FLUSH_INTERVAL_S:
@@ -492,8 +494,9 @@ class ChargerCommonMixin:
         for path in CHARGER_ALARM_PATHS:
             severity = active.get(path, 0)
             try:
-                if role_service[path] != severity:
-                    role_service[path] = severity
+                # SensorPublisher does the != comparison itself, so we
+                # don't pre-check here — saves one vedbus read per path.
+                self._publish_value(role_service, path, severity)
             except KeyError:
                 logger.debug("%s: alarm path %s missing from role",
                              self._plog, path)
