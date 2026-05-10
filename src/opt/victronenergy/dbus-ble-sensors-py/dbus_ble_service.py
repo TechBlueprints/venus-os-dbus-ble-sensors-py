@@ -6,6 +6,22 @@ from dbus_bus import get_bus
 from dbus_settings_service import DbusSettingsService
 from vedbus import VeDbusService, VeDbusItemImport, VeDbusItemExport
 
+
+# Short, UI-friendly suffixes appended to the display name of multi-role
+# devices so users can distinguish e.g. the Temp role from the Motion role
+# of a single Ruuvi sensor.  Single-role devices (Mopeka tank, Orion-TR
+# DC-DC, etc.) never get a suffix.  The canonical role name keys (used in
+# D-Bus paths and settings) are unchanged; this is display only.  Roles
+# missing from this mapping fall back to their raw role name.
+_ROLE_DISPLAY_SUFFIX = {
+    'temperature': 'Temp',
+    'movement': 'Motion',
+    'tank': 'Tank',
+    'battery': 'Battery',
+    'meteo': 'Meteo',
+}
+
+
 class DbusBleService(object):
     """
     Main service listing and enabling/disabling scan settings and device role services through the UI.
@@ -124,16 +140,26 @@ class DbusBleService(object):
         role_name = dbus_role_service.ble_role.NAME
         dev_id = dbus_role_service.get_dev_id()
 
+        # Multi-role devices (Ruuvi: temp+motion, SeeLevel BTP3:
+        # tank+temp+battery, ...) get the short role suffix appended so
+        # users can tell the per-role entries apart in the UI.  Single-role
+        # devices stay unsuffixed.
+        role_suffix = (
+            f" {_ROLE_DISPLAY_SUFFIX.get(role_name, role_name)}"
+            if dbus_role_service.get_role_count() > 1 else ""
+        )
+
         # Add name and callback
         custom_name_setting_path = f"/Settings/Devices/{dbus_role_service.get_dbus_id()}/CustomName"
         custom_name = self._dbus_settings.get_value(custom_name_setting_path)
         name = custom_name if custom_name else dbus_role_service.get_device_name()
-        self._set_value(f"/Devices/{dev_id}_{role_name}/Name", name)
+        self._set_value(f"/Devices/{dev_id}_{role_name}/Name", f"{name}{role_suffix}")
 
         def set_name_callback(service_name: str, path: str, custom_name_changes: str):
             if service_name != DbusSettingsService._SETTINGS_SERVICENAME or path != custom_name_setting_path:
                 return
-            self._set_value(f"/Devices/{dev_id}_{role_name}/Name", custom_name_changes['Value'])
+            self._set_value(f"/Devices/{dev_id}_{role_name}/Name",
+                            f"{custom_name_changes['Value']}{role_suffix}")
         self._dbus_settings.get_item(custom_name_setting_path).eventCallback = set_name_callback
 
         # Add enable entry and fire the callback with the persisted value so
