@@ -27,10 +27,14 @@ from hci_advertisement_tap import (
     create_tap_socket, run_tap_loop, TappedAdvertisement,
 )
 from ble_advertisement_router import BleAdvertisementRouter
+from sensor_rounding import SensorRoundingPolicy
+from sensor_publisher import SensorPublisher
 
 ADV_LOG_QUIET_PERIOD = 1800
 SILENCE_WARNING_SECONDS = 300
-DEDUP_KEEPALIVE_SECONDS = 900  # re-forward identical data every 15 min
+# Byte-level identical-advertisement re-forward interval comes from the
+# SensorRoundingPolicy setting at /Settings/SensorRounding/HeartbeatSeconds
+# so this and the publish-level dedup in SensorPublisher share one knob.
 from man_id import MAN_NAMES
 
 SNIF_LOGGER = logging.getLogger("sniffer")
@@ -146,6 +150,14 @@ class DbusBleSensors(object):
     def __init__(self):
         self._dbus: dbus.bus.BusConnection = get_bus("org.bluez")
         self._dbus_ble_service = DbusBleService()
+
+        # Settings-backed rounding policy + dedup/heartbeat publisher.
+        # Constructed once here so every device driver inherits the same
+        # policy via the singleton accessors (.get()).  Settings are
+        # auto-created with sane defaults on first run.
+        self._rounding_policy = SensorRoundingPolicy(
+            self._dbus_ble_service.settings)
+        self._publisher = SensorPublisher(self._rounding_policy)
 
         self._adapters = []
         self._adapter_paths: dict[str, str] = {}
@@ -381,7 +393,8 @@ class DbusBleSensors(object):
                 prev = last_mfg_data.get(mac)
                 if prev is not None:
                     prev_data, prev_ts = prev
-                    if prev_data == raw and now - prev_ts < DEDUP_KEEPALIVE_SECONDS:
+                    hb = self._rounding_policy.heartbeat_seconds
+                    if prev_data == raw and (hb <= 0 or now - prev_ts < hb):
                         return
                 last_mfg_data[mac] = (raw, now)
                 GLib.idle_add(self._glib_process_tap, adv)

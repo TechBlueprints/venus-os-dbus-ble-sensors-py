@@ -58,6 +58,17 @@ class DbusBleService(object):
     def get() -> DbusBleService:
         return DbusBleService._INSTANCE
 
+    @property
+    def settings(self) -> DbusSettingsService:
+        """Public accessor for the settings service.
+
+        Used by :class:`SensorRoundingPolicy` (and any future component
+        that needs to read/write Victron settings) so they can share
+        the same connection + match-rule cache rather than opening
+        their own.
+        """
+        return self._dbus_settings
+
     @staticmethod
     def _clear_path(path: str) -> str:
         return f"/{path.lstrip('/').rstrip('/')}"
