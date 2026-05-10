@@ -89,6 +89,17 @@ Tank slot order in bytes 3-10:
 Each frame reports **all** tanks plus battery voltage at once, so a
 single advertisement triggers updates across multiple D-Bus services.
 
+**No on-device alarm in BTP7.** Bytes 12-13 are confirmed inert: the
+official *SeeLeveL RV 2.0* Android app (`com.seelevelrvfinal` v1.1.1,
+React Native) implements tank-level alarms entirely client-side as
+user-configured threshold comparisons against the level bytes (3-10),
+not by parsing any alarm byte. No app-side reference to byte 12 or 13
+exists for manufacturer ID `0x0CC0`. (BTP3 by contrast carries an
+alarm digit in byte 13.) Consequently the driver does not publish
+`/Alarm` for BTP7 sensors; threshold-based alarms are left to the
+Venus OS tank-service layer (defaults: 10 % low, 90 % high), exactly
+as the official app does for its users.
+
 ## Sensor numbers
 
 | # | BTP3 (`0x0131`) | BTP7 (`0x0CC0`) |
