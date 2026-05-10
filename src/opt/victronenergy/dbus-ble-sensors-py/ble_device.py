@@ -7,6 +7,7 @@ from functools import partial
 from dbus_ble_service import DbusBleService
 from dbus_role_service import DbusRoleService
 from ble_role import BleRole
+from sensor_publisher import SensorPublisher
 from ve_types import *
 
 class BleDevice(object):
@@ -372,17 +373,49 @@ class BleDevice(object):
         return values
 
     def _update_dbus_data(self, role_service: DbusRoleService, sensor_data: dict):
-        # Batch all per-advertisement property writes inside a single
-        # ``DbusRoleService`` context block so the inner ``_set_value``
-        # calls share one refcount level — refcount-based vedbus emits
-        # exactly one ``PropertiesChanged`` signal per outer ``__exit__``.
-        # Without this, we paid one signal per property, fanning out to
-        # every D-Bus subscriber (vrmlogger, dbus-systemcalc, mqtt-rpc,
-        # gui-v2, …) once per field of every advertisement.
+        # Route every per-advertisement write through SensorPublisher so
+        # we get policy-driven rounding (per-type display resolution),
+        # change-detection (skip if rounded value matches last
+        # published), and the republish heartbeat (force an emit every
+        # /Settings/SensorRounding/HeartbeatSeconds even when nothing
+        # changed).
+        #
+        # The reg dict carries an optional ``sensor_type`` field (e.g.
+        # 'temperature', 'voltage') and/or an explicit ``round`` field
+        # for edge cases.  Regs that lack both pass through unrounded
+        # — but still benefit from change-detection + heartbeat dedup.
+        #
+        # The outer ``with role_service:`` keeps the existing batched-
+        # PropertiesChanged behavior: if multiple paths actually changed
+        # within this ad, vedbus coalesces them into one ItemsChanged.
+        publisher = SensorPublisher.get()
+        regs_by_name = self._regs_by_name()
         with role_service:
             for name, value in sensor_data.items():
-                role_service[name] = value
-                # TODO Find out what c method veItemSetFmt() do
+                reg = regs_by_name.get(name, {})
+                if publisher is not None:
+                    publisher.publish(
+                        role_service, name, value,
+                        sensor_type=reg.get('sensor_type'),
+                        override=reg.get('round'),
+                    )
+                else:
+                    # Fallback for tests / pre-init: skip rounding & dedup.
+                    role_service[name] = value
+
+    def _regs_by_name(self) -> dict:
+        """Build a {reg_name: reg_dict} lookup for the active model.
+
+        Cached on the instance after first use — the regs list is
+        immutable for the lifetime of the device.
+        """
+        cached = getattr(self, '_regs_by_name_cache', None)
+        if cached is not None:
+            return cached
+        cache = {reg['name']: reg for reg in self.info.get('regs', [])
+                 if 'name' in reg}
+        self._regs_by_name_cache = cache
+        return cache
 
     def handle_manufacturer_data(self, manufacturer_data: bytes):
         """
