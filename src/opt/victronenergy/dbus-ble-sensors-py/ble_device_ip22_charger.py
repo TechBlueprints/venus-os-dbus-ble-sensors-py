@@ -645,9 +645,12 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 # off-state ads then skip.  Without this, a stale value
                 # from the last decoded telemetry tick would persist and
                 # read like live data.
-                self._publish_value(role_service, "/Dc/0/Voltage", None)
-                self._publish_value(role_service, "/Dc/0/Current", None)
-                self._publish_value(role_service, "/Dc/0/Power", None)
+                self._publish_value(role_service, "/Dc/0/Voltage", None,
+                                    sensor_type="charger_voltage")
+                self._publish_value(role_service, "/Dc/0/Current", None,
+                                    sensor_type="charger_current")
+                self._publish_value(role_service, "/Dc/0/Power", None,
+                                    sensor_type="power")
                 self._publish_value(role_service, "/Dc/0/Temperature", None,
                                     sensor_type="temperature")
                 self._publish_value(role_service, "/Ac/In/L1/I", None,
@@ -677,14 +680,18 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 st = int(parsed["device_state"])
                 v1 = parsed.get("output_voltage1")
                 i1 = parsed.get("output_current1")
+                # IP22 is always a charger — use charger_voltage /
+                # charger_current types so the GUI/DVCC see sub-10 mV /
+                # sub-10 mA precision needed for absorption/float
+                # convergence tracking and tail-current detection.
                 # Always assign — passing None through SensorPublisher
                 # clears any stale value from a previous tick, so
                 # gui-v2 stops rendering yesterday's voltage as if it
                 # were live.
                 self._publish_value(role_service, "/Dc/0/Voltage", v1,
-                                    sensor_type="voltage")
+                                    sensor_type="charger_voltage")
                 self._publish_value(role_service, "/Dc/0/Current", i1,
-                                    sensor_type="current")
+                                    sensor_type="charger_current")
                 self._publish_value(
                     role_service, "/Dc/0/Power",
                     (round(v1 * i1, 2) if v1 is not None and i1 is not None
@@ -697,11 +704,11 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                     self._publish_value(role_service,
                                         f"/Dc/{idx + 1}/Voltage",
                                         parsed.get(vk),
-                                        sensor_type="voltage")
+                                        sensor_type="charger_voltage")
                     self._publish_value(role_service,
                                         f"/Dc/{idx + 1}/Current",
                                         parsed.get(ik),
-                                        sensor_type="current")
+                                        sensor_type="charger_current")
 
                 self._publish_value(role_service, "/Dc/0/Temperature",
                                     parsed.get("temperature"),

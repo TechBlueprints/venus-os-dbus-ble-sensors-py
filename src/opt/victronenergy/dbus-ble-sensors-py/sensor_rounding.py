@@ -30,19 +30,24 @@ if TYPE_CHECKING:
 # the decimal point.  Tuned to match what the GUI / VRM actually
 # displays; finer precision is sub-display noise.
 DEFAULTS: dict[str, tuple[int, int, int]] = {
-    'temperature':   (1, 0, 3),   # 0.1 °C
-    'humidity':      (1, 0, 3),   # 0.1 %
-    'pressure':      (0, 0, 3),   # 1 hPa
-    'voltage':       (2, 0, 4),   # 0.01 V
-    'current':       (2, 0, 4),   # 0.01 A
-    'power':         (0, 0, 3),   # 1 W
-    'soc':           (1, 0, 3),   # 0.1 %
-    'efficiency':    (2, 0, 4),   # 0.01 %
-    'acceleration':  (2, 0, 4),   # 0.01 g
-    'luminosity':    (0, 0, 2),   # 1 lux
-    'concentration': (0, 0, 3),   # 1 ppm / µg·m⁻³
-    'distance':      (1, 0, 3),   # 0.1 cm
-    'percent':       (1, 0, 3),   # 0.1 %  (generic fallback)
+    'temperature':       (1, 0, 3),   # 0.1 °C
+    'humidity':          (1, 0, 3),   # 0.1 %
+    'pressure':          (0, 0, 3),   # 1 hPa
+    'voltage':           (2, 0, 4),   # 0.01 V  (generic, e.g. battery monitor)
+    'charger_voltage':   (3, 0, 4),   # 0.001 V — chargers regulate to sub-10 mV
+                                      # precision during absorption/float; coarser
+                                      # rounding hides convergence behavior
+    'current':           (2, 0, 4),   # 0.01 A
+    'charger_current':   (3, 0, 4),   # 0.001 A — DVCC tail-current detection,
+                                      # absorption-end transitions
+    'power':             (0, 0, 3),   # 1 W
+    'soc':               (1, 0, 3),   # 0.1 %
+    'efficiency':        (2, 0, 4),   # 0.01 %
+    'acceleration':      (2, 0, 4),   # 0.01 g
+    'luminosity':        (0, 0, 2),   # 1 lux
+    'concentration':     (0, 0, 3),   # 1 ppm / µg·m⁻³
+    'distance':          (1, 0, 3),   # 0.1 cm
+    'percent':           (1, 0, 3),   # 0.1 %  (generic fallback)
 }
 
 # The republish-heartbeat: maximum interval (s) between ItemsChanged

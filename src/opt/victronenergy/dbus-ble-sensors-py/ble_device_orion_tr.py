@@ -798,14 +798,23 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
             # for change-detection + heartbeat.
             with role_service:
                 st = int(parsed["device_state"])
+                # Voltage precision policy: when the unit acts as a charger
+                # (alternator role) the user/DVCC need sub-10 mV precision
+                # to track absorption/float regulation; the generic voltage
+                # type at 0.01 V hides convergence behavior.  In dcdc/PSU
+                # role those decisions don't apply, so the cheaper default
+                # is fine.
+                is_alternator = role_service.ble_role.NAME == "alternator"
+                v_sensor_type = ("charger_voltage" if is_alternator
+                                 else "voltage")
                 if parsed.get("input_voltage") is not None:
                     self._publish_value(role_service, "/Dc/In/V",
                                         parsed["input_voltage"],
-                                        sensor_type="voltage")
+                                        sensor_type=v_sensor_type)
                 if parsed.get("output_voltage") is not None:
                     self._publish_value(role_service, "/Dc/0/Voltage",
                                         parsed["output_voltage"],
-                                        sensor_type="voltage")
+                                        sensor_type=v_sensor_type)
 
                 # ProductName = model spec from victron_ble's product-id table.
                 model = parsed.get("model_name")
@@ -818,7 +827,6 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 # charger — DVCC is not a meaningful contract for the
                 # dcdc role (PSU mode), so suppress the /State=252
                 # override and the charger /Alarms/* there.
-                is_alternator = role_service.ble_role.NAME == "alternator"
                 if is_alternator:
                     self._publish_value(role_service, "/State",
                                         self._derive_published_state(st))
