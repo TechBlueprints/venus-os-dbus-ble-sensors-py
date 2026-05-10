@@ -372,9 +372,17 @@ class BleDevice(object):
         return values
 
     def _update_dbus_data(self, role_service: DbusRoleService, sensor_data: dict):
-        for name, value in sensor_data.items():
-            role_service[name] = value
-            # TODO Find out what c method veItemSetFmt() do
+        # Batch all per-advertisement property writes inside a single
+        # ``DbusRoleService`` context block so the inner ``_set_value``
+        # calls share one refcount level — refcount-based vedbus emits
+        # exactly one ``PropertiesChanged`` signal per outer ``__exit__``.
+        # Without this, we paid one signal per property, fanning out to
+        # every D-Bus subscriber (vrmlogger, dbus-systemcalc, mqtt-rpc,
+        # gui-v2, …) once per field of every advertisement.
+        with role_service:
+            for name, value in sensor_data.items():
+                role_service[name] = value
+                # TODO Find out what c method veItemSetFmt() do
 
     def handle_manufacturer_data(self, manufacturer_data: bytes):
         """
