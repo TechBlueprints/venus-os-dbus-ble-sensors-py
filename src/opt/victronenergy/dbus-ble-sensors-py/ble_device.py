@@ -403,6 +403,28 @@ class BleDevice(object):
                     # Fallback for tests / pre-init: skip rounding & dedup.
                     role_service[name] = value
 
+    def _publish_value(self, role_service: DbusRoleService, path: str,
+                       value, sensor_type: 'str | None' = None,
+                       override: 'int | None' = None) -> bool:
+        """Publish a single value via :class:`SensorPublisher`.
+
+        Use this from drivers that publish *explicit paths* rather
+        than going through the regs table — e.g. Orion-TR's ``_publish``
+        which writes ``/Serial``, ``/State``, ``/Mode`` etc. based on
+        decoded advertisement fields, not on a regs definition.
+
+        Returns ``True`` if a write happened, ``False`` if skipped.
+        Falls back to a direct ``role_service[path] = value`` when no
+        publisher is initialised (tests / pre-init).
+        """
+        publisher = SensorPublisher.get()
+        if publisher is not None:
+            return publisher.publish(role_service, path, value,
+                                     sensor_type=sensor_type,
+                                     override=override)
+        role_service[path] = value
+        return True
+
     def _regs_by_name(self) -> dict:
         """Build a {reg_name: reg_dict} lookup for the active model.
 
