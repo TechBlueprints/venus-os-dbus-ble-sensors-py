@@ -247,19 +247,27 @@ class BleDevice(object):
             logging.error(f"{self._plog} ignoring {role_type} index {index}: {e}")
             return None
 
-        base_dev_id = self.info['dev_id']
-        self.info['dev_id'] = f"{base_dev_id}_{index:02d}"
+        # Pass the indexed dev id explicitly to the role-service
+        # constructor.  ``self.info['dev_id']`` is read once to compute
+        # the override and never mutated; a failure during init
+        # therefore cannot leak partial state into subsequent calls.
+        indexed_dev_id = f"{self.info['dev_id']}_{index:02d}"
+        try:
+            role_service = DbusRoleService(self, role, dev_id=indexed_dev_id)
+            role_service.load_settings()
 
-        role_service = DbusRoleService(self, role)
-        role_service.load_settings()
+            if device_name:
+                role_service['DeviceName'] = device_name
 
-        if device_name:
-            role_service['DeviceName'] = device_name
+            self._role_services[key] = role_service
+            DbusBleService.get().register_role_service(role_service)
+        except Exception:
+            logging.exception(
+                f"{self._plog} failed to create indexed {role_type} "
+                f"service [{index:02d}]"
+            )
+            return None
 
-        self._role_services[key] = role_service
-        DbusBleService.get().register_role_service(role_service)
-
-        self.info['dev_id'] = base_dev_id
         logging.info(f"{self._plog} created indexed {role_type} service [{index:02d}]")
         return role_service
 
