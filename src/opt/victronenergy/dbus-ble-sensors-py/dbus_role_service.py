@@ -13,7 +13,19 @@ class DbusRoleService(object):
     Role service class. Responsible for holding and sharing data through a dedicated dbus service.
     """
 
-    def __init__(self, ble_device, ble_role: BleRole):
+    def __init__(self, ble_device, ble_role: BleRole, dev_id: str = None):
+        """Construct a role service for *ble_device* fulfilling *ble_role*.
+
+        *dev_id* — explicit override of the device id used for the bus
+        name and settings paths.  Multi-sensor devices (e.g. SeeLevel)
+        register one role service per sensor channel and need names like
+        ``com.victronenergy.tank.<dev_prefix>_<mac>_<index:02d>``; they
+        pass the indexed value here.  When omitted, falls back to the
+        canonical ``ble_device.info['dev_id']`` set during the device's
+        configure pass.  This parameter exists so callers do not need
+        to mutate ``ble_device.info`` to inject a different dev id —
+        mutation through shared state has bitten us before.
+        """
         # private=True to allow creation of multiple services in the same app
         self._bus: dbus.Bus = dbus.SessionBus(
             private=True) if 'DBUS_SESSION_BUS_ADDRESS' in os.environ else dbus.SystemBus(private=True)
@@ -25,7 +37,7 @@ class DbusRoleService(object):
         self._dbus_iface = dbus.Interface(
             self._bus.get_object('org.freedesktop.DBus', '/org/freedesktop/DBus'),
             'org.freedesktop.DBus')
-        self._dev_id = self._ble_device.info['dev_id']
+        self._dev_id = dev_id if dev_id is not None else self._ble_device.info['dev_id']
         self._dbus_id = f"{self._dev_id}/{self.ble_role.NAME}"
         self._init_dbus_service()
 
