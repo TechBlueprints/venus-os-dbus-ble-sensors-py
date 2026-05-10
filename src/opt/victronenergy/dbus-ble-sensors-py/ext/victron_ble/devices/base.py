@@ -42,6 +42,22 @@ _AES_BLOCK_SIZE = 16
 _CTR_MASK_128 = (1 << 128) - 1
 
 
+# Cache of long-lived AES-ECB encryptor objects, keyed by the
+# advertisement key.  ``cryptography``'s ``Cipher(...).encryptor()``
+# allocates a fresh OpenSSL EVP_CIPHER_CTX every call, which dominated
+# CPU time when ``_aes_ctr_decrypt`` ran once per BLE advertisement
+# (3–4 chargers × 5–10 ads/s each, each ad allocating + finalising
+# its own context — about 5% of single-core CPU on Venus OS).
+#
+# AES-ECB has no per-call state: each ``encryptor.update(block)`` call
+# produces the AES encryption of that exact block.  We use it only
+# as a keystream generator (the actual CTR sequencing happens in this
+# function via ``counter``).  Reusing a single encryptor across calls
+# is therefore safe — we only need to keep it open (no ``finalize()``)
+# and feed it whole-block inputs.
+_AES_ECB_ENCRYPTOR_CACHE: dict[bytes, object] = {}
+
+
 def _aes_ctr_decrypt(key: bytes, iv_le_u16: int, ciphertext: bytes) -> bytes:
     """AES-128-CTR decrypt with a 128-bit little-endian counter.
 
@@ -55,8 +71,11 @@ def _aes_ctr_decrypt(key: bytes, iv_le_u16: int, ciphertext: bytes) -> bytes:
     """
     padded = _pkcs7_pad16(ciphertext)
     if _HAVE_CRYPTOGRAPHY:
-        encryptor = _CgCipher(_cg_algorithms.AES(key),
-                              _cg_modes.ECB()).encryptor()
+        encryptor = _AES_ECB_ENCRYPTOR_CACHE.get(key)
+        if encryptor is None:
+            encryptor = _CgCipher(_cg_algorithms.AES(key),
+                                  _cg_modes.ECB()).encryptor()
+            _AES_ECB_ENCRYPTOR_CACHE[key] = encryptor
         out = bytearray()
         counter = iv_le_u16
         for i in range(0, len(padded), _AES_BLOCK_SIZE):
@@ -66,7 +85,10 @@ def _aes_ctr_decrypt(key: bytes, iv_le_u16: int, ciphertext: bytes) -> bytes:
             block = padded[i:end]
             out += bytes(b ^ k for b, k in zip(block, keystream))
             counter = (counter + 1) & _CTR_MASK_128
-        encryptor.finalize()
+        # Deliberately *not* calling ``encryptor.finalize()`` — that
+        # would close the OpenSSL context and force the next call to
+        # rebuild it.  The cipher has no per-call state and is safe to
+        # keep open for the lifetime of the process.
         return bytes(out)
     # PyCryptodome reference implementation
     ctr = Counter.new(128, initial_value=iv_le_u16, little_endian=True)
