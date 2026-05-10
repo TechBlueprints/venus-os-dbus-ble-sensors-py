@@ -330,7 +330,7 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             for role_service in self._role_services.values():
                 current = role_service["/CustomName"]
                 if not current:
-                    role_service["/CustomName"] = adv_name
+                    self._publish_value(role_service, "/CustomName", adv_name)
 
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
         return self.matches_manufacturer_data(manufacturer_data)
@@ -519,7 +519,8 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 self.info["firmware_version"] = pretty
                 for role_service in self._role_services.values():
                     try:
-                        role_service["/FirmwareVersion"] = pretty
+                        self._publish_value(role_service,
+                                            "/FirmwareVersion", pretty)
                     except Exception:
                         pass
             except Exception:
@@ -532,7 +533,8 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 self.info["hardware_version"] = hw_version
                 for role_service in self._role_services.values():
                     try:
-                        role_service["/HardwareVersion"] = hw_version
+                        self._publish_value(role_service,
+                                            "/HardwareVersion", hw_version)
                     except Exception:
                         pass
             except Exception:
@@ -634,26 +636,34 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
 
         self._last_advertised_state = 0
         for role_service in list(self._role_services.values()):
-            # Off stays off regardless of DVCC engagement — there's no
-            # power flowing for "external control" to claim.
-            role_service["/State"] = 0
-            # Actively clear measurement paths.  Without this, a stale
-            # value from the last decoded telemetry tick would persist
-            # and read like live data.
-            role_service["/Dc/0/Voltage"] = None
-            role_service["/Dc/0/Current"] = None
-            role_service["/Dc/0/Power"] = None
-            role_service["/Dc/0/Temperature"] = None
-            role_service["/Ac/In/L1/I"] = None
-            if battery_v is not None:
-                role_service["/Settings/BatteryVoltage"] = battery_v
-            if self.info.get("serial"):
-                role_service["/Serial"] = self.info["serial"]
-            # Off-state by definition can't have charger-side alarms;
-            # clear all of them so a stale alarm from before the unit
-            # was switched off doesn't linger.
-            self._publish_alarms(role_service, 0)
-            self._publish_history(role_service)
+            with role_service:
+                # Off stays off regardless of DVCC engagement — there's no
+                # power flowing for "external control" to claim.
+                self._publish_value(role_service, "/State", 0)
+                # Actively clear measurement paths.  SensorPublisher writes
+                # None through (clearing) the first time per path; repeated
+                # off-state ads then skip.  Without this, a stale value
+                # from the last decoded telemetry tick would persist and
+                # read like live data.
+                self._publish_value(role_service, "/Dc/0/Voltage", None)
+                self._publish_value(role_service, "/Dc/0/Current", None)
+                self._publish_value(role_service, "/Dc/0/Power", None)
+                self._publish_value(role_service, "/Dc/0/Temperature", None,
+                                    sensor_type="temperature")
+                self._publish_value(role_service, "/Ac/In/L1/I", None,
+                                    sensor_type="current")
+                if battery_v is not None:
+                    self._publish_value(role_service,
+                                        "/Settings/BatteryVoltage",
+                                        battery_v, sensor_type="voltage")
+                if self.info.get("serial"):
+                    self._publish_value(role_service, "/Serial",
+                                        self.info["serial"])
+                # Off-state by definition can't have charger-side alarms;
+                # clear all of them so a stale alarm from before the unit
+                # was switched off doesn't linger.
+                self._publish_alarms(role_service, 0)
+                self._publish_history(role_service)
             role_service.connect()
 
     def _publish(self, parsed) -> None:
@@ -663,87 +673,107 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                     self.info, role_service.ble_role.NAME):
                 continue
 
-            st = int(parsed["device_state"])
-            v1 = parsed.get("output_voltage1")
-            i1 = parsed.get("output_current1")
-            # Always assign — assigning None on a missing reading clears
-            # any stale value from a previous tick, so gui-v2 stops
-            # rendering yesterday's voltage as if it were live.
-            role_service["/Dc/0/Voltage"] = v1
-            role_service["/Dc/0/Current"] = i1
-            role_service["/Dc/0/Power"] = (
-                round(v1 * i1, 2) if v1 is not None and i1 is not None
-                else None
-            )
+            with role_service:
+                st = int(parsed["device_state"])
+                v1 = parsed.get("output_voltage1")
+                i1 = parsed.get("output_current1")
+                # Always assign — passing None through SensorPublisher
+                # clears any stale value from a previous tick, so
+                # gui-v2 stops rendering yesterday's voltage as if it
+                # were live.
+                self._publish_value(role_service, "/Dc/0/Voltage", v1,
+                                    sensor_type="voltage")
+                self._publish_value(role_service, "/Dc/0/Current", i1,
+                                    sensor_type="current")
+                self._publish_value(
+                    role_service, "/Dc/0/Power",
+                    (round(v1 * i1, 2) if v1 is not None and i1 is not None
+                     else None),
+                    sensor_type="power")
 
-            for idx, out in enumerate(("2", "3")):
-                vk = f"output_voltage{out}"
-                ik = f"output_current{out}"
-                role_service[f"/Dc/{idx + 1}/Voltage"] = parsed.get(vk)
-                role_service[f"/Dc/{idx + 1}/Current"] = parsed.get(ik)
+                for idx, out in enumerate(("2", "3")):
+                    vk = f"output_voltage{out}"
+                    ik = f"output_current{out}"
+                    self._publish_value(role_service,
+                                        f"/Dc/{idx + 1}/Voltage",
+                                        parsed.get(vk),
+                                        sensor_type="voltage")
+                    self._publish_value(role_service,
+                                        f"/Dc/{idx + 1}/Current",
+                                        parsed.get(ik),
+                                        sensor_type="current")
 
-            role_service["/Dc/0/Temperature"] = parsed.get("temperature")
-            role_service["/Ac/In/L1/I"] = parsed.get("ac_current")
+                self._publish_value(role_service, "/Dc/0/Temperature",
+                                    parsed.get("temperature"),
+                                    sensor_type="temperature")
+                self._publish_value(role_service, "/Ac/In/L1/I",
+                                    parsed.get("ac_current"),
+                                    sensor_type="current")
 
-            model = parsed.get("model_name")
-            if model and not model.startswith("<Unknown"):
-                role_service["/ProductName"] = model
-            role_service["/ProductId"] = self.info["product_id"]
-            err = int(parsed["charger_error"])
-            # When a BMS / GX is dictating setpoints (DVCC engaged), the
-            # gui-v2 + dbus-systemcalc-py contract is to publish /State
-            # = 252 (EXTERNAL_CONTROL) so the rest of the system shows
-            # the charger as "externally controlled" instead of as a
-            # stand-alone unit happening to be in bulk/abs/float.  The
-            # IP22 firmware itself doesn't know it's externally
-            # controlled — it just sees us bumping 0xEDF0 / 0xEDF7 — so
-            # the override has to happen here, on the publish side.  We
-            # still pass the *real* advertised state to _tick_history()
-            # below so OperationTime / ChargedAh keep accumulating
-            # correctly while externally controlled.
-            self._last_advertised_state = st
-            role_service["/State"] = self._derive_published_state(st)
-            role_service["/ErrorCode"] = err
-            self._publish_alarms(role_service, err)
+                model = parsed.get("model_name")
+                if model and not model.startswith("<Unknown"):
+                    self._publish_value(role_service, "/ProductName", model)
+                self._publish_value(role_service, "/ProductId",
+                                    self.info["product_id"])
+                err = int(parsed["charger_error"])
+                # When a BMS / GX is dictating setpoints (DVCC engaged), the
+                # gui-v2 + dbus-systemcalc-py contract is to publish /State
+                # = 252 (EXTERNAL_CONTROL) so the rest of the system shows
+                # the charger as "externally controlled" instead of as a
+                # stand-alone unit happening to be in bulk/abs/float.  The
+                # IP22 firmware itself doesn't know it's externally
+                # controlled — it just sees us bumping 0xEDF0 / 0xEDF7 — so
+                # the override has to happen here, on the publish side.  We
+                # still pass the *real* advertised state to _tick_history()
+                # below so OperationTime / ChargedAh keep accumulating
+                # correctly while externally controlled.
+                self._last_advertised_state = st
+                self._publish_value(role_service, "/State",
+                                    self._derive_published_state(st))
+                self._publish_value(role_service, "/ErrorCode", err)
+                self._publish_alarms(role_service, err)
 
-            # /Serial — populated lazily from the BlueZ-advertised name
-            # on first telemetry tick (the encrypted payload itself
-            # doesn't carry the serial).  Use the ``"serial" in
-            # self.info`` sentinel so that a *negative* lookup (no
-            # Victron-format token in the BlueZ name) is also cached;
-            # otherwise this re-queried BlueZ for every advertisement.
-            if "serial" not in self.info:
-                self.info["serial"] = _serial_from_advertised_name(
-                    _bluez_device_name(self.info["dev_mac"])) or ""
-            if self.info["serial"]:
-                role_service["/Serial"] = self.info["serial"]
+                # /Serial — populated lazily from the BlueZ-advertised name
+                # on first telemetry tick (the encrypted payload itself
+                # doesn't carry the serial).  Use the ``"serial" in
+                # self.info`` sentinel so that a *negative* lookup (no
+                # Victron-format token in the BlueZ name) is also cached;
+                # otherwise this re-queried BlueZ for every advertisement.
+                if "serial" not in self.info:
+                    self.info["serial"] = _serial_from_advertised_name(
+                        _bluez_device_name(self.info["dev_mac"])) or ""
+                if self.info["serial"]:
+                    self._publish_value(role_service, "/Serial",
+                                        self.info["serial"])
 
-            # /Settings/BatteryVoltage — fixed per product id.  GUIs use
-            # this to label the battery bus and pick reasonable display
-            # ranges.  Only published when we can resolve a value;
-            # mis-publishing here would cause downstream confusion.
-            battery_v = _battery_voltage_for_product(
-                model, self.info["product_id"])
-            if battery_v is not None:
-                role_service["/Settings/BatteryVoltage"] = battery_v
+                # /Settings/BatteryVoltage — fixed per product id.  GUIs use
+                # this to label the battery bus and pick reasonable display
+                # ranges.  Only published when we can resolve a value;
+                # mis-publishing here would cause downstream confusion.
+                battery_v = _battery_voltage_for_product(
+                    model, self.info["product_id"])
+                if battery_v is not None:
+                    self._publish_value(role_service,
+                                        "/Settings/BatteryVoltage",
+                                        battery_v, sensor_type="voltage")
 
-            # NrOfOutputs — any non-None out2/out3 bumps it up
-            outputs = 1
-            if parsed.get("output_voltage2") is not None:
-                outputs = 2
-            if parsed.get("output_voltage3") is not None:
-                outputs = 3
-            role_service["/NrOfOutputs"] = outputs
+                # NrOfOutputs — any non-None out2/out3 bumps it up
+                outputs = 1
+                if parsed.get("output_voltage2") is not None:
+                    outputs = 2
+                if parsed.get("output_voltage3") is not None:
+                    outputs = 3
+                self._publish_value(role_service, "/NrOfOutputs", outputs)
 
-            # /Mode is intentionally not published — see the role file
-            # for why (firmware doesn't support remote on/off, and
-            # PageAcCharger.qml gates the Switch on dataItem.valid).
+                # /Mode is intentionally not published — see the role file
+                # for why (firmware doesn't support remote on/off, and
+                # PageAcCharger.qml gates the Switch on dataItem.valid).
 
-            # History accumulators — tick before publishing so the
-            # values reflect the current sample window.
-            current_a = (i1 if i1 is not None else 0.0)
-            self._tick_history(state=st, current_a=current_a)
-            self._publish_history(role_service)
+                # History accumulators — tick before publishing so the
+                # values reflect the current sample window.
+                current_a = (i1 if i1 is not None else 0.0)
+                self._tick_history(state=st, current_a=current_a)
+                self._publish_history(role_service)
 
             role_service.connect()
 

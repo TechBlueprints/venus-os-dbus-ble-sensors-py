@@ -473,7 +473,7 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
             for role_service in self._role_services.values():
                 current = role_service["/CustomName"]
                 if not current:
-                    role_service["/CustomName"] = adv_name
+                    self._publish_value(role_service, "/CustomName", adv_name)
 
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
         return self.matches_manufacturer_data(manufacturer_data)
@@ -651,7 +651,8 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 self.info["firmware_version"] = pretty
                 for role_service in self._role_services.values():
                     try:
-                        role_service["/FirmwareVersion"] = pretty
+                        self._publish_value(role_service,
+                                            "/FirmwareVersion", pretty)
                     except Exception:
                         pass
                 logger.info("%s: firmware version %s recorded",
@@ -666,7 +667,8 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 self.info["hardware_version"] = hw_version
                 for role_service in self._role_services.values():
                     try:
-                        role_service["/HardwareVersion"] = hw_version
+                        self._publish_value(role_service,
+                                            "/HardwareVersion", hw_version)
                     except Exception:
                         pass
                 logger.info("%s: hardware version %s recorded",
@@ -682,7 +684,9 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 if temp_c is not None:
                     for role_service in self._role_services.values():
                         try:
-                            role_service["/Dc/0/Temperature"] = temp_c
+                            self._publish_value(
+                                role_service, "/Dc/0/Temperature",
+                                temp_c, sensor_type="temperature")
                         except Exception:
                             pass
                     logger.info("%s: temperature %.1f °C recorded",
@@ -787,72 +791,90 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                     self.info, role_service.ble_role.NAME):
                 continue
 
-            st = int(parsed["device_state"])
-            if parsed.get("input_voltage") is not None:
-                role_service["/Dc/In/V"] = parsed["input_voltage"]
-            if parsed.get("output_voltage") is not None:
-                role_service["/Dc/0/Voltage"] = parsed["output_voltage"]
+            # Wrap the whole per-role publish in a single vedbus
+            # context: if multiple paths actually changed this ad, they
+            # coalesce into one ItemsChanged emit.  Each
+            # ``_publish_value`` underneath goes through SensorPublisher
+            # for change-detection + heartbeat.
+            with role_service:
+                st = int(parsed["device_state"])
+                if parsed.get("input_voltage") is not None:
+                    self._publish_value(role_service, "/Dc/In/V",
+                                        parsed["input_voltage"],
+                                        sensor_type="voltage")
+                if parsed.get("output_voltage") is not None:
+                    self._publish_value(role_service, "/Dc/0/Voltage",
+                                        parsed["output_voltage"],
+                                        sensor_type="voltage")
 
-            # ProductName = model spec from victron_ble's product-id table.
-            model = parsed.get("model_name")
-            if model and not model.startswith("<Unknown"):
-                role_service["/ProductName"] = model
+                # ProductName = model spec from victron_ble's product-id table.
+                model = parsed.get("model_name")
+                if model and not model.startswith("<Unknown"):
+                    self._publish_value(role_service, "/ProductName", model)
 
-            err = int(parsed["charger_error"])
-            self._last_advertised_state = st
-            # Only the alternator role represents the device as a
-            # charger — DVCC is not a meaningful contract for the
-            # dcdc role (PSU mode), so suppress the /State=252
-            # override and the charger /Alarms/* there.
-            is_alternator = role_service.ble_role.NAME == "alternator"
-            if is_alternator:
-                role_service["/State"] = self._derive_published_state(st)
-                self._publish_alarms(role_service, err)
-            else:
-                role_service["/State"] = st
-            role_service["/ErrorCode"] = err
-            role_service["/DeviceOffReason"] = int(parsed["off_reason"])
+                err = int(parsed["charger_error"])
+                self._last_advertised_state = st
+                # Only the alternator role represents the device as a
+                # charger — DVCC is not a meaningful contract for the
+                # dcdc role (PSU mode), so suppress the /State=252
+                # override and the charger /Alarms/* there.
+                is_alternator = role_service.ble_role.NAME == "alternator"
+                if is_alternator:
+                    self._publish_value(role_service, "/State",
+                                        self._derive_published_state(st))
+                    self._publish_alarms(role_service, err)
+                else:
+                    self._publish_value(role_service, "/State", st)
+                self._publish_value(role_service, "/ErrorCode", err)
+                self._publish_value(role_service, "/DeviceOffReason",
+                                    int(parsed["off_reason"]))
 
-            # Keep /Mode in sync with the inferred mode, unless a write is
-            # pending against the device.
-            if not self._mode_busy:
-                role_service["/Mode"] = 4 if st == 0 else 1
+                # Keep /Mode in sync with the inferred mode, unless a write is
+                # pending against the device.
+                if not self._mode_busy:
+                    self._publish_value(role_service, "/Mode",
+                                        4 if st == 0 else 1)
 
-            # /Serial — published on every role that declares it.
-            try:
-                if self.info.get("serial"):
-                    role_service["/Serial"] = self.info["serial"]
-            except KeyError:
-                pass
-
-            # /Settings/BatteryVoltage — derived from the model name
-            # using the Orion-TR-aware shared parser.  An Orion-TR
-            # Smart 12/24 has a 24 V output (battery side).
-            battery_v = battery_voltage_from_model(
-                model, pid_table=_ORION_PRODUCT_NAMES,
-                pid=self.info.get("product_id"))
-            if battery_v is not None:
+                # /Serial — published on every role that declares it.
                 try:
-                    role_service["/Settings/BatteryVoltage"] = battery_v
+                    if self.info.get("serial"):
+                        self._publish_value(role_service, "/Serial",
+                                            self.info["serial"])
                 except KeyError:
                     pass
 
-            # Force /ProductId to match the active service type.  gui-v2
-            # keys its layout off /ProductId for alternator services.
-            if is_alternator:
-                role_service["/ProductId"] = ALTERNATOR_PRODUCT_ID
-            else:
-                role_service["/ProductId"] = self.info["product_id"]
+                # /Settings/BatteryVoltage — derived from the model name
+                # using the Orion-TR-aware shared parser.  An Orion-TR
+                # Smart 12/24 has a 24 V output (battery side).
+                battery_v = battery_voltage_from_model(
+                    model, pid_table=_ORION_PRODUCT_NAMES,
+                    pid=self.info.get("product_id"))
+                if battery_v is not None:
+                    try:
+                        self._publish_value(role_service,
+                                            "/Settings/BatteryVoltage",
+                                            battery_v, sensor_type="voltage")
+                    except KeyError:
+                        pass
 
-            # History accumulators — alternator role only (charging
-            # context).  Tick from the *real* advertised state, not
-            # the EXTERNAL_CONTROL override.
-            if is_alternator:
-                # Orion-TR adv carries input/output voltage but not
-                # output current directly; pass None so ChargedAh
-                # only ticks once we have a real current source.
-                self._tick_history(state=st, current_a=None)
-                self._publish_history(role_service)
+                # Force /ProductId to match the active service type.  gui-v2
+                # keys its layout off /ProductId for alternator services.
+                if is_alternator:
+                    self._publish_value(role_service, "/ProductId",
+                                        ALTERNATOR_PRODUCT_ID)
+                else:
+                    self._publish_value(role_service, "/ProductId",
+                                        self.info["product_id"])
+
+                # History accumulators — alternator role only (charging
+                # context).  Tick from the *real* advertised state, not
+                # the EXTERNAL_CONTROL override.
+                if is_alternator:
+                    # Orion-TR adv carries input/output voltage but not
+                    # output current directly; pass None so ChargedAh
+                    # only ticks once we have a real current source.
+                    self._tick_history(state=st, current_a=None)
+                    self._publish_history(role_service)
 
             role_service.connect()
 
