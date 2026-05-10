@@ -48,6 +48,7 @@ class BleDeviceGobius(BleDevice):
                     'bits': 7,
                     'scale': 1,
                     'bias': -40,
+                    'sensor_type': 'temperature',
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {

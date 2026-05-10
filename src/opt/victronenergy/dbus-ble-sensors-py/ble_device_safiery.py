@@ -34,6 +34,7 @@ class BleDeviceSafiery(BleDevice):
                     'offset': 1,
                     'bits': 7,
                     'scale': 32,
+                    'sensor_type': 'voltage',
                     # .format	= &veUnitVolt2Dec,
                 },
                 {
@@ -43,6 +44,7 @@ class BleDeviceSafiery(BleDevice):
                     'bits': 7,
                     'scale': 1,
                     'bias': -40,
+                    'sensor_type': 'temperature',
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {

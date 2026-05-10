@@ -51,6 +51,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0x8000,
                     'roles': ['temperature'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'temperature',  # 0.1 °C display
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {
@@ -61,6 +62,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0xffff,
                     'roles': ['temperature'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'humidity',     # 0.1 %
                     # .format	= &veUnitPercentage,
                 },
                 {
@@ -72,6 +74,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0xffff,
                     'roles': ['temperature'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'pressure',     # 1 hPa
                     # .format	= &veUnitHectoPascal,
                 },
                 {
@@ -82,6 +85,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0x8000,
                     'roles': ['movement'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'acceleration',  # 0.01 g
                     # .format	= &veUnitG2Dec,
                 },
                 {
@@ -92,6 +96,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0x8000,
                     'roles': ['movement'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'acceleration',
                     # .format	= &veUnitG2Dec,
                 },
                 {
@@ -102,6 +107,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0x8000,
                     'roles': ['movement'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'acceleration',
                     # .format	= &veUnitG2Dec,
                 },
                 {
@@ -114,6 +120,7 @@ class BleDeviceRuuvi(BleDevice):
                     'bias': 1.6,
                     'inval': 0x3ff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'voltage',       # 0.01 V
                     # .format	= &veUnitVolt2Dec,
                 },
                 {
@@ -125,6 +132,8 @@ class BleDeviceRuuvi(BleDevice):
                     'bias': -40,
                     'inval': 0x1f,
                     'flags': ['REG_FLAG_INVALID'],
+                    # TxPower is already discrete in 0.5 dBm steps —
+                    # no rounding needed; dedup alone handles it.
                     # .format	= &veUnitdBm,
                 },
                 {
@@ -154,6 +163,7 @@ class BleDeviceRuuvi(BleDevice):
                     'scale': 200,
                     'inval': 0x8000,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'temperature',
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {
@@ -163,6 +173,7 @@ class BleDeviceRuuvi(BleDevice):
                     'scale': 400,
                     'inval': 0xffff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'humidity',
                     # .format	= &veUnitPercentage,
                 },
                 {
@@ -173,6 +184,7 @@ class BleDeviceRuuvi(BleDevice):
                     'bias': 500,
                     'inval': 0xffff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'pressure',
                     # .format	= &veUnitHectoPascal,
                 },
                 {
@@ -182,6 +194,7 @@ class BleDeviceRuuvi(BleDevice):
                     'scale': 10,
                     'inval': 0xffff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'concentration',
                     # .format	= &veUnitUgM3,
                 },
                 {
@@ -190,12 +203,14 @@ class BleDeviceRuuvi(BleDevice):
                     'offset': 9,
                     'inval': 0xffff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    'sensor_type': 'concentration',
                     # .format	= &veUnitPPM,
                 },
                 {
                     'name':  'VOC',
                     'type': VE_UN8,
                     'offset': 11,
+                    # Index value (no unit) — no rounding.
                     # .format	= &veUnitIndex,
                 },
                 {
@@ -211,6 +226,7 @@ class BleDeviceRuuvi(BleDevice):
                     'xlate': _xlate_lum,
                     'inval': 0xff,
                     'flags': ['REG_FLAG_INVALID'],
+                    'sensor_type': 'luminosity',
                     # .format	= &veUnitLux,
                 },
                 {
