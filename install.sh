@@ -253,18 +253,42 @@ chmod +x "$INSTALL_DIR"/*.sh 2>/dev/null || true
 
 # Take down a service tree cleanly before we replace it.
 #
-# daemontools normally responds to `svc -d` on the parent service, but the
-# log sub-service runs its own `multilog` process which holds an fcntl lock
-# on /var/log/$svc_name/.  If we just `rm -rf /service/$svc_name` while
-# multilog is still alive, the lock survives and the *new* multilog can
-# never start, leaving the new service running with no log output.
+# Take a managed service tree down completely *and* kill the supervise
+# processes that were managing it, so we can safely ``rm -rf`` the
+# /service/$svc_name symlink and recreate it.
+#
+# Why ``svc -dx`` instead of plain ``svc -d``:
+#
+#   ``svc -d`` only tells supervise that the service should be DOWN — the
+#   supervise process itself keeps running, waiting to be told to bring
+#   the service back up.  If the caller then ``rm -rf``s the symlink,
+#   svscan's next directory scan removes its internal tracking entry but
+#   does NOT kill the supervise process; it gets reparented to PID 1 and
+#   keeps running, holding any multilog children alive.  When the symlink
+#   is recreated, svscan spawns a FRESH supervise pointing at the same
+#   ``service/`` directory — now you have two supervises competing for
+#   the same supervise/control FIFO, and the orphaned multilog still
+#   holds the fcntl lock on /var/log/$svc_name/ so the fresh multilog
+#   never starts (its run loop logs ``multilog: fatal: unable to lock
+#   directory`` forever).  This produced a hard-to-spot bug where the
+#   new service ran with no log output.
+#
+#   ``svc -dx`` writes ``dx`` to the control FIFO: "go down, then exit".
+#   supervise exits after the service stops, svscan notices on its next
+#   scan, the multilog child is reaped, and the log-dir lock is released.
+#   That's what we want before tearing the symlink down.
 #
 # Belt and suspenders:
-#   1. svc -d the log service first so multilog gets SIGTERM
-#   2. svc -d the parent service
-#   3. pkill any multilog whose argv references our log dir, in case the
-#      log service entry was missing/broken (i.e. supervise wasn't
-#      managing it any more so svc -d was a no-op)
+#   1. ``svc -dx`` the log service first so multilog gets SIGTERM and
+#      supervise(log) exits, releasing the log-dir lock.
+#   2. ``svc -dx`` the parent service so supervise(parent) exits too.
+#   3. Wait for the supervise processes to actually exit (``svc -dx`` is
+#      async — it returns once the control byte is written, not when
+#      supervise has finished shutting down).  Without this wait the
+#      ``rm -rf`` below can race the still-running supervise.
+#   4. As a last resort, pkill any multilog whose argv references our
+#      log dir, for the case where svscan had already forgotten the
+#      service tree (so ``svc -dx`` was a no-op on a non-managed entry).
 stop_service_tree() {
     local svc_name="$1"
     local link="/service/$svc_name"
@@ -272,11 +296,20 @@ stop_service_tree() {
 
     if [ -e "$link" ]; then
         if [ -d "$link/log" ] || [ -L "$link/log" ]; then
-            svc -d "$link/log" 2>/dev/null || true
+            svc -dx "$link/log" 2>/dev/null || true
         fi
-        svc -d "$link" 2>/dev/null || true
-        sleep 1
+        svc -dx "$link" 2>/dev/null || true
     fi
+
+    # Wait up to 5s for supervise processes to actually exit.  We grep
+    # the exact "supervise $svc_name" argv produced by svscan; that's
+    # unique to this service tree even when other supervises exist.
+    for _ in 1 2 3 4 5; do
+        if ! pgrep -f "supervise $svc_name\$" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
 
     if pgrep -f "multilog .* $log_dir\$" >/dev/null 2>&1; then
         pkill -f "multilog .* $log_dir\$" 2>/dev/null || true
