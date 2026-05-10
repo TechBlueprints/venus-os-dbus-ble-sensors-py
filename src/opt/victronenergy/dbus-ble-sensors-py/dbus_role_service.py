@@ -209,6 +209,12 @@ class DbusRoleService(object):
     def get_device_name(self) -> str:
         return self._get_value('/DeviceName')
 
+    def get_role_count(self) -> int:
+        """Number of roles the parent device class publishes (e.g. a Ruuvi
+        Tag publishes both ``temperature`` and ``movement``, so this returns
+        2; a Mopeka tank returns 1)."""
+        return len(self._ble_device.info.get('roles') or {})
+
     def add_setting(self, setting: dict, callback=None):
         name = self._clear_path(setting['name'])
         props = setting['props']
