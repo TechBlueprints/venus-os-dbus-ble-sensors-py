@@ -89,27 +89,40 @@ class SensorRoundingPolicy:
     _INSTANCE: 'SensorRoundingPolicy | None' = None
 
     def __init__(self, settings: 'DbusSettingsService'):
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
         SensorRoundingPolicy._INSTANCE = self
         self._cache: dict[str, int] = {}
 
         for ttype, (default, min_, max_) in DEFAULTS.items():
-            item = settings.set_item(
-                _setting_path(ttype), default, min_, max_,
-                callback=self._make_cb(ttype),
-            )
+            path = _setting_path(ttype)
+            try:
+                item = settings.set_item(
+                    path, default, min_, max_,
+                    callback=self._make_cb(ttype),
+                )
+            except Exception:
+                _log.exception("SensorRoundingPolicy: set_item failed for %s (%s)", ttype, path)
+                self._cache[ttype] = default
+                continue
             try:
                 self._cache[ttype] = int(item.get_value())
             except (TypeError, ValueError):
+                _log.warning("SensorRoundingPolicy: get_value failed for %s, using default %d", ttype, default)
                 self._cache[ttype] = default
+            else:
+                _log.info("SensorRoundingPolicy: %s = %d (path %s)", ttype, self._cache[ttype], path)
 
-        hb_item = settings.set_item(
-            _HEARTBEAT_SETTING_PATH,
-            HEARTBEAT_DEFAULT, HEARTBEAT_MIN, HEARTBEAT_MAX,
-            callback=self._make_cb(_HEARTBEAT_KEY),
-        )
         try:
+            hb_item = settings.set_item(
+                _HEARTBEAT_SETTING_PATH,
+                HEARTBEAT_DEFAULT, HEARTBEAT_MIN, HEARTBEAT_MAX,
+                callback=self._make_cb(_HEARTBEAT_KEY),
+            )
             self._cache[_HEARTBEAT_KEY] = int(hb_item.get_value())
-        except (TypeError, ValueError):
+            _log.info("SensorRoundingPolicy: heartbeat = %d", self._cache[_HEARTBEAT_KEY])
+        except Exception:
+            _log.exception("SensorRoundingPolicy: heartbeat setup failed")
             self._cache[_HEARTBEAT_KEY] = HEARTBEAT_DEFAULT
 
     @staticmethod
