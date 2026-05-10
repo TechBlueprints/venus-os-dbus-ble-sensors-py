@@ -90,9 +90,18 @@ def test_changed_publish_writes(publisher, svc):
     assert svc['/Temp'] in (23.6, 23.7)
 
 
-def test_none_value_skipped(publisher, svc):
+def test_none_clears_stale_value(publisher, svc):
+    """Writing None after a real value clears the path (stale-data hygiene)."""
+    publisher.publish(svc, '/Temp', 23.5, 'temperature')
+    assert svc['/Temp'] == 23.5
+    assert publisher.publish(svc, '/Temp', None, 'temperature') is True
+    assert svc['/Temp'] is None
+
+
+def test_repeated_none_skips(publisher, svc):
+    """After None is written, repeating None inside heartbeat is a no-op."""
+    publisher.publish(svc, '/Temp', None, 'temperature')   # first None — writes
     assert publisher.publish(svc, '/Temp', None, 'temperature') is False
-    assert svc.get('/Temp') is None
 
 
 def test_zero_is_valid(publisher, svc):
