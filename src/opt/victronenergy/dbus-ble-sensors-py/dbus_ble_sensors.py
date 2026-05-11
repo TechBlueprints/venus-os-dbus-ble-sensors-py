@@ -29,6 +29,8 @@ from hci_advertisement_tap import (
 from ble_advertisement_router import BleAdvertisementRouter
 from sensor_rounding import SensorRoundingPolicy
 from sensor_publisher import SensorPublisher
+from load_throttle import LoadThrottle
+import platform_notifications
 
 ADV_LOG_QUIET_PERIOD = 1800
 SILENCE_WARNING_SECONDS = 300
@@ -190,6 +192,19 @@ class DbusBleSensors(object):
             version=PROCESS_VERSION,
             on_registrations_changed=self._on_registrations_changed,
         )
+
+        # Load-driven self-throttle: pauses the HCI tap + BlueZ
+        # AdvertisementMonitor registration when sustained load gets
+        # close to the /etc/watchdog.conf trip threshold.  See
+        # load_throttle.py for the state machine.  The active GUI
+        # notification handle (if any) lives here so we can clear it
+        # on release.
+        self._throttle = LoadThrottle(
+            on_trip=self._on_load_trip,
+            on_release=self._on_load_released,
+        )
+        self._throttle_notification: platform_notifications.PlatformNotification | None = None
+        self._throttled: bool = False
 
         self._list_adapters()
 
@@ -420,6 +435,96 @@ class DbusBleSensors(object):
         self._start_tap()
         self._router.start()
         GLib.timeout_add_seconds(30, self._prune_tick)
+        # Tick the load throttle every 30s on the GLib mainloop.
+        # ``LoadThrottle.tick`` always returns True so the timer
+        # persists for the life of the process.
+        GLib.timeout_add_seconds(30, self._throttle.tick)
+
+    # ── Load-driven throttle ──────────────────────────────────────────────
+
+    def _unregister_passive_monitor(self, adapter_name: str) -> None:
+        """Tell BlueZ to drop our AdvertisementMonitor for this adapter.
+
+        Counterpart to ``_register_passive_monitor``.  Called when the
+        throttle trips so BlueZ stops driving the controller's passive
+        scan on our behalf — that's a meaningful chunk of the load on
+        the system at high LO levels.  Best-effort; logs and moves on
+        if BlueZ refuses (we'll fall through to re-register on release
+        anyway).
+        """
+        adapter_path = self._adapter_paths.get(adapter_name)
+        if not adapter_path or adapter_name not in self._registered_adapters:
+            return
+        try:
+            adapter = self._dbus.get_object('org.bluez', adapter_path)
+            mgr = dbus.Interface(adapter, 'org.bluez.AdvertisementMonitorManager1')
+            mgr.UnregisterMonitor(_MONITOR_APP_PATH)
+            self._registered_adapters.discard(adapter_name)
+            logging.info(f"{adapter_name}: passive scanning monitor unregistered (throttle)")
+        except dbus.exceptions.DBusException as exc:
+            logging.warning(
+                f"{adapter_name}: UnregisterMonitor failed: {exc}")
+
+    def _on_load_trip(self, load_5m: float, load_15m: float) -> None:
+        """Called by LoadThrottle when load crosses the trip threshold.
+
+        Stops the HCI tap thread (releases its CPU + closes the
+        kernel socket), unregisters our AdvertisementMonitor from each
+        adapter (BlueZ stops scanning on our behalf), and pushes a
+        warning notification to the GUI via the platform service.
+        """
+        self._throttled = True
+
+        # Stop the HCI tap thread.  ``run_tap_loop`` checks the stop
+        # event between recvs and returns cleanly; the socket closes
+        # when the thread exits.
+        self._tap_stop.set()
+        # _prune_tick will not restart the tap while _throttled is True
+        # (see the change in _prune_tick below).
+        self._tap_thread = None
+
+        # Unregister AdvertisementMonitor on every adapter we'd registered.
+        for name in list(self._registered_adapters):
+            self._unregister_passive_monitor(name)
+
+        # Surface a warning notification to the Cerbo GUI.
+        try:
+            self._throttle_notification = platform_notifications.inject(
+                self._dbus,
+                type_id=platform_notifications.TYPE_WARNING,
+                device_name="BLE Sensors",
+                description="High system load — BLE updates paused",
+            )
+            self._throttle_notification.activate()
+        except Exception:
+            logging.exception("Failed to publish throttle warning notification")
+            self._throttle_notification = None
+
+    def _on_load_released(self, load_5m: float, load_15m: float) -> None:
+        """Called by LoadThrottle when load drops back below the release.
+
+        Restarts the HCI tap, re-registers the passive monitor on all
+        known adapters, and dismisses the GUI notification (it stays
+        in the history list for later review).
+        """
+        self._throttled = False
+
+        # Restart the tap.  _start_tap re-clears the event and spawns
+        # a fresh daemon thread.
+        self._start_tap()
+
+        # Re-register the AdvertisementMonitor on each known adapter.
+        # _prune_tick would eventually do this on its own, but we do
+        # it eagerly to minimize the gap.
+        for name in list(self._adapter_paths):
+            self._register_passive_monitor(name)
+
+        if self._throttle_notification is not None:
+            try:
+                self._throttle_notification.dismiss()
+            except Exception:
+                logging.exception("Failed to dismiss throttle notification")
+            self._throttle_notification = None
 
     def _on_registrations_changed(self):
         """Called by the router when external registrations change.
@@ -487,16 +592,21 @@ class DbusBleSensors(object):
             self._last_adv_seen.pop(mac, None)
             self._last_mfg_data.pop(mac, None)
 
-        # Tap thread watchdog: restart if it died
-        if self._tap_thread is not None and not self._tap_thread.is_alive():
-            logging.warning("HCI monitor tap thread is dead — restarting")
-            self._tap_thread = None
-            self._start_tap()
+        # Tap thread watchdog: restart if it died.  Skip while the
+        # load throttle has us paused — the throttle deliberately
+        # tore the tap down, and will re-start it on release.
+        if not self._throttled:
+            if self._tap_thread is not None and not self._tap_thread.is_alive():
+                logging.warning("HCI monitor tap thread is dead — restarting")
+                self._tap_thread = None
+                self._start_tap()
 
-        # Re-register monitors on any adapter that lost its registration
-        for name in self._adapter_paths:
-            if name not in self._registered_adapters:
-                self._register_passive_monitor(name)
+            # Re-register monitors on any adapter that lost its registration.
+            # Same throttle gate — don't re-arm what the throttle just
+            # explicitly disabled.
+            for name in self._adapter_paths:
+                if name not in self._registered_adapters:
+                    self._register_passive_monitor(name)
 
         # Silence detection: re-register passive monitors if no ads for 5 min
         if self._last_tap_rx > 0 and now - self._last_tap_rx > SILENCE_WARNING_SECONDS:
