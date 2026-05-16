@@ -71,23 +71,24 @@ def svc():
 
 
 def test_first_publish_writes(publisher, svc):
+    # Precise value goes through; rounding is only used to decide
+    # whether to emit, not what to publish.
     assert publisher.publish(svc, '/Temp', 23.456, 'temperature') is True
-    assert svc['/Temp'] == 23.5     # rounded to 1 decimal
+    assert svc['/Temp'] == 23.456   # PRECISE, not rounded to 23.5
 
 
 def test_unchanged_publish_skips(publisher, svc):
-    publisher.publish(svc, '/Temp', 23.49, 'temperature')           # writes 23.5
-    # Same rounded value (23.51 -> 23.5) → skip
+    publisher.publish(svc, '/Temp', 23.49, 'temperature')           # round=23.5, emit 23.49
+    # Same rounded value (23.51 -> 23.5) → skip the emit
     assert publisher.publish(svc, '/Temp', 23.51, 'temperature') is False
 
 
 def test_changed_publish_writes(publisher, svc):
-    publisher.publish(svc, '/Temp', 23.49, 'temperature')           # 23.5
+    publisher.publish(svc, '/Temp', 23.49, 'temperature')           # round=23.5
+    # 23.65 rounds to a different bucket → emit
     assert publisher.publish(svc, '/Temp', 23.65, 'temperature') is True
-    # 23.65 rounds to 23.6 or 23.7 (banker's rounding at half — float
-    # repr makes the exact result implementation-dependent), so
-    # assert on type/range rather than exact value.
-    assert svc['/Temp'] in (23.6, 23.7)
+    # Stored value is the precise input, not the rounded comparison value.
+    assert svc['/Temp'] == 23.65
 
 
 def test_none_clears_stale_value(publisher, svc):
@@ -124,10 +125,15 @@ def test_no_sensor_type_still_dedups(publisher, svc):
 
 
 def test_override_takes_precedence(publisher, svc):
-    # temperature default = 1 decimal; override to 0
+    # ``override`` controls the *comparison* precision, not what is
+    # emitted: the precise input still lands on the bus.  Verified
+    # by a follow-on call where 23.456 → round(0)=23 caches "23", and
+    # 23.49 also rounds to 23 → dedups.
     assert publisher.publish(svc, '/Temp', 23.456, 'temperature',
                               override=0) is True
-    assert svc['/Temp'] == 23
+    assert svc['/Temp'] == 23.456                              # precise emit
+    assert publisher.publish(svc, '/Temp', 23.49, 'temperature',
+                              override=0) is False             # same rounded bucket → skip
 
 
 def test_force_writes_unchanged(publisher, svc):

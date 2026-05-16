@@ -55,13 +55,21 @@ class SensorPublisher:
                 sensor_type: 'str | None' = None,
                 override: 'int | None' = None,
                 force: bool = False) -> bool:
-        """Round *value* and write to ``role_service[path]`` only when:
+        """Write *value* (precise, unrounded) to ``role_service[path]``
+        only when:
 
-        - the rounded value differs from the last published one, OR
+        - the *rounded* value differs from the last published one, OR
         - the heartbeat interval has elapsed since the last publish, OR
         - *force* is True.
 
-        Returns ``True`` if a write happened, ``False`` if skipped.
+        Rounding is applied **only for the change-detection comparison**.
+        The value actually written to D-Bus is the original precise
+        value the driver passed in, so downstream consumers (VRM, MQTT,
+        gui-v2) still see full resolution when an emit happens.  This
+        is the same pattern used in ``dbus-aggregate-smartshunts``
+        (commits c8ecb18 / 90cb683) and ``dbus-virtual-dcsystem``
+        (ecd2659): coarse comparison gates noisy emits, but the data
+        on the bus stays precise.
 
         ``value=None`` is published the same way any other value is:
         if the cache already holds ``None`` for this path (and we're
@@ -71,6 +79,8 @@ class SensorPublisher:
         IP22 charger do when a device transitions to ``Off`` and we
         want stale voltage/current readings to vanish from the GUI
         rather than linger.
+
+        Returns ``True`` if a write happened, ``False`` if skipped.
         """
         rounded = self._policy.round_value(value, sensor_type, override)
 
@@ -78,8 +88,8 @@ class SensorPublisher:
         cache = self._last.setdefault(role_service, {})
         last = cache.get(path)
         if not force and last is not None:
-            last_value, last_t = last
-            if rounded == last_value:
+            last_rounded, last_t = last
+            if rounded == last_rounded:
                 hb = self._policy.heartbeat_seconds
                 # ``hb <= 0`` disables heartbeat: never republish
                 # an unchanged value.  Otherwise republish once the
@@ -87,6 +97,10 @@ class SensorPublisher:
                 if hb <= 0 or (now - last_t) < hb:
                     return False
 
-        role_service[path] = rounded
+        # Emit the *precise* value, cache the *rounded* one for the
+        # next comparison.  Storing precise would make us re-emit on
+        # every sub-rounding flicker — the whole point of the rounded
+        # comparison is to avoid that.
+        role_service[path] = value
         cache[path] = (rounded, now)
         return True
