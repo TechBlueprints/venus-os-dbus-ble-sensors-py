@@ -807,30 +807,35 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 is_alternator = role_service.ble_role.NAME == "alternator"
                 v_sensor_type = ("charger_voltage" if is_alternator
                                  else "voltage")
-                # Dedup-precision override for the dcdc (PSU) role.
-                # An actively-regulating Orion-TR swings its input and
-                # output voltages by 0.1-0.2 V around the target on
-                # every advertisement.  At the 'voltage' default of
-                # 0.01 V dedup precision, every wiggle reaches the
-                # bus (was ~1.5 IC/sec per charger).  Override to 0
-                # decimals (1 V) — consumers in the dcdc role want
-                # "is it running and roughly where?", not absorption
-                # tail behavior.  The PRECISE value is still emitted
-                # when something does cross the bucket; downstream
-                # readers see 51.92 V, not 52.  Alternator role keeps
-                # the 'charger_voltage' default (0.001 V) since DVCC
-                # consumers there DO care about regulation detail.
-                v_override = 0 if not is_alternator else None
+                # Dedup policy for the dcdc (PSU) role.
+                #
+                # An Orion-TR sitting at its regulation target swings
+                # its measured voltage 0.05-0.15 V around that target
+                # on every advertisement.  Rounded-equality dedup
+                # fails badly here because the target frequently
+                # straddles a rounding boundary — a 13.5 V input
+                # flickering 13.46 ↔ 13.53 maps to round-to-integer
+                # 13 vs 14 and emits on every other ad.  Use deadband
+                # mode instead: only emit when the precise value has
+                # moved at least 0.5 V (input) or 1.0 V (output) from
+                # the last emit.  The precise value is still what
+                # lands on D-Bus when a write happens.
+                #
+                # Alternator role consumers (DVCC) DO want sub-volt
+                # regulation detail, so they keep the default
+                # 'charger_voltage' rounded-mode policy (0.001 V).
+                v_deadband_in = None if is_alternator else 0.5
+                v_deadband_out = None if is_alternator else 1.0
                 if parsed.get("input_voltage") is not None:
                     self._publish_value(role_service, "/Dc/In/V",
                                         parsed["input_voltage"],
                                         sensor_type=v_sensor_type,
-                                        override=v_override)
+                                        deadband=v_deadband_in)
                 if parsed.get("output_voltage") is not None:
                     self._publish_value(role_service, "/Dc/0/Voltage",
                                         parsed["output_voltage"],
                                         sensor_type=v_sensor_type,
-                                        override=v_override)
+                                        deadband=v_deadband_out)
 
                 # ProductName = model spec from victron_ble's product-id table.
                 model = parsed.get("model_name")
