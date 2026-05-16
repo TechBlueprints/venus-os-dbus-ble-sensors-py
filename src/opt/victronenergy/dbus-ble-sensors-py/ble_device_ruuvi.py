@@ -137,11 +137,37 @@ class BleDeviceRuuvi(BleDevice):
                     # .format	= &veUnitdBm,
                 },
                 {
+                    # MovementCounter increments only when the Ruuvi's
+                    # onboard accelerometer interrupt fires — i.e., the
+                    # firmware decided the tag actually moved.  We use
+                    # this as a per-device gate in ``update_data``
+                    # below: when the counter is unchanged between two
+                    # ads, AccelX/Y/Z are dropped from the role_data
+                    # dict so vedbus is not poked with another redundant
+                    # gravity-vector reading.  Stationary tag => silent.
+                    'name': 'MovementCounter',
+                    'type': VE_UN8,
+                    'offset': 15,
+                    'inval': 0xff,
+                    'roles': ['movement'],
+                    'flags': ['REG_FLAG_INVALID'],
+                    # Integer counter — vedbus's exact-equality dedup
+                    # handles it, no rounding policy needed.
+                },
+                {
                     'name': 'SeqNo',
                     'type': VE_UN16,
                     'offset': 16,
                     'inval': 0xffff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
+                    # SeqNo (measurement sequence number) increments on
+                    # every advertisement.  If published it would drive
+                    # an ItemsChanged emit per ad on every Ruuvi role
+                    # service (was the single biggest IC-rate driver
+                    # before this change).  Mark roles=[None] so the
+                    # parser skips it entirely — no D-Bus path created,
+                    # no consumer can rely on it.
+                    'roles': [None],
                     # .format	= &veUnitNone,
                 },
             ],
@@ -276,8 +302,40 @@ class BleDeviceRuuvi(BleDevice):
             return len(manufacturer_data) == self.manufacturer_data_length
 
     def update_data(self, role_service: DbusRoleService, sensor_data: dict):
-        # Flags (format 6 / Ruuvi Air only) carry extra VOC/NOX bits. Format 5
-        # (RuuviTag) has no Flags reg — do not require it for those frames.
+        # ── Movement-role: gate AccelX/Y/Z on MovementCounter changes ──
+        #
+        # The Ruuvi format 5 firmware increments MovementCounter only
+        # when its onboard accelerometer interrupt fires — i.e., the
+        # tag actually moved.  Between motion events the counter is
+        # constant, even though the gravity-vector axes flicker by a
+        # few mg from sensor noise on every advertisement.  Rounding
+        # alone can't suppress those flickers because one axis is
+        # always near a rounding boundary (the horizontal one, ≈0 g).
+        #
+        # Per-device cache: when this ad's MovementCounter matches the
+        # last one we saw, we delete AccelX/Y/Z from the role_data
+        # dict.  ``_update_dbus_data`` only iterates what's in the
+        # dict, so accel paths are not poked that cycle.  MovementCounter
+        # itself stays in the dict; vedbus's exact-equality dedup will
+        # then skip emitting it too (same value as last time), and
+        # vedbus emits no ItemsChanged at all — exactly the "stationary
+        # tag, silent service" outcome we want.
+        if 'MovementCounter' in sensor_data:
+            counter = sensor_data['MovementCounter']
+            last = getattr(self, '_last_movement_counter', None)
+            if counter is not None and counter == last:
+                for k in ('AccelX', 'AccelY', 'AccelZ'):
+                    sensor_data.pop(k, None)
+            else:
+                # Counter advanced (or first ad after boot) — let the
+                # accel values through and remember the new counter.
+                self._last_movement_counter = counter
+
+        # ── Format 6 / Ruuvi Air: pack VOC/NOX flag bits ───────────────
+        #
+        # Flags (format 6 / Ruuvi Air only) carry extra VOC/NOX bits.
+        # Format 5 (RuuviTag) has no Flags reg — do not require it for
+        # those frames.
         voc = sensor_data.get('VOC', None)
         nox = sensor_data.get('NOX', None)
         if voc is None and nox is None:
