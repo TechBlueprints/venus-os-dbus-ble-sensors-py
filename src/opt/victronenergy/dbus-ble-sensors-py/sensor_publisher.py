@@ -54,42 +54,82 @@ class SensorPublisher:
     def publish(self, role_service: 'DbusRoleService', path: str, value,
                 sensor_type: 'str | None' = None,
                 override: 'int | None' = None,
+                deadband: 'float | None' = None,
                 force: bool = False) -> bool:
-        """Write *value* (precise, unrounded) to ``role_service[path]``
-        only when:
+        """Write *value* (precise, unrounded) to ``role_service[path]``.
 
-        - the *rounded* value differs from the last published one, OR
-        - the heartbeat interval has elapsed since the last publish, OR
-        - *force* is True.
+        Whether a write actually happens depends on **one of two
+        change-detection modes**, picked by the parameters:
 
-        Rounding is applied **only for the change-detection comparison**.
-        The value actually written to D-Bus is the original precise
-        value the driver passed in, so downstream consumers (VRM, MQTT,
-        gui-v2) still see full resolution when an emit happens.  This
-        is the same pattern used in ``dbus-aggregate-smartshunts``
-        (commits c8ecb18 / 90cb683) and ``dbus-virtual-dcsystem``
-        (ecd2659): coarse comparison gates noisy emits, but the data
-        on the bus stays precise.
+        **Rounded-equality mode** (default — ``deadband`` is None).
+        The new value is rounded per ``sensor_type`` / ``override``
+        and compared for equality against the last cached rounded
+        value.  A write happens when:
+
+          - the rounded value differs, OR
+          - the heartbeat interval has elapsed, OR
+          - *force* is True.
+
+        Works well when the source value naturally clusters away from
+        rounding boundaries.  Fails when the value sits at a boundary
+        (e.g. ``/Dc/In/V`` hovering at 13.5 V with ``round(_, 0)``
+        flipping between 13 and 14 on every advertisement).
+
+        **Deadband mode** (``deadband`` set to a positive float).
+        ``sensor_type`` and ``override`` are ignored for comparison.
+        Instead the new precise value is compared against the last
+        precise value cached, and a write happens when:
+
+          - ``abs(value - last_value) >= deadband``, OR
+          - the heartbeat interval has elapsed, OR
+          - *force* is True.
+
+        Robust against boundary-sitting values: a Orion-TR input
+        voltage flickering 13.43 V ↔ 13.53 V (10 mV swing) is
+        within any reasonable 0.5 V deadband and stays silent.
+
+        In **both modes** the value actually written to D-Bus is the
+        precise input; rounding/deadband only gates whether to emit.
 
         ``value=None`` is published the same way any other value is:
         if the cache already holds ``None`` for this path (and we're
         inside the heartbeat window), the write is skipped; if the
         cache holds a real value, ``None`` is written through to
-        clear the stale reading.  This matches what drivers like the
-        IP22 charger do when a device transitions to ``Off`` and we
-        want stale voltage/current readings to vanish from the GUI
-        rather than linger.
+        clear the stale reading.
 
         Returns ``True`` if a write happened, ``False`` if skipped.
         """
-        rounded = self._policy.round_value(value, sensor_type, override)
+        # Pick the comparison key:
+        #   deadband mode → cache the precise value
+        #   rounded mode  → cache the rounded value
+        # That way the next call's comparison reads the right thing.
+        if deadband is not None and deadband > 0:
+            cmp_key = value
+        else:
+            cmp_key = self._policy.round_value(value, sensor_type, override)
 
         now = time.monotonic()
         cache = self._last.setdefault(role_service, {})
         last = cache.get(path)
         if not force and last is not None:
-            last_rounded, last_t = last
-            if rounded == last_rounded:
+            last_key, last_t = last
+            unchanged = False
+            if deadband is not None and deadband > 0:
+                # Deadband: compare precise values numerically.
+                # Treat None on either side as "different" so a
+                # stale-to-fresh transition (or vice versa) always
+                # emits.
+                if value is None or last_key is None:
+                    unchanged = (value is None and last_key is None)
+                else:
+                    try:
+                        unchanged = abs(value - last_key) < deadband
+                    except TypeError:
+                        unchanged = (value == last_key)
+            else:
+                unchanged = (cmp_key == last_key)
+
+            if unchanged:
                 hb = self._policy.heartbeat_seconds
                 # ``hb <= 0`` disables heartbeat: never republish
                 # an unchanged value.  Otherwise republish once the
@@ -97,10 +137,6 @@ class SensorPublisher:
                 if hb <= 0 or (now - last_t) < hb:
                     return False
 
-        # Emit the *precise* value, cache the *rounded* one for the
-        # next comparison.  Storing precise would make us re-emit on
-        # every sub-rounding flicker — the whole point of the rounded
-        # comparison is to avoid that.
         role_service[path] = value
-        cache[path] = (rounded, now)
+        cache[path] = (cmp_key, now)
         return True

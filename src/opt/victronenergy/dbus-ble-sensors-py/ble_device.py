@@ -405,13 +405,19 @@ class BleDevice(object):
 
     def _publish_value(self, role_service: DbusRoleService, path: str,
                        value, sensor_type: 'str | None' = None,
-                       override: 'int | None' = None) -> bool:
+                       override: 'int | None' = None,
+                       deadband: 'float | None' = None) -> bool:
         """Publish a single value via :class:`SensorPublisher`.
 
         Use this from drivers that publish *explicit paths* rather
         than going through the regs table — e.g. Orion-TR's ``_publish``
         which writes ``/Serial``, ``/State``, ``/Mode`` etc. based on
         decoded advertisement fields, not on a regs definition.
+
+        Pass ``deadband=<N>`` for values that sit on rounding
+        boundaries (e.g. an input voltage hovering at 13.5 V with
+        ``override=0`` flipping between 13 and 14 on every ad).  See
+        :meth:`SensorPublisher.publish` for the full mode semantics.
 
         Returns ``True`` if a write happened, ``False`` if skipped.
         Falls back to a direct ``role_service[path] = value`` when no
@@ -421,7 +427,8 @@ class BleDevice(object):
         if publisher is not None:
             return publisher.publish(role_service, path, value,
                                      sensor_type=sensor_type,
-                                     override=override)
+                                     override=override,
+                                     deadband=deadband)
         role_service[path] = value
         return True
 

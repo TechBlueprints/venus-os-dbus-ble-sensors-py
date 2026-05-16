@@ -142,6 +142,80 @@ def test_force_writes_unchanged(publisher, svc):
                               force=True) is True
 
 
+# ─── Deadband mode ──────────────────────────────────────────────────
+
+
+def test_deadband_first_publish_writes(publisher, svc):
+    # No prior value cached — always emit.
+    assert publisher.publish(svc, '/V', 13.5, deadband=0.5) is True
+    assert svc['/V'] == 13.5
+
+
+def test_deadband_small_change_skips(publisher, svc):
+    """The exact failure case that motivated this mode: value
+    flickering around a rounding boundary stays within deadband."""
+    publisher.publish(svc, '/V', 13.46, deadband=0.5)
+    # All within 0.5 V of 13.46 → silent
+    assert publisher.publish(svc, '/V', 13.53, deadband=0.5) is False
+    assert publisher.publish(svc, '/V', 13.44, deadband=0.5) is False
+    assert publisher.publish(svc, '/V', 13.50, deadband=0.5) is False
+
+
+def test_deadband_at_threshold_emits(publisher, svc):
+    publisher.publish(svc, '/V', 13.0, deadband=0.5)
+    # |13.5 - 13.0| == 0.5 → ``>=`` → emit
+    assert publisher.publish(svc, '/V', 13.5, deadband=0.5) is True
+    assert svc['/V'] == 13.5
+
+
+def test_deadband_large_change_emits_precise(publisher, svc):
+    publisher.publish(svc, '/V', 13.5, deadband=0.5)
+    assert publisher.publish(svc, '/V', 15.234, deadband=0.5) is True
+    # Precise value lands on the bus, NOT a rounded one.
+    assert svc['/V'] == 15.234
+
+
+def test_deadband_negative_delta_uses_abs(publisher, svc):
+    publisher.publish(svc, '/V', 13.5, deadband=0.5)
+    # 12.9 is 0.6 V below 13.5 → ``abs >= 0.5`` → emit
+    assert publisher.publish(svc, '/V', 12.9, deadband=0.5) is True
+
+
+def test_deadband_compares_against_last_emitted_not_last_seen(publisher, svc):
+    """Cache the last EMITTED value, not the last skipped one.
+    Otherwise small steps could ratchet through the deadband one
+    sub-deadband at a time and never trigger an emit even though
+    the value has drifted far from the last published reading."""
+    publisher.publish(svc, '/V', 13.0, deadband=0.5)
+    publisher.publish(svc, '/V', 13.4, deadband=0.5)   # skip (0.4 < 0.5)
+    publisher.publish(svc, '/V', 13.49, deadband=0.5)  # skip (0.49 < 0.5)
+    # Now 13.5 vs last emitted (13.0) is exactly 0.5 → emit.
+    assert publisher.publish(svc, '/V', 13.5, deadband=0.5) is True
+    assert svc['/V'] == 13.5
+
+
+def test_deadband_none_handling(publisher, svc):
+    """None ↔ value transitions emit; None ↔ None inside heartbeat
+    skips (same as rounded mode)."""
+    publisher.publish(svc, '/V', None, deadband=0.5)
+    # repeated None → skip
+    assert publisher.publish(svc, '/V', None, deadband=0.5) is False
+    # None → value → emit
+    assert publisher.publish(svc, '/V', 13.0, deadband=0.5) is True
+    # value → None → emit (stale-data hygiene)
+    assert publisher.publish(svc, '/V', None, deadband=0.5) is True
+
+
+def test_deadband_zero_disables(publisher, svc):
+    """``deadband=0`` falls back to rounded-equality mode (the
+    sentinel "positive deadband" rule).  Sensible since "emit on any
+    change at all" is what rounded mode already does at ndigits=N."""
+    publisher.publish(svc, '/V', 13.456, deadband=0)
+    # deadband=0 ignored → falls back to no-rounding equality;
+    # 13.457 != 13.456 → emit
+    assert publisher.publish(svc, '/V', 13.457, deadband=0) is True
+
+
 # ─── Heartbeat ──────────────────────────────────────────────────────
 
 
