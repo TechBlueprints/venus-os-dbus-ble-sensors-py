@@ -807,14 +807,30 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 is_alternator = role_service.ble_role.NAME == "alternator"
                 v_sensor_type = ("charger_voltage" if is_alternator
                                  else "voltage")
+                # Dedup-precision override for the dcdc (PSU) role.
+                # An actively-regulating Orion-TR swings its input and
+                # output voltages by 0.1-0.2 V around the target on
+                # every advertisement.  At the 'voltage' default of
+                # 0.01 V dedup precision, every wiggle reaches the
+                # bus (was ~1.5 IC/sec per charger).  Override to 0
+                # decimals (1 V) — consumers in the dcdc role want
+                # "is it running and roughly where?", not absorption
+                # tail behavior.  The PRECISE value is still emitted
+                # when something does cross the bucket; downstream
+                # readers see 51.92 V, not 52.  Alternator role keeps
+                # the 'charger_voltage' default (0.001 V) since DVCC
+                # consumers there DO care about regulation detail.
+                v_override = 0 if not is_alternator else None
                 if parsed.get("input_voltage") is not None:
                     self._publish_value(role_service, "/Dc/In/V",
                                         parsed["input_voltage"],
-                                        sensor_type=v_sensor_type)
+                                        sensor_type=v_sensor_type,
+                                        override=v_override)
                 if parsed.get("output_voltage") is not None:
                     self._publish_value(role_service, "/Dc/0/Voltage",
                                         parsed["output_voltage"],
-                                        sensor_type=v_sensor_type)
+                                        sensor_type=v_sensor_type,
+                                        override=v_override)
 
                 # ProductName = model spec from victron_ble's product-id table.
                 model = parsed.get("model_name")

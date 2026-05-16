@@ -72,24 +72,28 @@ def publisher():
 
 
 def test_sensor_type_applied_via_reg(publisher):
-    """A reg tagged with sensor_type='temperature' gets rounded to 1 dp."""
+    """A reg tagged with sensor_type='temperature' uses 1 dp for the
+    *change-detection* comparison; the precise value still lands on
+    D-Bus.  Downstream consumers (VRM, MQTT) see full resolution."""
     svc = FakeRoleService()
     dev = FakeDevice(regs=[
         {'name': 'Temperature', 'sensor_type': 'temperature'},
         {'name': 'Voltage', 'sensor_type': 'voltage'},
     ])
     dev._update_dbus_data(svc, {'Temperature': 23.456, 'Voltage': 12.345})
-    assert svc['Temperature'] == 23.5
-    assert svc['Voltage'] == 12.35
+    assert svc['Temperature'] == 23.456    # precise emit
+    assert svc['Voltage'] == 12.345        # precise emit
 
 
 def test_round_override_takes_precedence(publisher):
+    """``round`` override on a reg controls comparison precision only;
+    the value emitted is still the precise input."""
     svc = FakeRoleService()
     dev = FakeDevice(regs=[
         {'name': 'Temperature', 'sensor_type': 'temperature', 'round': 2},
     ])
     dev._update_dbus_data(svc, {'Temperature': 23.456})
-    assert svc['Temperature'] == 23.46
+    assert svc['Temperature'] == 23.456    # precise emit
 
 
 def test_no_sensor_type_passes_through(publisher):
