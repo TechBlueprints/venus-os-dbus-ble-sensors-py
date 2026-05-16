@@ -35,7 +35,6 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'Pressure': 1013.25,
                     'BatteryVoltage': 1.643,
                     'TxPower': 8.0,
-                    'SeqNo': 4660,
                 },
                 'movement': {
                     'AccelX': 0.1,
@@ -43,7 +42,7 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'AccelZ': 0.0,
                     'BatteryVoltage': 1.643,
                     'TxPower': 8.0,
-                    'SeqNo': 4660,
+                    'MovementCounter': 16,  # offset 15 = 0x10 in the fixture
                 }
             }
         )
@@ -91,7 +90,6 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'Pressure': 1155.35,
                     'BatteryVoltage': 2.6189999999999998,
                     'TxPower': 4.0,
-                    'SeqNo': 11189,
                 },
                 'movement': {
                     'AccelX': 0.652,
@@ -99,7 +97,7 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'AccelZ': 0.024,
                     'BatteryVoltage': 2.6189999999999998,
                     'TxPower': 4.0,
-                    'SeqNo': 11189,
+                    'MovementCounter': 88,  # offset 15 = 0x58 in the fixture
                 }
             }
         )
@@ -114,7 +112,6 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'Pressure': 1155.35,
                     'BatteryVoltage': 2.584,
                     'TxPower': 4.0,
-                    'SeqNo': 16713,
                 },
                 'movement': {
                     'AccelX': 0.66,
@@ -122,7 +119,7 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'AccelZ': 0.008,
                     'BatteryVoltage': 2.584,
                     'TxPower': 4.0,
-                    'SeqNo': 16713,
+                    'MovementCounter': 100,  # offset 15 = 0x64 in the fixture
                 }
             }
         )
@@ -146,7 +143,6 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'Pressure': 867.5799999999999,
                     'BatteryVoltage': 2.935,
                     'TxPower': 4.0,
-                    'SeqNo': 48378,
                 },
                 'movement': {
                     'AccelX': 0.932,
@@ -154,7 +150,7 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'AccelZ': -0.02,
                     'BatteryVoltage': 2.935,
                     'TxPower': 4.0,
-                    'SeqNo': 48378,
+                    'MovementCounter': 95,  # offset 15 = 0x5F
                 }
             }
         )
@@ -171,7 +167,6 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'Pressure': 867.5899999999999,
                     'BatteryVoltage': 2.936,
                     'TxPower': 4.0,
-                    'SeqNo': 12729,
                 },
                 'movement': {
                     'AccelX': 1.024,
@@ -179,7 +174,7 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'AccelZ': -0.04,
                     'BatteryVoltage': 2.936,
                     'TxPower': 4.0,
-                    'SeqNo': 12729,
+                    'MovementCounter': 143,  # offset 15 = 0x8F
                 }
             }
         )
@@ -196,7 +191,6 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'Pressure': 868.02,
                     'BatteryVoltage': 2.8970000000000002,
                     'TxPower': 4.0,
-                    'SeqNo': 12554,
                 },
                 'movement': {
                     'AccelX': 0.772,
@@ -204,7 +198,66 @@ class BleDeviceRuuviTests(BleDeviceBaseTests):
                     'AccelZ': -0.064,
                     'BatteryVoltage': 2.8970000000000002,
                     'TxPower': 4.0,
-                    'SeqNo': 12554,
+                    'MovementCounter': 1,  # offset 15 = 0x01
                 }
             }
         )
+
+    # ------------------------------------------------------------------
+    # MovementCounter-based gating: only let AccelX/Y/Z through to the
+    # publish layer when the tag's onboard interrupt has fired (counter
+    # advanced) since the last ad we processed.
+    # ------------------------------------------------------------------
+
+    def test_movement_counter_unchanged_strips_accel(self):
+        # Two ads with the SAME MovementCounter — second ad's role_data
+        # should have AccelX/Y/Z stripped out by ``update_data`` so the
+        # downstream ``_update_dbus_data`` doesn't poke vedbus with them.
+        self.device = BleDeviceRuuvi('012345332211')
+        ad = b'\x05\x11\x94\x55\xA8\xC8\x7D\x00\x64\xFF\x9C\x00\x00\x05\x78\x10\x12\x34\x56\x78\x9A\xBC\xDE\xF0'
+        # _parse_manufacturer_data needs ``self.info`` populated with
+        # the format-5 reg list, which happens in ``configure()``.
+        self.device.configure(ad)
+        self.device._load_configuration()
+
+        first = self.device._parse_manufacturer_data(ad)
+        second = self.device._parse_manufacturer_data(ad)
+
+        # First ad: counter is "fresh" (no prior cached value) — accel
+        # stays in the dict; the cache is now populated.
+        movement_first = first['movement']
+        self.device.update_data(None, movement_first)
+        assert 'AccelX' in movement_first
+        assert 'AccelY' in movement_first
+        assert 'AccelZ' in movement_first
+        assert movement_first['MovementCounter'] == 16
+
+        # Second ad with same counter: accel stripped.
+        movement_second = second['movement']
+        self.device.update_data(None, movement_second)
+        assert 'AccelX' not in movement_second
+        assert 'AccelY' not in movement_second
+        assert 'AccelZ' not in movement_second
+        # MovementCounter itself stays — vedbus dedup will skip its emit
+        # (same value), but the publisher still sees it for heartbeat.
+        assert movement_second['MovementCounter'] == 16
+
+    def test_movement_counter_advanced_passes_accel_through(self):
+        # First ad has counter = 16; mutate byte 15 -> 17 for the second
+        # ad so the cache miss-matches and AccelX/Y/Z stay in the dict.
+        self.device = BleDeviceRuuvi('012345332211')
+        base = bytearray(b'\x05\x11\x94\x55\xA8\xC8\x7D\x00\x64\xFF\x9C\x00\x00\x05\x78\x10\x12\x34\x56\x78\x9A\xBC\xDE\xF0')
+        self.device.configure(bytes(base))
+        self.device._load_configuration()
+        first = self.device._parse_manufacturer_data(bytes(base))
+        self.device.update_data(None, first['movement'])
+
+        base[15] = 0x11  # counter advanced 16 -> 17
+        second = self.device._parse_manufacturer_data(bytes(base))
+        movement_second = second['movement']
+        self.device.update_data(None, movement_second)
+
+        assert movement_second['MovementCounter'] == 17
+        assert 'AccelX' in movement_second
+        assert 'AccelY' in movement_second
+        assert 'AccelZ' in movement_second
