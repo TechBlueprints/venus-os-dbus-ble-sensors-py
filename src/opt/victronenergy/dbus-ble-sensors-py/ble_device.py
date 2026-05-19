@@ -390,13 +390,21 @@ class BleDevice(object):
         # within this ad, vedbus coalesces them into one ItemsChanged.
         publisher = SensorPublisher.get()
         regs_by_name = self._regs_by_name()
+        # ``info['sensor_types']`` is a fallback map for values that
+        # don't have a matching reg in ``info['regs']`` — e.g. Mopeka
+        # Standard's Temperature/BatteryVoltage/RawValue, which are
+        # *derived* in ``update_data`` from raw protocol bytes and so
+        # never appear in the parse-time regs table.  The reg's
+        # ``sensor_type`` still wins when both exist.
+        sensor_types = self.info.get('sensor_types', {})
         with role_service:
             for name, value in sensor_data.items():
                 reg = regs_by_name.get(name, {})
+                sensor_type = reg.get('sensor_type') or sensor_types.get(name)
                 if publisher is not None:
                     publisher.publish(
                         role_service, name, value,
-                        sensor_type=reg.get('sensor_type'),
+                        sensor_type=sensor_type,
                         override=reg.get('round'),
                     )
                 else:

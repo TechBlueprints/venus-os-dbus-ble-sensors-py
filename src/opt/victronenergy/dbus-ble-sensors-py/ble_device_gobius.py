@@ -55,7 +55,8 @@ class BleDeviceGobius(BleDevice):
                     'name':  'RawValue',
                     'type': VE_UN16,
                     'offset': 2,
-                    'xlate': self.gobius_level
+                    'xlate': self.gobius_level,
+                    'sensor_type': 'distance',   # cm; rounded to 0.1 cm
                     # .format	= &veUnitcm,
                 },
             ]

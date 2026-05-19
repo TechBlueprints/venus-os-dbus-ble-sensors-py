@@ -85,6 +85,18 @@ class BleDeviceMopekaStd(BleDevice):
             # Mopeka Standard / XL / eTrailer are all propane sensors;
             # default FluidType = 8 (LPG).  User can override per-tank.
             'roles': {'tank': {'fluid_type': 8}},
+            # Mopeka Standard publishes Temperature, BatteryVoltage,
+            # and RawValue as *derived* fields populated in
+            # ``update_data`` below — they have no entries in
+            # ``regs``, so the SensorPublisher can't pick up their
+            # rounding type via the regs-by-name lookup.  This map
+            # plugs the gap; ``BleDevice._update_dbus_data`` consults
+            # it after ``regs_by_name`` returns nothing.
+            'sensor_types': {
+                'Temperature':    'temperature',
+                'BatteryVoltage': 'voltage',
+                'RawValue':       'distance',   # cm; rounded to 0.1 cm
+            },
             'regs': [
                 # byte 1: sensor type (low 6 bits + high 2; bits 4-5 reserved)
                 {

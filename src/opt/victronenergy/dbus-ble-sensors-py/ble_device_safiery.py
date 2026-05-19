@@ -61,6 +61,7 @@ class BleDeviceSafiery(BleDevice):
                     'offset': 3,
                     'bits': 14,
                     'scale': 10,
+                    'sensor_type': 'distance',   # cm; rounded to 0.1 cm
                     # .format	= &veUnitNone,
                 },
                 {
@@ -68,6 +69,7 @@ class BleDeviceSafiery(BleDevice):
                     'type': VE_SN8,
                     'offset': 8,
                     'scale': 1024,
+                    'sensor_type': 'acceleration',  # 0.01 g
                     # .format	= &veUnitG2Dec,
                 },
                 {
@@ -75,6 +77,7 @@ class BleDeviceSafiery(BleDevice):
                     'type': VE_SN8,
                     'offset': 9,
                     'scale': 1024,
+                    'sensor_type': 'acceleration',
                     # .format	= &veUnitG2Dec,
                 },
                 {
@@ -82,6 +85,7 @@ class BleDeviceSafiery(BleDevice):
                     'type': VE_SN8,
                     'offset': 10,
                     'scale': 1024,
+                    'sensor_type': 'acceleration',
                     # .format	= &veUnitG2Dec,
                 },
             ],
