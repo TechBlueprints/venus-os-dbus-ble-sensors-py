@@ -239,11 +239,31 @@ class DbusBleSensors(object):
         for path, ifaces in objects.items():
             self._on_interfaces_added(path, ifaces)
 
+    # Optional adapter allow-list: if this file exists and is non-empty,
+    # passive scanning runs ONLY on the adapters listed in it (one hciX
+    # name per line, '#' comments allowed).  Absent or empty file = all
+    # adapters (historical behavior).  Lets installations reserve
+    # specific adapters for other BLE services (e.g. battery BMS
+    # connections) that continuous passive scanning would destabilize.
+    ADAPTER_ALLOWLIST_PATH = '/data/apps/dbus-ble-sensors-py/adapter-allowlist.conf'
+
+    def _adapter_allowed(self, name):
+        try:
+            with open(self.ADAPTER_ALLOWLIST_PATH) as f:
+                allowed = [ln.strip() for ln in f
+                           if ln.strip() and not ln.lstrip().startswith('#')]
+            return not allowed or name in allowed
+        except OSError:
+            return True
+
     def _on_interfaces_added(self, path, interfaces):
         if not str(path).startswith('/org/bluez'):
             return
         name = path.split('/')[-1]
         if 'org.bluez.Adapter1' in interfaces:
+            if not self._adapter_allowed(name):
+                logging.info(f"{name}: skipping adapter (not in adapter-allowlist.conf)")
+                return
             adapter = self._dbus.get_object('org.bluez', path)
             props = dbus.Interface(adapter, 'org.freedesktop.DBus.Properties')
             mac = props.Get('org.bluez.Adapter1', 'Address')
