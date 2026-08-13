@@ -279,6 +279,10 @@ class DbusBleSensors(object):
             return
         name = path.split('/')[-1]
         if 'org.bluez.Adapter1' in interfaces:
+            if name not in self._adapters:
+                # never added (e.g. excluded by adapter-allowlist.conf) —
+                # removing would raise and kill the signal handler
+                return
             self._dbus_ble_service.remove_ble_adapter(name)
             self._adapters.remove(name)
             self._adapter_paths.pop(name, None)
