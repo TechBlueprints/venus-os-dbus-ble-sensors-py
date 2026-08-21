@@ -54,6 +54,13 @@ SYSTEMCALC_SERVICE = "com.victronenergy.system"
 ACTIVE_BMS_PATH = "/ActiveBmsService"
 CHARGE_VOLTAGE_PATH = "/Info/MaxChargeVoltage"
 CHARGE_CURRENT_PATH = "/Info/MaxChargeCurrent"
+# The DVCC master switch. systemcalc keeps /ActiveBmsService populated even
+# with DVCC off (verified on Venus 3.72: Bol=0 leaves it set), so following
+# it alone would keep chargers externally controlled after the user turns
+# DVCC off in the GUI. The toggle is the user's word on whether the BMS
+# runs the chargers; obey it.
+SETTINGS_SERVICE = "com.victronenergy.settings"
+DVCC_PATH = "/Settings/Services/Bol"
 
 
 class DbusBusOps(object):
@@ -137,7 +144,12 @@ class BmsLinkFollower(object):
         return True
 
     def _tick(self):
-        bms = self._ops.get(SYSTEMCALC_SERVICE, ACTIVE_BMS_PATH)
+        dvcc = self._ops.get(SETTINGS_SERVICE, DVCC_PATH)
+        try:
+            dvcc_on = int(dvcc) == 1
+        except (TypeError, ValueError):
+            dvcc_on = False
+        bms = self._ops.get(SYSTEMCALC_SERVICE, ACTIVE_BMS_PATH) if dvcc_on else None
         bms = str(bms) if bms else None
         if bms != self._last_bms:
             logger.info("active BMS is now %s", bms or "absent")

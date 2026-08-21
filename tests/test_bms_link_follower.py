@@ -12,6 +12,8 @@ from bms_link_follower import (
     BmsLinkFollower,
     CHARGE_CURRENT_PATH,
     CHARGE_VOLTAGE_PATH,
+    DVCC_PATH,
+    SETTINGS_SERVICE,
     SYSTEMCALC_SERVICE,
 )
 
@@ -38,7 +40,8 @@ class FakeBus:
     def charger_services(self):
         return list(self.chargers)
 
-    def with_bms(self, cvl=13.8, ccl=50.0):
+    def with_bms(self, cvl=13.8, ccl=50.0, dvcc=1):
+        self.values[(SETTINGS_SERVICE, DVCC_PATH)] = dvcc
         self.values[(SYSTEMCALC_SERVICE, ACTIVE_BMS_PATH)] = BMS
         self.values[(BMS, CHARGE_VOLTAGE_PATH)] = cvl
         self.values[(BMS, CHARGE_CURRENT_PATH)] = ccl
@@ -87,6 +90,26 @@ def test_bms_loss_releases_the_charger():
     assert bus.writes == [(CHARGER, "/Settings/BmsPresent", 0)]
     # and only once
     bus.writes.clear()
+    follower.tick()
+    assert bus.writes == []
+
+
+def test_dvcc_off_counts_as_absent():
+    # systemcalc keeps /ActiveBmsService set with DVCC off (verified on
+    # Venus 3.72), so the toggle must gate the follower directly
+    bus = FakeBus().with_bms()
+    follower = BmsLinkFollower(bus_ops=bus)
+    follower.tick()
+    bus.writes.clear()
+    bus.values[(SETTINGS_SERVICE, DVCC_PATH)] = 0
+    follower.tick()
+    assert bus.writes == [(CHARGER, "/Settings/BmsPresent", 0)]
+
+
+def test_dvcc_never_configured_counts_as_absent():
+    bus = FakeBus().with_bms()
+    del bus.values[(SETTINGS_SERVICE, DVCC_PATH)]
+    follower = BmsLinkFollower(bus_ops=bus)
     follower.tick()
     assert bus.writes == []
 
