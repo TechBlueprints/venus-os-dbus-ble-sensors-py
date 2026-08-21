@@ -420,6 +420,15 @@ class DbusBleSensors(object):
         self._start_tap()
         self._router.start()
         GLib.timeout_add_seconds(30, self._prune_tick)
+        # Bridge the active BMS's charge limits onto local charger roles'
+        # /Link paths - systemcalc's DVCC does not drive
+        # com.victronenergy.charger services. Runs on its own thread, NOT a
+        # GLib timer: see bms_link_follower.py for the mainloop-deadlock
+        # rationale.
+        from bms_link_follower import BmsLinkFollower
+
+        self._bms_link_follower = BmsLinkFollower()
+        self._bms_link_follower.start()
 
     def _on_registrations_changed(self):
         """Called by the router when external registrations change.
