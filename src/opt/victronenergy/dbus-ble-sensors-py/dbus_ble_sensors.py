@@ -673,6 +673,15 @@ class DbusBleSensors(object):
         # an active discovery and reset our scan parameters.  Worst-
         # case recovery latency = _SCAN_REENABLE_INTERVAL_S.
         GLib.timeout_add_seconds(_SCAN_REENABLE_INTERVAL_S, self._scan_reenable_tick)
+        # Bridge the active BMS's charge limits onto local charger roles'
+        # /Link paths - systemcalc's DVCC does not drive
+        # com.victronenergy.charger services. Runs on its own thread, NOT a
+        # GLib timer: see bms_link_follower.py for the mainloop-deadlock
+        # rationale.
+        from bms_link_follower import BmsLinkFollower
+
+        self._bms_link_follower = BmsLinkFollower()
+        self._bms_link_follower.start()
 
     # ── Load-driven throttle ──────────────────────────────────────────────
 
