@@ -31,6 +31,7 @@ from ble_advertisement_router import BleAdvertisementRouter
 from sensor_rounding import SensorRoundingPolicy
 from sensor_publisher import SensorPublisher
 from load_throttle import LoadThrottle
+import adapter_identity
 import hci_scan_control
 import platform_notifications
 from scan_claims import ScanClaims
@@ -61,16 +62,11 @@ _SCAN_REENABLE_INTERVAL_S = 60
 _KNOWN_MAC_TYPES_PATH = '/data/conf/dbus-ble-sensors-py-known-mac-types.json'
 
 
-def _adapter_index(adapter_name: str) -> 'int | None':
-    """Convert a BlueZ adapter name (``hci0`` / ``hci1``) to the numeric
-    controller index expected by ``hci_scan_control``.  Returns None
-    for non-``hci<N>`` names so callers can skip cleanly."""
-    if not adapter_name.startswith('hci'):
-        return None
-    suffix = adapter_name[3:]
-    if not suffix.isdigit():
-        return None
-    return int(suffix)
+# Adapter identity lives in adapter_identity: a card is its MAC, and the
+# hci<N> index is resolved from that immediately before each HCI socket
+# call.  There is deliberately no name-to-index helper here any more —
+# one was how a remembered "hci1" could end up driving whichever card
+# happened to hold that number later.
 
 
 def _load_known_mac_types_static() -> 'dict[str, int]':
@@ -157,8 +153,11 @@ class DbusBleSensors(object):
             self._dbus_ble_service.settings)
         self._publisher = SensorPublisher(self._rounding_policy)
 
-        self._adapters = []
-        self._adapter_paths: dict[str, str] = {}
+        # Adapters we know about, keyed by identity (MAC, colons
+        # stripped) rather than by hci<N> — the number is not stable
+        # across a reset, a replug, or a reboot.  Each value carries the
+        # name and path BlueZ most recently used for that card.
+        self._adapters: dict[str, dict] = {}
 
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
@@ -176,7 +175,7 @@ class DbusBleSensors(object):
         self._silence_warned: bool = False
         self._tap_thread: threading.Thread | None = None
         self._tap_stop = threading.Event()
-        # Adapters we've enabled passive scan on (set of names like 'hci0').
+        # Adapters we've enabled scanning on, by identity key.
         # Replaces the old ``_registered_adapters`` from when we drove
         # scanning by registering a bluez AdvertisementMonitor.
         self._scan_enabled_adapters: set[str] = set()
@@ -252,62 +251,97 @@ class DbusBleSensors(object):
             self._on_interfaces_added(path, ifaces)
 
     # Optional adapter allow-list: if this file exists and is non-empty,
-    # passive scanning runs ONLY on the adapters listed in it (one hciX
-    # name per line, '#' comments allowed).  Absent or empty file = all
-    # adapters (historical behavior).  Lets installations reserve
-    # specific adapters for other BLE services (e.g. battery BMS
-    # connections) that continuous passive scanning would destabilize.
+    # scanning runs ONLY on the adapters listed in it (one per line,
+    # '#' comments allowed).  Absent or empty file = all adapters
+    # (historical behavior).  Lets installations reserve specific
+    # adapters for other BLE services (e.g. battery BMS connections)
+    # that continuous scanning would destabilize.
+    #
+    # Entries are adapter MACs, in any spelling.  hciX names still work,
+    # but they name a number rather than a card: cards get renumbered by
+    # a reset, a replug, or a reboot, and a reservation that follows the
+    # number instead of the card protects the wrong radio.
     ADAPTER_ALLOWLIST_PATH = '/data/apps/dbus-ble-sensors-py/adapter-allowlist.conf'
 
-    def _adapter_allowed(self, name):
+    def _adapter_name(self, key: str) -> 'str | None':
+        """The hci<N> BlueZ last used for this card, for log lines only."""
+        record = self._adapters.get(key)
+        return record['name'] if record else None
+
+    def _adapter_allowed(self, key, name):
+        """Whether this adapter may be scanned on.
+
+        Entries are matched by *identity*: a MAC in any spelling names the
+        card itself, and an ``hci<N>`` entry is accepted as the older
+        spelling.  Matching by name alone is what made this file dangerous
+        — reserve ``hci1`` for a BMS, let the cards renumber, and the
+        reservation now protects the wrong radio while we scan the one we
+        promised to leave alone.
+        """
         try:
             with open(self.ADAPTER_ALLOWLIST_PATH) as f:
-                allowed = [ln.strip() for ln in f
-                           if ln.strip() and not ln.lstrip().startswith('#')]
-            return not allowed or name in allowed
+                entries = [ln.split('#', 1)[0].strip() for ln in f]
         except OSError:
             return True
+        return adapter_identity.allowed(entries, key, name)
 
     def _on_interfaces_added(self, path, interfaces):
         if not str(path).startswith('/org/bluez'):
             return
         name = path.split('/')[-1]
         if 'org.bluez.Adapter1' in interfaces:
-            if not self._adapter_allowed(name):
-                logging.info(f"{name}: skipping adapter (not in adapter-allowlist.conf)")
-                return
+            # The MAC has to be read before the allow-list check now, since
+            # that is what the entries are matched against.  BlueZ hands it
+            # to us here, so this costs nothing extra and is authoritative
+            # — no hciconfig, no sysfs (which Venus does not populate).
             adapter = self._dbus.get_object('org.bluez', path)
             props = dbus.Interface(adapter, 'org.freedesktop.DBus.Properties')
-            mac = props.Get('org.bluez.Adapter1', 'Address')
+            mac = str(props.Get('org.bluez.Adapter1', 'Address'))
+            key = adapter_identity.mac_key(mac) or adapter_identity.canonical(name)
+            if not self._adapter_allowed(key, name):
+                logging.info(f"{name} ({key}): skipping adapter "
+                             f"(not in adapter-allowlist.conf)")
+                return
             logging.info(f"{name}: adding adapter, path={path!r}, address={mac!r}")
-            if name not in self._adapters:
-                self._adapters.append(name)
-                self._adapter_paths[name] = str(path)
+            known = self._adapters.get(key)
+            if known is not None and known['name'] != name:
+                # Same card, new number.  Everything we know about it is
+                # keyed by identity, so this is a rename, not a new card.
+                logging.info(f"{key}: renumbered {known['name']} -> {name}")
+                adapter_identity.invalidate()
+            if known is None or known['name'] != name:
+                self._adapters[key] = {'name': name, 'mac': mac,
+                                       'path': str(path)}
                 self._dbus_ble_service.add_ble_adapter(name, mac)
-                self._start_passive_scan(name)
+                self._start_passive_scan(key)
 
     def _on_interfaces_removed(self, path, interfaces):
         if not str(path).startswith('/org/bluez'):
             return
         name = path.split('/')[-1]
         if 'org.bluez.Adapter1' in interfaces:
-            if name not in self._adapters:
+            key = next((k for k, rec in self._adapters.items()
+                        if rec['name'] == name), None)
+            if key is None:
                 # never added (e.g. excluded by adapter-allowlist.conf) —
                 # removing would raise and kill the signal handler
                 return
             self._dbus_ble_service.remove_ble_adapter(name)
-            self._adapters.remove(name)
-            self._adapter_paths.pop(name, None)
+            self._adapters.pop(key, None)
             # Best-effort: turn off the controller's scanner before
             # bluez tears the adapter down.  If the adapter is already
-            # gone the HCI socket open will fail; we swallow that.
+            # gone the HCI socket open will fail; we swallow that.  Use
+            # the name BlueZ just gave us: the card is on its way out, so
+            # resolving the identity afresh would only fail.
             try:
-                hci_scan_control.disable_passive_scan(_adapter_index(name))
+                if name.startswith('hci') and name[3:].isdigit():
+                    hci_scan_control.disable_passive_scan(int(name[3:]))
             except Exception:
                 pass
-            self._scan_enabled_adapters.discard(name)
-            self._scan_claims.release(name)
-            logging.info(f"{name}: adapter removed")
+            self._scan_enabled_adapters.discard(key)
+            self._scan_claims.release(key)
+            adapter_identity.invalidate()
+            logging.info(f"{name} ({key}): adapter removed")
 
     def _save_known_mac_types(self) -> None:
         """Persist ``self._mac_address_types`` to disk.
@@ -389,7 +423,7 @@ class DbusBleSensors(object):
                               "staying passive")
         return hci_scan_control.SCAN_TYPE_PASSIVE
 
-    def _start_passive_scan(self, adapter_name: str) -> None:
+    def _start_passive_scan(self, key: str) -> None:
         """Issue HCI commands to put the adapter into passive scan mode.
 
         Replaces the previous BlueZ ``RegisterMonitor`` flow.  The
@@ -409,40 +443,45 @@ class DbusBleSensors(object):
         is OFF, we apply the accept list as part of the same HCI
         socket open so the scan-disabled window stays minimal.
         """
-        idx = _adapter_index(adapter_name)
+        # Resolved here, immediately before the socket call, and never
+        # stored: between one scan-enable and the next this card may have
+        # been renumbered out from under us.
+        idx = adapter_identity.index_for(key)
+        label = adapter_identity.label(key, self._adapter_name(key))
         if idx is None:
-            logging.warning(f"{adapter_name}: not an hci<N> adapter, cannot enable scan")
+            logging.warning(f"{label}: no current hci<N> for this adapter, "
+                            f"cannot enable scan")
             return
         policy = self._desired_filter_policy()
-        was_enabled = adapter_name in self._scan_enabled_adapters
-        prev_policy = self._scan_filter_policy.get(adapter_name)
+        was_enabled = key in self._scan_enabled_adapters
+        prev_policy = self._scan_filter_policy.get(key)
         ok = self._apply_scan_policy(idx, policy)
         if ok:
-            self._scan_enabled_adapters.add(adapter_name)
-            self._scan_claims.hold(adapter_name)
-            self._scan_filter_policy[adapter_name] = policy
-            self._scan_failure_streak[adapter_name] = 0
+            self._scan_enabled_adapters.add(key)
+            self._scan_claims.hold(key)
+            self._scan_filter_policy[key] = policy
+            self._scan_failure_streak[key] = 0
             # Only log the "scan enabled" line on a real transition —
             # first enable, change of policy, or recovery from a
             # failure streak.  Steady-state re-applies stay quiet at
             # debug; otherwise this fires every ``_scan_reenable_tick``.
             if not was_enabled or prev_policy != policy:
-                label = ("accept-all" if policy == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
-                         else "accept-list-only")
+                policy_label = ("accept-all" if policy == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
+                                else "accept-list-only")
                 mode = ("active" if self._desired_scan_type()
                         == hci_scan_control.SCAN_TYPE_ACTIVE else "passive")
-                logging.info(f"{adapter_name}: {mode} scan enabled via HCI socket ({label})")
+                logging.info(f"{label}: {mode} scan enabled via HCI socket ({policy_label})")
             else:
-                logging.debug(f"{adapter_name}: passive scan re-applied")
+                logging.debug(f"{label}: scan re-applied")
         else:
-            streak = self._scan_failure_streak.get(adapter_name, 0) + 1
-            self._scan_failure_streak[adapter_name] = streak
+            streak = self._scan_failure_streak.get(key, 0) + 1
+            self._scan_failure_streak[key] = streak
             # Loud on first failure of a streak so the user notices in
             # logs; quiet during the retry storm; loud again once an
             # hour so persistent failures aren't completely silent.
             if streak == 1 or streak % 60 == 0:
                 logging.warning(
-                    f"{adapter_name}: passive scan enable failed "
+                    f"{label}: scan enable failed "
                     f"(streak={streak}); will retry on next periodic tick. "
                     "Most common cause on a Cerbo: this adapter is in LE "
                     "advertising mode (broadcasting the Cerbo as a "
@@ -456,7 +495,7 @@ class DbusBleSensors(object):
                     "the advertising adapter.")
             else:
                 logging.debug(
-                    f"{adapter_name}: passive scan enable failed (streak={streak})")
+                    f"{label}: scan enable failed (streak={streak})")
 
     def _apply_scan_policy(self, adapter_index: int, policy: int) -> bool:
         """Apply a scan filter policy on the given adapter.
@@ -518,29 +557,30 @@ class DbusBleSensors(object):
         if self._throttled:
             return True
         desired = self._desired_filter_policy()
-        for adapter_name in list(self._adapter_paths):
-            idx = _adapter_index(adapter_name)
+        for key in list(self._adapters):
+            idx = adapter_identity.index_for(key)
             if idx is None:
                 continue
-            current = self._scan_filter_policy.get(adapter_name)
+            current = self._scan_filter_policy.get(key)
             if current != desired:
                 # Policy change — go through the full apply path so
                 # accept-list rebuild + scan-params update happen as
                 # one transaction.
                 if self._apply_scan_policy(idx, desired):
-                    self._scan_enabled_adapters.add(adapter_name)
-                    self._scan_claims.hold(adapter_name)
-                    self._scan_filter_policy[adapter_name] = desired
-                    label = ("accept-all" if desired == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
-                             else "accept-list-only")
-                    logging.info(f"{adapter_name}: scan filter policy switched to {label}")
+                    self._scan_enabled_adapters.add(key)
+                    self._scan_claims.hold(key)
+                    self._scan_filter_policy[key] = desired
+                    policy_label = ("accept-all" if desired == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
+                                    else "accept-list-only")
+                    logging.info(f"{adapter_identity.label(key, self._adapter_name(key))}: "
+                                 f"scan filter policy switched to {policy_label}")
             else:
                 # Steady-state re-issue using the policy we already
                 # have.  For accept-list mode, also re-apply the list
                 # in case it changed (new devices learned via the tap).
                 if self._apply_scan_policy(idx, desired):
-                    self._scan_enabled_adapters.add(adapter_name)
-                    self._scan_claims.hold(adapter_name)
+                    self._scan_enabled_adapters.add(key)
+                    self._scan_claims.hold(key)
         # Flush persisted cache once per tick if anything changed.
         self._save_known_mac_types()
         return True
@@ -734,12 +774,13 @@ class DbusBleSensors(object):
         re-enable tick is also gated on ``_throttled`` so it won't
         fight the disable.
         """
-        for adapter_name in list(self._scan_enabled_adapters):
-            idx = _adapter_index(adapter_name)
+        for key in list(self._scan_enabled_adapters):
+            idx = adapter_identity.index_for(key)
             if idx is None:
                 continue
             if hci_scan_control.disable_passive_scan(idx):
-                logging.info(f"{adapter_name}: passive scan disabled (throttle)")
+                logging.info(f"{adapter_identity.label(key, self._adapter_name(key))}: "
+                             f"scan disabled (throttle)")
         self._scan_enabled_adapters.clear()
         # We are off the air: stop telling everyone else these cards are
         # busy, so a BMS link can be placed on one while we sit out.
@@ -794,8 +835,8 @@ class DbusBleSensors(object):
         # Eagerly re-enable scanning on each adapter; the periodic
         # _scan_reenable_tick would also pick this up, but doing it
         # here minimises the recovery gap.
-        for name in list(self._adapter_paths):
-            self._start_passive_scan(name)
+        for key in list(self._adapters):
+            self._start_passive_scan(key)
 
         if self._throttle_notification is not None:
             try:
@@ -883,9 +924,9 @@ class DbusBleSensors(object):
             # periodic _scan_reenable_tick covers this on a 60 s
             # cadence; this is the eager path for the more frequent
             # _prune_tick (30 s).
-            for name in self._adapter_paths:
-                if name not in self._scan_enabled_adapters:
-                    self._start_passive_scan(name)
+            for key in list(self._adapters):
+                if key not in self._scan_enabled_adapters:
+                    self._start_passive_scan(key)
 
         # Silence detection: force a scan re-enable if no ads for 5 min
         if self._last_tap_rx > 0 and now - self._last_tap_rx > SILENCE_WARNING_SECONDS:

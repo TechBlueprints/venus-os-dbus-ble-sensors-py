@@ -30,6 +30,45 @@ through the same LE Advertising Report path, so nothing downstream changes.
 The toggle re-applies immediately (same path as `ContinuousScan`) rather
 than waiting for the 60 s scan-re-enable tick.
 
+## Adapter identity
+
+**An adapter is its MAC.  `hciN` is only what it is called right now.**
+
+The numbering is not stable: a USB reset renumbers a card, so does
+replugging, and so does a reboot.  On dev-cerbo the onboard Broadcom failed
+its firmware reset one boot —
+
+```
+Bluetooth: hci1: BCM: failed to write update baudrate (-110)
+Bluetooth: hci1: BCM: Reset failed (-110)
+```
+
+— and the USB dongle that had been `hci1` came up as `hci0`.  Everything
+this service remembered about "hci1" then referred to a different physical
+radio.
+
+So state is keyed by the adapter's MAC (colons stripped, uppercase) and the
+`hciN` is resolved from it immediately before each HCI socket call, never
+cached across one.  `adapter_identity.py` does the resolving, borrowing
+bcmv2's resolver rather than growing a second one — it already knows that
+Venus OS populates no sysfs `address` attribute for any adapter, so the
+whole table comes from a single `hciconfig` call behind a short-lived cache.
+BlueZ hands us the `Address` property when an adapter appears, so the
+common path costs nothing extra.
+
+`adapter-allowlist.conf` takes **adapter MACs**, in any spelling:
+
+```
+# Scan only on the USB dongle; leave the onboard radio for the BMS.
+00:01:95:40:C3:33
+```
+
+`hciN` entries still work and are matched against the name BlueZ is
+currently using — but they name a number rather than a card, and that
+reservation protects the wrong radio the moment the numbering changes.
+Since the file exists precisely to reserve a card for another BLE service,
+getting it backwards means scanning the card you promised to leave alone.
+
 ## Relationship to the connection path
 
 This is the **inbound** half of the Bluetooth stack only.  Outbound GATT —

@@ -87,6 +87,12 @@ it either: `scan_claims.py` holds a **soft** claim
 scanning enabled on, released when the adapter disappears or the load
 throttle stops scanning.
 
+Claim files are keyed by the adapter's MAC, not by `hciN` — same reason the
+scan path is (see [`hci-tap-architecture.md`](hci-tap-architecture.md)): the
+number is not an identity, and a claim that names a number stops describing
+the card the moment it renumbers.  bcmv2 accepts `hciN` everywhere as a
+convenience spelling that resolves to one.
+
 Soft, not hard: passive scanning genuinely coexists with other traffic, so
 this is an announcement to rank on, not a reservation.  We never yield a
 card because of someone else's claim either — one-directional by design.
