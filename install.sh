@@ -111,7 +111,17 @@ if [ -d "$INSTALL_DIR" ]; then
         REMOTE=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "none")
         if [ "$LOCAL" != "$REMOTE" ]; then
             echo "  Updates available. Resetting to latest..."
-            git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
+            # -f -B: point $BRANCH at the remote and take its content,
+            # discarding any local edits.  Plain `git checkout` aborts when
+            # the working tree is dirty — and a dirty tree is normal on a
+            # device that has been debugged on directly — which stranded
+            # the install one line before the `reset --hard` that was
+            # always going to discard those edits anyway.  Anything worth
+            # keeping should be committed, or saved off the device first.
+            if ! git checkout -f -B "$BRANCH" "origin/$BRANCH"; then
+                echo "Error: could not check out $BRANCH."
+                exit 1
+            fi
             git reset --hard "origin/$BRANCH"
             NEEDS_RESTART=true
             echo "  Repository updated"
