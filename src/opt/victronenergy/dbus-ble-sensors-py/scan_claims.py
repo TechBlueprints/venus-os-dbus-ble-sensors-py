@@ -16,24 +16,32 @@ But "not routed through the connection manager" should not mean
 card whose links are measurably less stable — that is what
 ``adapter-allowlist.conf`` exists to work around by hand.
 
-So we publish a **soft** claim (``hciN.use.<owner>.scan``) per adapter we
-have scanning enabled on, released when the adapter goes away or the load
-throttle stops scanning.
+**The claim kind follows what we are actually doing**, because that is the
+only thing that makes it true:
 
-Soft rather than hard, because passive scanning genuinely does coexist
-with other traffic: the claim is a fact to rank on, not a reservation, and
-a hard ``hciN.scan`` would push every bcmv2 consumer off cards they can
-legitimately use.  If ``/Settings/BleSensors/ActiveScan`` is ever turned
-on, that reasoning weakens — ``hciN.scan`` means precisely "I am actively
-scanning here, use another card" — and switching to :meth:`claim_hard` is
-a one-line change.
+* **Passive scanning takes a soft claim** (``<MAC>.use.<owner>.scan``).
+  A passive scanner listens and transmits nothing; it genuinely coexists
+  with other traffic, so the claim is a fact to rank on, not a
+  reservation.  A hard claim here would push every bcmv2 consumer off
+  cards they can legitimately share — and ours is a permanent listen, not
+  a short scan activity, so it would push them off forever.
+* **Active scanning takes the hard claim** (``<MAC>.scan``, exclusive).
+  An active scanner transmits a SCAN_REQ at every advertiser it hears and
+  holds the channel for the response.  That is precisely what the hard
+  claim means — "I am actively scanning here, use another card" — and
+  announcing it as merely soft would let a second scanner land on the
+  same radio believing it was free.
 
-We never yield a card on someone else's claim either — this is
-one-directional by design, an announcement rather than a negotiation.
+If the hard claim cannot be taken (another live process is already
+scanning that card) we fall back to a soft one rather than going silent:
+we are still using the radio, and everyone else should still see it.  We
+never yield a card on someone else's claim — this is one-directional by
+design, an announcement rather than a negotiation.
 
 The nice emergent property: our own GATT links go through bcmv2, which
 ranks by occupancy, so a charger write naturally prefers a card we are
-*not* scanning on.
+*not* scanning on.  Our own hard claim does not push our own connections
+away — bcmv2 compares the claim's pid against its own.
 """
 from __future__ import annotations
 
@@ -57,8 +65,10 @@ class ScanClaims:
     """
 
     def __init__(self) -> None:
-        self._claims: dict[str, object] = {}
+        # adapter key -> (kind, claim), kind being "hard" or "soft"
+        self._claims: dict[str, tuple[str, object]] = {}
         self._warned = False
+        self._downgraded: set[str] = set()
 
     def _manager(self):
         manager = ble_catcher.claim_manager()
@@ -68,27 +78,56 @@ class ScanClaims:
                         "announced to other BLE services")
         return manager
 
-    def hold(self, adapter: str) -> None:
-        """Claim *adapter*.  Idempotent; the manager heartbeats for us."""
-        if adapter in self._claims:
+    def hold(self, adapter: str, exclusive: bool = False) -> None:
+        """Claim *adapter*, hard when *exclusive* (i.e. actively scanning).
+
+        Idempotent for an unchanged kind; the manager heartbeats for us.
+        A change of kind — the ActiveScan toggle being flipped — releases
+        the old claim and takes the other, so the file on disk always says
+        what we are currently doing.
+        """
+        want = "hard" if exclusive else "soft"
+        held = self._claims.get(adapter)
+        if held is not None and held[0] == want:
             return
         manager = self._manager()
         if manager is None:
             return
+        if held is not None:
+            self.release(adapter)
+
+        kind, claim = want, None
         try:
-            claim = manager.claim_soft(adapter, qualifier=QUALIFIER)
+            if exclusive:
+                claim = manager.claim_hard(adapter)
+                if claim is None:
+                    # Someone else is scanning this card.  Say so once, and
+                    # register as occupancy rather than disappearing: we are
+                    # still on this radio either way.
+                    kind = "soft"
+                    claim = manager.claim_soft(adapter, qualifier=QUALIFIER)
+                    if adapter not in self._downgraded:
+                        self._downgraded.add(adapter)
+                        logger.info(
+                            "%s: another process holds the scan claim — "
+                            "claiming softly instead", adapter)
+                else:
+                    self._downgraded.discard(adapter)
+            else:
+                claim = manager.claim_soft(adapter, qualifier=QUALIFIER)
         except Exception:
             logger.exception("%s: failed to claim", adapter)
             return
         if claim is not None:
-            self._claims[adapter] = claim
-            logger.debug("%s: scan claim held", adapter)
+            self._claims[adapter] = (kind, claim)
+            logger.debug("%s: %s scan claim held", adapter, kind)
 
     def release(self, adapter: str) -> None:
         """Drop our claim on *adapter*, if we hold one."""
-        claim = self._claims.pop(adapter, None)
-        if claim is None:
+        held = self._claims.pop(adapter, None)
+        if held is None:
             return
+        _kind, claim = held
         manager = self._manager()
         if manager is None:
             return
@@ -105,3 +144,8 @@ class ScanClaims:
 
     def held(self) -> list[str]:
         return sorted(self._claims)
+
+    def kind(self, adapter: str) -> 'str | None':
+        """``"hard"``, ``"soft"``, or None if we hold no claim."""
+        held = self._claims.get(adapter)
+        return held[0] if held else None

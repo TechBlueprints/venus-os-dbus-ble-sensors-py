@@ -263,6 +263,16 @@ class DbusBleSensors(object):
     # number instead of the card protects the wrong radio.
     ADAPTER_ALLOWLIST_PATH = '/data/apps/dbus-ble-sensors-py/adapter-allowlist.conf'
 
+    def _scanning_actively(self) -> bool:
+        """Whether we are transmitting SCAN_REQs, not merely listening.
+
+        Decides the bt-claims kind: an active scanner takes the exclusive
+        scan claim, a passive listen only registers as occupancy.  See
+        scan_claims for why the distinction matters to everyone else.
+        """
+        return (self._desired_scan_type()
+                == hci_scan_control.SCAN_TYPE_ACTIVE)
+
     def _adapter_name(self, key: str) -> 'str | None':
         """The hci<N> BlueZ last used for this card, for log lines only."""
         record = self._adapters.get(key)
@@ -458,7 +468,7 @@ class DbusBleSensors(object):
         ok = self._apply_scan_policy(idx, policy)
         if ok:
             self._scan_enabled_adapters.add(key)
-            self._scan_claims.hold(key)
+            self._scan_claims.hold(key, exclusive=self._scanning_actively())
             self._scan_filter_policy[key] = policy
             self._scan_failure_streak[key] = 0
             # Only log the "scan enabled" line on a real transition —
@@ -568,7 +578,7 @@ class DbusBleSensors(object):
                 # one transaction.
                 if self._apply_scan_policy(idx, desired):
                     self._scan_enabled_adapters.add(key)
-                    self._scan_claims.hold(key)
+                    self._scan_claims.hold(key, exclusive=self._scanning_actively())
                     self._scan_filter_policy[key] = desired
                     policy_label = ("accept-all" if desired == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
                                     else "accept-list-only")
@@ -580,7 +590,7 @@ class DbusBleSensors(object):
                 # in case it changed (new devices learned via the tap).
                 if self._apply_scan_policy(idx, desired):
                     self._scan_enabled_adapters.add(key)
-                    self._scan_claims.hold(key)
+                    self._scan_claims.hold(key, exclusive=self._scanning_actively())
         # Flush persisted cache once per tick if anything changed.
         self._save_known_mac_types()
         return True

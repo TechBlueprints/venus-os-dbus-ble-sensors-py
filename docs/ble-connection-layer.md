@@ -93,11 +93,19 @@ number is not an identity, and a claim that names a number stops describing
 the card the moment it renumbers.  bcmv2 accepts `hciN` everywhere as a
 convenience spelling that resolves to one.
 
-Soft, not hard: passive scanning genuinely coexists with other traffic, so
-this is an announcement to rank on, not a reservation.  We never yield a
-card because of someone else's claim either — one-directional by design.
-(With `ActiveScan` turned on, a hard `hciN.scan` claim would be the more
-honest statement — a one-line change in `scan_claims.py`.)
+**The kind follows the scan type**, because that is what makes the claim
+true:
+
+| Scan type | Claim | Why |
+|---|---|---|
+| Passive (default) | soft, `<MAC>.use.<owner>.scan` | Listens, transmits nothing, genuinely shares the card — a fact to rank on, not a reservation. Ours is a permanent listen rather than a short scan activity, so a hard claim would push everyone off that radio forever. |
+| Active (`ActiveScan=1`) | hard, `<MAC>.scan` | Transmits a SCAN_REQ at every advertiser and holds the channel for the reply. That is exactly what the hard claim announces; calling it soft would let a second scanner land on the same radio believing it free. |
+
+If the hard claim is already held by another live process we fall back to a
+soft one rather than going silent — we are on that radio either way, and
+everyone else should still see it. We never yield a card because of someone
+else's claim: one-directional by design. Our own hard claim does not push
+our own connections away, since bcmv2 compares the claim's pid to its own.
 
 The useful consequence: our own GATT writes go through bcmv2, which ranks
 by occupancy, so a charger write now naturally prefers a card we are *not*

@@ -12,16 +12,28 @@ from scan_claims import ScanClaims
 
 
 class _FakeManager:
-    def __init__(self, fail_on=()):
+    def __init__(self, fail_on=(), hard_taken=()):
         self.held: dict[str, object] = {}
         self.released: list[str] = []
         self.fail_on = set(fail_on)
+        # adapters whose exclusive scan claim another process already holds
+        self.hard_taken = set(hard_taken)
+        self.kinds: dict[str, str] = {}
 
     def claim_soft(self, adapter, qualifier=None):
         if adapter in self.fail_on:
             raise OSError("claim directory unwritable")
         claim = object()
         self.held[adapter] = (claim, qualifier)
+        self.kinds[adapter] = "soft"
+        return claim
+
+    def claim_hard(self, adapter):
+        if adapter in self.hard_taken:
+            return None
+        claim = object()
+        self.held[adapter] = (claim, None)
+        self.kinds[adapter] = "hard"
         return claim
 
     def release(self, claim):
@@ -109,3 +121,62 @@ def test_release_of_unheld_adapter_is_harmless(monkeypatch) -> None:
     claims = ScanClaims()
     claims.release("hci9")
     assert manager.released == []
+
+
+def test_passive_scanning_claims_softly(monkeypatch) -> None:
+    # A passive listen transmits nothing and genuinely shares the card.
+    manager = _FakeManager()
+    _with_manager(monkeypatch, manager)
+    claims = ScanClaims()
+    claims.hold("hci0", exclusive=False)
+    assert claims.kind("hci0") == "soft"
+    assert manager.kinds["hci0"] == "soft"
+    assert manager.held["hci0"][1] == "scan"
+
+
+def test_active_scanning_takes_the_exclusive_claim(monkeypatch) -> None:
+    # An active scanner transmits SCAN_REQs and holds the channel; that is
+    # exactly what the hard claim announces.
+    manager = _FakeManager()
+    _with_manager(monkeypatch, manager)
+    claims = ScanClaims()
+    claims.hold("hci0", exclusive=True)
+    assert claims.kind("hci0") == "hard"
+    assert manager.kinds["hci0"] == "hard"
+
+
+def test_flipping_the_toggle_swaps_the_claim_kind(monkeypatch) -> None:
+    # The file on disk must say what we are doing now, not what we were.
+    manager = _FakeManager()
+    _with_manager(monkeypatch, manager)
+    claims = ScanClaims()
+    claims.hold("hci0", exclusive=False)
+    claims.hold("hci0", exclusive=True)
+    assert claims.kind("hci0") == "hard"
+    assert manager.kinds["hci0"] == "hard"
+    assert manager.released == ["hci0"]      # the soft one was given up
+    claims.hold("hci0", exclusive=False)
+    assert claims.kind("hci0") == "soft"
+
+
+def test_same_kind_twice_is_a_no_op(monkeypatch) -> None:
+    manager = _FakeManager()
+    _with_manager(monkeypatch, manager)
+    claims = ScanClaims()
+    claims.hold("hci0", exclusive=True)
+    first = manager.held["hci0"][0]
+    claims.hold("hci0", exclusive=True)
+    assert manager.held["hci0"][0] is first
+    assert manager.released == []
+
+
+def test_contested_hard_claim_falls_back_to_soft(monkeypatch) -> None:
+    # Another live scanner holds it.  We are still on this radio, so
+    # register as occupancy rather than disappearing from the directory.
+    manager = _FakeManager(hard_taken={"hci0"})
+    _with_manager(monkeypatch, manager)
+    claims = ScanClaims()
+    claims.hold("hci0", exclusive=True)
+    assert claims.kind("hci0") == "soft"
+    assert manager.kinds["hci0"] == "soft"
+    assert claims.held() == ["hci0"]
