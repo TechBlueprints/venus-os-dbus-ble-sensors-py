@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# Copyright 2026 Clint Goudie-Nice
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
 """
 Probe a Victron BLE charger / DC-DC for VREG implementation status.
 
@@ -6,7 +13,7 @@ Runs on a Cerbo (or any host with a paired Victron device on BlueZ),
 talks the same CBOR-framed VE.Direct HEX protocol the driver uses, and
 emits a report of which VREGs respond, with what value, and what kind
 of write a 1-byte sentinel triggers (code 1 = unknown register, code
-2 = parameter / size error → register exists, code 3 = read-only,
+2 = parameter / size error -> register exists, code 3 = read-only,
 empty = write accepted).
 
 Use it to:
@@ -14,7 +21,7 @@ Use it to:
   - Locate the Orion-TR's max-current VREG (gap #1)
   - Find the Orion-TR's Function (Charger / PSU) VREG (gap #4)
   - Confirm IP22 optional charge-profile VREGs before wiring writable
-    settings paths (gap #9 — Equalize voltage/duration, AbsorptionMaxTime,
+    settings paths (gap #9 - Equalize voltage/duration, AbsorptionMaxTime,
     BulkMaxTime, RebulkVoltage)
 
 Usage:
@@ -23,33 +30,38 @@ Usage:
   ./scripts/probe_charger_vregs.py --mac FF:13:42:2B:7A:4B --candidates current
   ./scripts/probe_charger_vregs.py --mac ED:47:4D:2A:7C:2A --candidates ip22-optional
 
-The script needs the BLE adapter to itself, so stop ``dbus-ble-sensors-py``
-first:
+The link goes through bcmv2 like the service's own, so the probe picks its
+adapter with the same claim awareness and is visible to every other BLE
+service while it runs.  It still wants the device to itself, though - the
+driver holds a session of its own - so stop the service first:
 
   svc -d /service/dbus-ble-sensors-py
-  ./scripts/probe_charger_vregs.py …
+  ./scripts/probe_charger_vregs.py ...
   svc -u /service/dbus-ble-sensors-py
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import binascii
+import os
 import struct
 import sys
-import time
 
 import dbus
 import dbus.mainloop.glib
-from gi.repository import GLib
 
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
-SVC_306B   = "306b0001-b081-4037-83dc-e59fcc3cdfd0"
-CTRL_UUID  = "306b0002-b081-4037-83dc-e59fcc3cdfd0"
-DLAST_UUID = "306b0003-b081-4037-83dc-e59fcc3cdfd0"
-DBULK_UUID = "306b0004-b081-4037-83dc-e59fcc3cdfd0"
-C6_UUID    = "97580006-ddf1-48be-b73e-182664615d8e"
-C3_UUID    = "97580003-ddf1-48be-b73e-182664615d8e"
+# The driver package is a sibling of this script's directory.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "src", "opt", "victronenergy", "dbus-ble-sensors-py"))
+
+import ble_catcher  # noqa: E402
+import ble_gatt_dbus  # noqa: E402
+import ble_gatt_link  # noqa: E402
+import victron_vreg as vreg  # noqa: E402
 
 # --- Candidate VREG sets ----------------------------------------------------
 
@@ -85,146 +97,112 @@ CANDIDATES = {
 
 # --- BLE plumbing -----------------------------------------------------------
 
-def _pump(ms: int, ctx: GLib.MainContext) -> None:
-    end = time.monotonic() + ms / 1000.0
-    while time.monotonic() < end:
-        ctx.iteration(False)
-        time.sleep(0.005)
+class _Collector:
+    """Accumulates reassembled CBOR pushes as one flat byte stream.
 
-def _open_session(mac: str, passkey: int):
-    """Open a paired GATT session and run the CTRL handshake.  Returns
-    (dev, dlast, all_data, pump) — the caller drives reads/writes via
-    dlast and inspects accumulated responses in all_data."""
+    The probe searches raw bytes for per-register push/error patterns
+    rather than parsing frames, so unlike the provisioner's collector this
+    one just concatenates.
+    """
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self._bulk = bytearray()
+
+    def on_last(self, _char, chunk: bytearray) -> None:
+        self.data.extend(bytes(self._bulk) + bytes(chunk))
+        self._bulk.clear()
+
+    def on_bulk(self, _char, chunk: bytearray) -> None:
+        self._bulk.extend(chunk)
+
+
+async def _open_session(mac: str, passkey: int):
+    """Connect, authenticate, and run the CTRL handshake.
+
+    Returns ``(client, collector, agent, stop, pump)`` - the caller drives
+    requests through the client and reads accumulated responses out of the
+    collector.
+    """
     bus = dbus.SystemBus()
-    om = dbus.Interface(
-        bus.get_object("org.bluez", "/"),
-        "org.freedesktop.DBus.ObjectManager")
-    ctx = GLib.MainContext.default()
-    pump = lambda ms: _pump(ms, ctx)
 
-    suf = "/dev_" + mac.replace(":", "_")
-    for path in sorted(om.GetManagedObjects().keys()):
-        path = str(path)
-        if path.endswith(suf):
-            try:
-                dbus.Interface(bus.get_object("org.bluez", path),
-                               "org.bluez.Device1").Disconnect()
-            except dbus.DBusException:
-                pass
-    pump(1000)
-
-    dev_path = None
-    objs = om.GetManagedObjects()
-    for path in sorted(objs.keys()):
-        path = str(path)
-        if path.endswith(suf) and "org.bluez.Device1" in objs[path]:
-            dev_path = path
-            break
-    if dev_path is None:
-        sys.exit(f"device {mac} not found in BlueZ — is it advertising?")
-
-    dev = dbus.Interface(bus.get_object("org.bluez", dev_path),
-                         "org.bluez.Device1")
-    props = dbus.Interface(bus.get_object("org.bluez", dev_path),
-                           "org.freedesktop.DBus.Properties")
-
-    for _ in range(5):
-        try:
-            dev.Connect()
-            break
-        except dbus.DBusException:
-            pump(1000)
-
-    for _ in range(40):
-        pump(300)
-        if bool(props.Get("org.bluez.Device1", "ServicesResolved")):
-            break
-    pump(400)
-
-    objs = om.GetManagedObjects()
-    chars: dict[str, str] = {}
-    for path, ifs in objs.items():
-        path = str(path)
-        if not path.startswith(dev_path):
-            continue
-        if "org.bluez.GattCharacteristic1" not in ifs:
-            continue
-        cp = ifs["org.bluez.GattCharacteristic1"]
-        u = str(cp.get("UUID", ""))
-        si = objs.get(str(cp.get("Service", "")), {}).get(
-            "org.bluez.GattService1", {})
-        if u.startswith("306b") and str(si.get("UUID", "")) == SVC_306B:
-            chars[u] = path
-        elif u.startswith("9758"):
-            chars[u] = path
-
-    ci6 = dbus.Interface(bus.get_object("org.bluez", chars[C6_UUID]),
-                         "org.bluez.GattCharacteristic1")
-    ci3 = dbus.Interface(bus.get_object("org.bluez", chars[C3_UUID]),
-                         "org.bluez.GattCharacteristic1")
-    ctrl = dbus.Interface(bus.get_object("org.bluez", chars[CTRL_UUID]),
-                          "org.bluez.GattCharacteristic1")
-    dlast = dbus.Interface(bus.get_object("org.bluez", chars[DLAST_UUID]),
-                           "org.bluez.GattCharacteristic1")
-    dbulk = dbus.Interface(bus.get_object("org.bluez", chars[DBULK_UUID]),
-                           "org.bluez.GattCharacteristic1")
-
-    nonce = bytes(ci6.ReadValue({}))
-    ci6.WriteValue(list(struct.pack("<I",
-                                    binascii.crc32(nonce) & 0xFFFFFFFF)),
-                   {"type": "request"})
-    pump(500)
-    nonce2 = bytes(ci6.ReadValue({}))
+    # Drop any stale session first: the device-side session lingers after
+    # a previous connection and can reject a fresh PUK until torn down.
+    suffix = "/dev_" + mac.upper().replace(":", "_")
     try:
-        ci3.WriteValue(list(nonce2 + struct.pack("<I", passkey)),
-                       {"type": "request"})
-        pump(500)
+        om = dbus.Interface(bus.get_object("org.bluez", "/"),
+                            "org.freedesktop.DBus.ObjectManager")
+        for path in sorted(str(p) for p in om.GetManagedObjects()):
+            if path.endswith(suffix):
+                try:
+                    dbus.Interface(bus.get_object("org.bluez", path),
+                                   "org.bluez.Device1").Disconnect()
+                except dbus.DBusException:
+                    pass
     except dbus.DBusException:
         pass
 
-    buf = bytearray()
-    all_data = bytearray()
+    path, props = ble_gatt_dbus.lookup_device(bus, mac)
+    device = await ble_gatt_link.resolve(mac, path, props)
 
-    def on_last(_i, ch, _inv):
-        if "Value" not in ch:
-            return
-        d = bytes(int(x) for x in ch["Value"])
-        nonlocal buf
-        full = bytes(buf) + d
-        buf = bytearray()
-        all_data.extend(full)
+    stop = asyncio.Event()
+    pump = asyncio.create_task(ble_gatt_dbus.pump_default_context(stop))
+    agent = None
+    if not (props or {}).get("Paired"):
+        agent = ble_gatt_dbus.PairingAgent(bus, passkey, mac)
+        agent.register()
 
-    def on_bulk(_i, ch, _inv):
-        if "Value" not in ch:
-            return
-        d = bytes(int(x) for x in ch["Value"])
-        buf.extend(d)
+    client = await ble_gatt_link.connect(device, mac)
+    if agent is not None:
+        await client.pair()
 
-    bus.add_signal_receiver(
-        on_last, dbus_interface="org.freedesktop.DBus.Properties",
-        signal_name="PropertiesChanged", path=chars[DLAST_UUID])
-    bus.add_signal_receiver(
-        on_bulk, dbus_interface="org.freedesktop.DBus.Properties",
-        signal_name="PropertiesChanged", path=chars[DBULK_UUID])
-    for cc in (ctrl, dlast, dbulk):
-        try:
-            cc.StartNotify()
-        except dbus.DBusException:
-            pass
-    pump(300)
+    # PUK CRC, then PIN: both best-effort, exactly as before - a firmware
+    # that does not need them simply ignores the round trip.
     try:
-        bytes(ctrl.ReadValue({}))
-    except dbus.DBusException:
+        nonce = bytes(await client.read_gatt_char(vreg.CHAR_PUK))
+        crc = struct.pack("<I", binascii.crc32(nonce) & 0xFFFFFFFF)
+        await client.write_gatt_char(vreg.CHAR_PUK, crc, response=True)
+        await asyncio.sleep(0.5)
+        nonce = bytes(await client.read_gatt_char(vreg.CHAR_PUK))
+        await client.write_gatt_char(
+            vreg.CHAR_PIN, nonce + struct.pack("<I", passkey), response=True)
+        await asyncio.sleep(0.5)
+    except Exception as exc:
+        print(f"  (auth step skipped: {exc})")
+
+    collector = _Collector()
+    for char, callback in ((vreg.CHAR_DATA_LAST, collector.on_last),
+                           (vreg.CHAR_DATA_BULK, collector.on_bulk)):
+        if client.services.get_characteristic(char) is None:
+            continue
+        try:
+            # AcquireNotify: on Venus OS a paired link delivers empty
+            # PropertiesChanged payloads for these characteristics.
+            await client.start_notify(char, callback,
+                                      bluez={"use_start_notify": False})
+        except Exception:
+            await client.start_notify(char, callback)
+    await asyncio.sleep(0.3)
+
+    # Reading CTRL is what puts the device into CBOR mode.
+    try:
+        await client.read_gatt_char(vreg.CHAR_CONTROL)
+    except Exception:
         pass
-    pump(150)
-    ctrl.WriteValue(list(b"\xFA\x80\xFF"), {"type": "command"})
-    pump(250)
-    ctrl.WriteValue(list(b"\xF9\x80"), {"type": "command"})
-    pump(400)
-    dlast.WriteValue(list(b"\x03\x00\x9F\x19\xED\xDB\xFF"),
-                     {"type": "command"})
-    pump(800)
-    return dev, dlast, all_data, pump
+    await asyncio.sleep(0.15)
+    await client.write_gatt_char(vreg.CHAR_CONTROL, b"\xFA\x80\xFF",
+                                 response=False)
+    await asyncio.sleep(0.25)
+    await client.write_gatt_char(vreg.CHAR_CONTROL, b"\xF9\x80",
+                                 response=False)
+    await asyncio.sleep(0.4)
+    # Prime the outgoing stream with a subscribe to a chatty register.
+    await client.write_gatt_char(vreg.CHAR_DATA_LAST,
+                                 b"\x03\x00\x9F\x19\xED\xDB\xFF",
+                                 response=False)
+    await asyncio.sleep(0.8)
+    return client, collector, agent, stop, pump
+
 
 def _decode_value(data: bytes, off: int):
     """CBOR-decode a single value at offset `off` of `data`.  Returns
@@ -258,12 +236,12 @@ def _decode_value(data: bytes, off: int):
                 pass
     return ("?", f"h={h:02x}")
 
-def _probe_one(dlast, all_data: bytearray, pump, reg: int,
-               write_sentinel: bool = False, pump_ms: int = 500):
+async def _probe_one(client, collector: _Collector, reg: int,
+                     write_sentinel: bool = False, pump_ms: int = 500):
     """Probe one VREG.  Returns a dict describing what we observed."""
-    pre_len = len(all_data)
+    pre_len = len(collector.data)
     if write_sentinel:
-        # 1-byte SetValue — distinguishes unknown (code 1) from
+        # 1-byte SetValue - distinguishes unknown (code 1) from
         # everything else.  Crucially, we don't want this to actually
         # take effect, so use a value the firmware will reject.
         payload = bytes([0x06, 0x00, 0x9F, 0x19,
@@ -275,13 +253,14 @@ def _probe_one(dlast, all_data: bytearray, pump, reg: int,
                          (reg >> 8) & 0xFF, reg & 0xFF,
                          0xFF])
     try:
-        dlast.WriteValue(list(payload), {"type": "command"})
-    except dbus.DBusException as exc:
+        await client.write_gatt_char(vreg.CHAR_DATA_LAST, payload,
+                                     response=False)
+    except Exception as exc:
         return {"reg": reg, "lost": str(exc)}
-    pump(pump_ms)
-    new_data = bytes(all_data[pre_len:])
+    await asyncio.sleep(pump_ms / 1000.0)
+    new_data = bytes(collector.data[pre_len:])
     push_pat = bytes([0x08, 0x00, 0x19, (reg >> 8) & 0xFF, reg & 0xFF])
-    err_pat  = bytes([0x09, 0x00, 0x19, (reg >> 8) & 0xFF, reg & 0xFF])
+    err_pat = bytes([0x09, 0x00, 0x19, (reg >> 8) & 0xFF, reg & 0xFF])
     pi = new_data.find(push_pat)
     ei = new_data.find(err_pat)
     if pi >= 0:
@@ -292,53 +271,24 @@ def _probe_one(dlast, all_data: bytearray, pump, reg: int,
         return {"reg": reg, "kind": "error", "code": code}
     return {"reg": reg, "kind": "silent"}
 
+
 def _expand_range(spec: str) -> list[int]:
     if "-" in spec:
         a, b = spec.split("-", 1)
         return list(range(int(a, 0), int(b, 0) + 1))
     return [int(spec, 0)]
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mac", required=True,
-                   help="Device MAC address (AA:BB:CC:DD:EE:FF)")
-    p.add_argument("--passkey", type=int, default=14916,
-                   help="GATT passkey (default 14916 — Cerbo default PIN)")
-    p.add_argument("--range",
-                   help="Inclusive 0xAAAA-0xBBBB or single 0xAAAA")
-    p.add_argument("--candidates", choices=sorted(CANDIDATES.keys()),
-                   help="Use a named candidate set "
-                        "(core / current / function / ip22-optional)")
-    p.add_argument("--write-sentinel", action="store_true",
-                   help="Use 1-byte SetValue instead of GetValue.  Returns "
-                        "code 2 for registers that exist but didn't accept "
-                        "the size — useful when the device only responds "
-                        "to writes (some firmwares).")
-    p.add_argument("--pump-ms", type=int, default=500,
-                   help="ms to pump after each request (default 500)")
-    args = p.parse_args()
-
-    if args.range:
-        regs = _expand_range(args.range)
-    elif args.candidates:
-        regs = CANDIDATES[args.candidates]
-    else:
-        sys.exit("must provide --range or --candidates")
-
-    print(f"Probing {len(regs)} VREG(s) on {args.mac} "
-          f"({'write sentinel' if args.write_sentinel else 'GetValue'}, "
-          f"{args.pump_ms} ms each)...")
-    print()
-
-    dev, dlast, all_data, pump = _open_session(args.mac, args.passkey)
+async def _run(args, regs) -> None:
+    client, collector, agent, stop, pump = await _open_session(
+        args.mac.upper(), args.passkey)
     try:
         for reg in regs:
-            r = _probe_one(dlast, all_data, pump, reg,
-                           write_sentinel=args.write_sentinel,
-                           pump_ms=args.pump_ms)
+            r = await _probe_one(client, collector, reg,
+                                 write_sentinel=args.write_sentinel,
+                                 pump_ms=args.pump_ms)
             tag = "0x{:04X}".format(r["reg"])
             if "lost" in r:
-                print(f"  {tag}: connection lost — {r['lost']}")
+                print(f"  {tag}: connection lost - {r['lost']}")
                 break
             kind = r["kind"]
             if kind == "push":
@@ -348,18 +298,67 @@ def main():
                 code = r["code"]
                 meaning = {
                     1: "unknown register",
-                    2: "parameter / size error → register EXISTS",
-                    3: "read-only → register EXISTS",
+                    2: "parameter / size error -> register EXISTS",
+                    3: "read-only -> register EXISTS",
                 }.get(code, f"code {code}")
                 if code != 1:
                     print(f"  {tag}: ERR code {code} ({meaning})")
             else:
                 print(f"  {tag}: silent (no response)")
     finally:
+        await ble_gatt_link.disconnect(client)
+        if agent is not None:
+            agent.unregister()
+        stop.set()
         try:
-            dev.Disconnect()
-        except dbus.DBusException:
+            await pump
+        except asyncio.CancelledError:
             pass
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mac", required=True,
+                   help="Device MAC address (AA:BB:CC:DD:EE:FF)")
+    p.add_argument("--passkey", type=int, default=14916,
+                   help="GATT passkey (default 14916 - Cerbo default PIN)")
+    p.add_argument("--range",
+                   help="Inclusive 0xAAAA-0xBBBB or single 0xAAAA")
+    p.add_argument("--candidates", choices=sorted(CANDIDATES.keys()),
+                   help="Use a named candidate set "
+                        "(core / current / function / ip22-optional)")
+    p.add_argument("--write-sentinel", action="store_true",
+                   help="Use 1-byte SetValue instead of GetValue.  Returns "
+                        "code 2 for registers that exist but didn't accept "
+                        "the size - useful when the device only responds "
+                        "to writes (some firmwares).")
+    p.add_argument("--pump-ms", type=int, default=500,
+                   help="ms to wait after each request (default 500)")
+    p.add_argument("--adapter", default=None,
+                   help="Pin the link to this adapter (e.g. hci1) instead "
+                        "of letting bcmv2 place it")
+    args = p.parse_args()
+
+    if args.range:
+        regs = _expand_range(args.range)
+    elif args.candidates:
+        regs = CANDIDATES[args.candidates]
+    else:
+        sys.exit("must provide --range or --candidates")
+
+    pins = [f"{args.mac.upper()}@{args.adapter}"] if args.adapter else []
+    if not ble_catcher.install(owner="dbus-ble-sensors-py.probe",
+                               extra_adapters=pins):
+        sys.exit("BLE connection stack unavailable - run "
+                 "'git submodule update --init --recursive'")
+
+    print(f"Probing {len(regs)} VREG(s) on {args.mac} "
+          f"({'write sentinel' if args.write_sentinel else 'GetValue'}, "
+          f"{args.pump_ms} ms each)...")
+    print()
+
+    asyncio.run(_run(args, regs))
+
 
 if __name__ == "__main__":
     main()

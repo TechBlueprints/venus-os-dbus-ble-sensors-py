@@ -73,7 +73,6 @@ from orion_tr_key_settings import (
     set_preferred_adapter,
 )
 from orion_tr_pin import resolve_pairing_passkey
-from scan_control import pause_scanning, resume_scanning
 from ve_types import VE_UN8
 
 logger = logging.getLogger(__name__)
@@ -592,10 +591,9 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
             self._plog,
         )
 
-        # Yield hci0 to the provisioner subprocess so BleakScanner and
-        # the mode-write path don't step on its GATT burst.  Released in
-        # the worker thread regardless of outcome.
-        pause_scanning("orion-tr key provisioning")
+        # _provision_busy keeps the mode-write path off this device while
+        # the provisioner subprocess holds its GATT session.  Adapter
+        # contention beyond that is bcmv2's problem, not ours.
         _provision_busy = True
 
         # Check if we have a preferred adapter from a prior successful connect
@@ -618,7 +616,6 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 self._persist_provisioning_result(payload)
             finally:
                 _provision_busy = False
-                resume_scanning("orion-tr key provisioning")
 
         threading.Thread(
             target=worker, name=f"orion-tr-keyprov-{mac_colon}",
@@ -741,7 +738,6 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
 
         pref_adapter = get_preferred_adapter(self._dbus_settings,
                                              self.info["dev_mac"])
-        pause_scanning("orion-tr daily refresh")
         _provision_busy = True
 
         def worker():
@@ -762,7 +758,6 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
                 self._persist_provisioning_result(payload)
             finally:
                 _provision_busy = False
-                resume_scanning("orion-tr daily refresh")
 
         threading.Thread(
             target=worker, name=f"orion-tr-daily-{mac_colon}",
@@ -1039,18 +1034,10 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
         mac = _format_mac_colons(self.info["dev_mac"])
         mode_byte = 4 if value == 4 else 1
 
-        # The mode-write path pairs, connects, writes VREG 0x0200 and
-        # disconnects.  Like the key-provisioner it needs the adapter to
-        # itself, so pause the scan loop for the duration.
-        pause_scanning("orion-tr /Mode write")
-
         def on_done(success: bool):
-            try:
-                self._mode_busy = False
-                if not success:
-                    logger.error("%s: GATT mode write failed", self._plog)
-            finally:
-                resume_scanning("orion-tr /Mode write")
+            self._mode_busy = False
+            if not success:
+                logger.error("%s: GATT mode write failed", self._plog)
 
         writer.write_register(
             mac,

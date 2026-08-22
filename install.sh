@@ -8,8 +8,10 @@
 
 set -e
 
-REPO_URL="https://github.com/TechBlueprints/venus-os-dbus-ble-sensors-py.git"
-BRANCH="main"
+# Overridable so a test branch can be installed without editing this
+# file:  BRANCH=feature/xyz sh -c "$(curl -fsSL .../install.sh)"
+REPO_URL="${REPO_URL:-https://github.com/TechBlueprints/venus-os-dbus-ble-sensors-py.git}"
+BRANCH="${BRANCH:-main}"
 INSTALL_DIR="/data/apps/dbus-ble-sensors-py"
 SERVICE_NAME="dbus-ble-sensors-py"
 LAUNCHER_NAME="dbus-ble-sensors-py-launcher"
@@ -109,7 +111,17 @@ if [ -d "$INSTALL_DIR" ]; then
         REMOTE=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "none")
         if [ "$LOCAL" != "$REMOTE" ]; then
             echo "  Updates available. Resetting to latest..."
-            git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
+            # -f -B: point $BRANCH at the remote and take its content,
+            # discarding any local edits.  Plain `git checkout` aborts when
+            # the working tree is dirty — and a dirty tree is normal on a
+            # device that has been debugged on directly — which stranded
+            # the install one line before the `reset --hard` that was
+            # always going to discard those edits anyway.  Anything worth
+            # keeping should be committed, or saved off the device first.
+            if ! git checkout -f -B "$BRANCH" "origin/$BRANCH"; then
+                echo "Error: could not check out $BRANCH."
+                exit 1
+            fi
             git reset --hard "origin/$BRANCH"
             NEEDS_RESTART=true
             echo "  Repository updated"
@@ -128,11 +140,32 @@ if [ -d "$INSTALL_DIR" ]; then
     fi
 else
     echo "  Cloning repository..."
-    git clone -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+    git clone --recurse-submodules -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
     cd "$INSTALL_DIR"
     git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
     echo "  Repository cloned"
 fi
+echo ""
+
+# --- Step 3b: Sync BLE dependency submodules ---
+#
+# The BLE connection stack (bleak, bleak-connection-manager, bleak-retry-
+# connector and its deps) is carried as git submodules under
+# $APP_DIR/ext/.  A `git reset --hard` moves the gitlinks but does not
+# touch the submodule working trees, and an install that predates the
+# submodules has empty directories, so sync unconditionally rather than
+# only on the clone path.  Venus OS ships no bleak and its dbus-fast is
+# 2.21.1 (bleak needs >= 4), so a missing submodule means no GATT at all
+# — loud enough to be worth failing the install over.
+
+echo "Step 3b: Syncing BLE dependency submodules..."
+cd "$INSTALL_DIR"
+if ! git submodule update --init --recursive; then
+    echo "Error: failed to fetch BLE dependency submodules."
+    echo "       Charger GATT writes and key provisioning need them."
+    exit 1
+fi
+echo "  BLE submodules in sync"
 echo ""
 
 # --- Step 4: Fetch velib_python ---

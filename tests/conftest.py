@@ -31,9 +31,8 @@ DRIVER_DIR = os.path.normpath(os.path.join(
 sys.path.insert(0, DRIVER_DIR)
 
 # Stub out the heavy runtime imports ble_charger_common touches at
-# module level (dbus, gi.repository.GLib, orion_tr_gatt,
-# scan_control).  Tests that need real behaviour from these get
-# explicit fakes via fixtures below.
+# module level (dbus, gi.repository.GLib, orion_tr_gatt).  Tests that
+# need real behaviour from these get explicit fakes via fixtures below.
 
 if "dbus" not in sys.modules:
     dbus = types.ModuleType("dbus")
@@ -88,11 +87,6 @@ if "orion_tr_gatt" not in sys.modules:
     otg.AsyncGATTWriter = _StubAsyncGATTWriter
     sys.modules["orion_tr_gatt"] = otg
 
-if "scan_control" not in sys.modules:
-    sc = types.ModuleType("scan_control")
-    sc.pause_scanning = lambda *a, **kw: None
-    sc.resume_scanning = lambda *a, **kw: None
-    sys.modules["scan_control"] = sc
 
 # pytest fixtures — real ones, not stubs.
 import pytest  # noqa: E402

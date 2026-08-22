@@ -65,6 +65,13 @@ class _FakeRoleService:
     def connect(self):  # role_service.connect() is a no-op here
         pass
 
+    # The driver batches publishes inside ``with role_service:`` blocks.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
 # ---------------------------------------------------------------------------
 # 1. Role surface:  /Mode, /Capabilities/HasNoDeviceOffMode, /DeviceOffReason
 #    must NOT be registered on the IP22 charger role.
@@ -146,10 +153,17 @@ def ip22_module():
                  "orion_tr_key_settings", "dbus_settings_service"):
         if name not in sys.modules:
             sys.modules[name] = types.ModuleType(name)
+    def _stub_publish_value(self, role_service, path, value, **_kw):
+        # Mirrors BleDevice._publish_value's no-publisher fallback:
+        # direct write-through, report "wrote".
+        role_service[path] = value
+        return True
+
     sys.modules["ble_device"].BleDevice = type("BleDevice", (), {
         "MANUFACTURER_ID": None,
         "DEVICE_CLASSES": {},
         "info": {},
+        "_publish_value": _stub_publish_value,
     })
     sys.modules["dbus_role_service"].DbusRoleService = type(
         "DbusRoleService", (), {})
@@ -172,6 +186,10 @@ def ip22_module():
     _existing = sys.modules.get("ble_device_ip22_charger")
     if _existing is not None:
         _existing.DbusBleService = _StubBleSvc
+        # The class may have been built against an earlier, barer
+        # BleDevice stub (no _publish_value) — patch the method onto
+        # the driver class itself; MRO lookup picks it up dynamically.
+        _existing.BleDeviceIP22Charger._publish_value = _stub_publish_value
     sys.modules["dbus_settings_service"].DbusSettingsService = type(
         "DbusSettingsService", (), {"__init__": lambda self: None})
     for fn in ("advertisement_key_setting_path", "get_advertisement_key",
@@ -259,6 +277,32 @@ def test_publish_off_state_sets_state_to_zero(ip22_module):
     device = _make_device(ip22_module)
     role = device._role_services["charger"]
     device._publish_off_state()
+    assert role.values["/State"] == 0
+
+def test_publish_off_state_shows_external_control_when_dvcc_engaged(
+        ip22_module):
+    """A BMS-commanded 0 A limit drops the IP22 into standby, where it
+    advertises the short off frame.  With DVCC engaged that standby is
+    externally imposed, so /State must read 252, not a dead-looking 0."""
+    device = _make_device(ip22_module)
+    role = device._role_services["charger"]
+    device._dvcc_engaged = True
+    device._publish_off_state()
+    assert role.values["/State"] == 252
+    # Measurements stay honest — standby still has nothing to report.
+    assert role.values["/Dc/0/Voltage"] is None
+    assert role.values["/Dc/0/Current"] is None
+
+def test_disengaging_dvcc_during_off_frame_reverts_state_to_zero(
+        ip22_module):
+    """DVCC engage → off-frame publishes 252; disengage must re-derive
+    down to plain Off without waiting for the next advertisement."""
+    device = _make_device(ip22_module)
+    role = device._role_services["charger"]
+    device._dvcc_engaged = True
+    device._publish_off_state()
+    assert role.values["/State"] == 252
+    device._set_dvcc_engaged(role, False)
     assert role.values["/State"] == 0
 
 # ---------------------------------------------------------------------------

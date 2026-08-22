@@ -13,9 +13,9 @@ BLE advertisement (0x02E1, product 0xA3C0–0xA3DF)
         ▼
  dbus_ble_sensors.py  ──dispatch──▶  BleDeviceOrionTR
         │                               │
-        │  bleak scanner (hci0/hci2)    ├── victron_ble decrypt + parse
-        │  paused during GATT bursts    ├── dcdc / alternator role flip
-        │  via scan_control.py          ├── /Mode GATT write
+        │  passive HCI tap (all hciN)   ├── victron_ble decrypt + parse
+        │  GATT links placed by bcmv2   ├── dcdc / alternator role flip
+        │  (bleak-connection-manager)   ├── /Mode GATT write
         │                               └── key / firmware provisioning
         │                                       │
         ▼                                       ▼
@@ -42,14 +42,19 @@ BLE advertisement (0x02E1, product 0xA3C0–0xA3DF)
    `base.py` so it uses `cryptography` (shipped in Venus OS) instead of
    PyCryptodome (not available).
 
-3. **Scan pause/resume.**  `scan_control.pause_scanning()` /
-   `resume_scanning()` are ref-counted hooks that make the `BleakScanner`
-   yield the adapter during GATT bursts.  The scan loop polls
-   `is_scanning_paused()` every 250 ms inside its active-scan context so
-   it exits within one BLE advertising interval.
+3. **Connections go through bcmv2.**  Every GATT link — the subprocess
+   provisioner's included — is opened through `bleak-connection-manager`,
+   so it is placed with knowledge of what the other BLE services on the
+   box are doing with the radios, and publishes claims of its own while
+   it is up.  `--preferred-adapter` is expressed as a bcmv2 pin.  See
+   [`ble-connection-layer.md`](ble-connection-layer.md).  The ref-counted
+   `scan_control` pause/resume that used to guard these bursts is gone:
+   it made the in-process `BleakScanner` yield an adapter, and there has
+   been no such scanner since the HCI tap replaced it.
 
 4. **Multi-adapter support.**  All GATT paths resolve the device across
-   every BlueZ adapter via `ObjectManager` rather than hard-coding `hci0`.
+   every BlueZ adapter via `ObjectManager` rather than hard-coding `hci0`;
+   a bonded device's own adapter is the one bcmv2 claims on.
 
 ## Files
 
@@ -58,11 +63,12 @@ BLE advertisement (0x02E1, product 0xA3C0–0xA3DF)
 | `ble_device_orion_tr.py` | Device driver: dispatch, decode, dcdc↔alternator flip, /Mode write, provision lifecycle, daily refresh |
 | `orion_tr_key_cli.py` | Standalone subprocess: PUK auth + VREG reads for key, firmware, temperature, product id |
 | `orion_tr_gatt.py` | Async GATT register writer for /Mode (paired, encrypted CBOR SetValue) |
+| `victron_vreg.py` | The VREG/CBOR protocol itself, shared by the writer and the provisioner |
+| `ble_catcher.py`, `ble_async_loop.py`, `ble_gatt_link.py`, `ble_gatt_dbus.py` | bcmv2 connection layer: catcher install, the BLE event loop, device resolution, pairing agent |
 | `orion_tr_key_settings.py` | Silent-setting helpers for `AdvertisementKey` and `FirmwareVersion` |
 | `orion_tr_pin.py` | Pairing passkey resolution: ini → Cerbo setting → default 0 |
 | `ble_role_dcdc.py` | `dcdc` role (D-Bus paths for `PageDcDcConverter.qml`) |
 | `ble_role_alternator.py` | `alternator` role (D-Bus paths for `PageAlternator.qml`) |
-| `scan_control.py` | Ref-counted pause/resume for the BleakScanner loop |
 | `ext/victron_ble/` | Vendored + patched `victron_ble` library |
 
 ## D-Bus service paths

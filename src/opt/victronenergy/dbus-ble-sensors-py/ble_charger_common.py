@@ -42,7 +42,6 @@ import dbus
 from gi.repository import GLib
 
 from orion_tr_gatt import AsyncGATTWriter
-from scan_control import pause_scanning, resume_scanning
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +386,6 @@ class ChargerCommonMixin:
         del self._pending_writes[vreg]
 
         mac = format_mac_colons(self.info["dev_mac"])
-        pause_scanning(f"{self.SETTINGS_NS_PREFIX} GATT write 0x{vreg:04X}")
 
         def on_done(success: bool):
             try:
@@ -402,8 +400,6 @@ class ChargerCommonMixin:
                             "%s: pending-write completion callback failed",
                             self._plog)
             finally:
-                resume_scanning(
-                    f"{self.SETTINGS_NS_PREFIX} GATT write 0x{vreg:04X}")
                 self._schedule_drain()
 
         writer.write_register(
@@ -507,11 +503,16 @@ class ChargerCommonMixin:
 
     def _derive_published_state(self, advertised_state: int) -> int:
         """Return the value that should appear on /State right now.
-        ``STATE_EXTERNAL_CONTROL`` (252) when DVCC is engaged and the
-        device is powered, otherwise the raw advertised state.  Off
-        stays off."""
-        if advertised_state == 0:
-            return 0
+        ``STATE_EXTERNAL_CONTROL`` (252) whenever DVCC is engaged,
+        otherwise the raw advertised state.
+
+        Off is *not* exempt: a BMS-driven charge-current limit of 0 A
+        puts the unit into standby, where it advertises the short
+        power-off frame.  That standby is the *result* of external
+        control, and publishing 0 there made a correctly-managed
+        charger read as dead (a real support case).  This matches
+        solarcharger behaviour under DVCC, which shows external
+        control while held at 0 A."""
         if self._dvcc_engaged:
             return STATE_EXTERNAL_CONTROL
         return advertised_state
@@ -618,3 +619,20 @@ class ChargerCommonMixin:
                 self._history_charged_ah = float(v)
             except (TypeError, ValueError):
                 pass
+
+        # DVCC engagement must survive a service restart.  The role
+        # restores /Settings/BmsPresent (and /Link/NetworkMode) from
+        # localsettings, but those arrive by registration, not through
+        # our write handlers — so ``_dvcc_engaged`` would start False
+        # and an externally-held charger would read "Off" until the
+        # next /Link write (potentially hours for a full battery).
+        try:
+            bms_present = int(role_service["/Settings/BmsPresent"] or 0)
+        except Exception:
+            bms_present = 0
+        try:
+            mode = int(role_service["/Link/NetworkMode"] or 0)
+        except Exception:
+            mode = 0
+        if bms_present == 1 or mode != 0:
+            self._set_dvcc_engaged(role_service, True)

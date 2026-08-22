@@ -52,6 +52,11 @@ Implementation notes:
   any scanning code.  Drop-in replacement for the standalone
   [TechBlueprints/dbus-ble-advertisements](https://github.com/TechBlueprints/dbus-ble-advertisements)
   project.
+- [`docs/ble-connection-layer.md`](docs/ble-connection-layer.md) — the
+  outbound half of the Bluetooth stack: GATT connections routed through
+  **bcmv2** (`bleak-connection-manager`) for claim-aware adapter
+  placement, why passive advertisement scanning deliberately stays on the
+  raw HCI tap, and how the GLib and asyncio loops are kept apart
 - [`docs/IP22-INTEGRATION.md`](docs/IP22-INTEGRATION.md) — IP22
   driver, role, DVCC contract, alarm derivation, history accumulators
 - [`docs/ORION-TR-INTEGRATION.md`](docs/ORION-TR-INTEGRATION.md) —
@@ -77,6 +82,14 @@ curl -fsSL https://raw.githubusercontent.com/TechBlueprints/venus-os-dbus-ble-se
 This installs to `/data/apps/dbus-ble-sensors-py/`, which persists across firmware updates automatically.
 
 To update, re-run the same command.
+
+The BLE connection stack (bleak, `bleak-connection-manager`,
+`bleak-retry-connector` and its dependencies) is carried as git submodules
+under `ext/`; `install.sh` fetches them.  Cloning by hand needs
+`git clone --recurse-submodules`, or a `git submodule update --init
+--recursive` afterwards — without them the advertisement-driven sensors
+still work, but GATT writes and key provisioning cannot run.  See
+[`docs/ble-connection-layer.md`](docs/ble-connection-layer.md).
 
 To disable:
 

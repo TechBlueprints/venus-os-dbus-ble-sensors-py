@@ -38,6 +38,12 @@ class _Subject(bcc.ChargerCommonMixin):
         self._writer = writer
         self._init_charger_common()
 
+    def _publish_value(self, role_service, path, value, **_kw):
+        # BleDevice._publish_value's no-publisher fallback: direct
+        # write-through, report "wrote".
+        role_service[path] = value
+        return True
+
     @staticmethod
     def _gatt_writer():  # override the default singleton path
         # Late-bind to whatever ``writer`` was wired into the most
@@ -87,6 +93,22 @@ def test_load_persisted_no_settings_is_no_op(subject, fake_role):
     subject.load_persisted_charger_settings(fake_role)
     # Nothing was set, nothing was raised.
     assert fake_role.values == {}
+
+def test_load_persisted_seeds_dvcc_engagement_from_bms_present(
+        subject, fake_role):
+    """A restart restores /Settings/BmsPresent via role registration,
+    not through the write handlers — engagement (and the 252 /State
+    override) must be re-derived at load, or an externally-held
+    charger reads "Off" until the next /Link write."""
+    fake_role["/Settings/BmsPresent"] = 1
+    fake_role["/State"] = 0        # role registers /State before load
+    subject._last_advertised_state = 0
+
+    subject.load_persisted_charger_settings(fake_role)
+
+    assert subject._dvcc_engaged is True
+    assert fake_role["/Link/NetworkStatus"] == 1
+    assert fake_role["/State"] == bcc.STATE_EXTERNAL_CONTROL
 
 def test_load_persisted_seeds_history_state(subject, fake_settings):
     subject._persist_setting("History/OperationTime", 1234.5)
@@ -311,8 +333,14 @@ def test_publish_alarms_missing_path_falls_back(subject, fake_role):
 # DVCC engagement / /State override
 # ---------------------------------------------------------------------------
 
-def test_derive_published_state_off_stays_off(subject):
+def test_derive_published_state_engaged_overrides_off(subject):
+    """Externally-commanded standby (0 A limit → off frame) must show
+    external control, not a dead-looking Off."""
     subject._dvcc_engaged = True
+    assert subject._derive_published_state(0) == bcc.STATE_EXTERNAL_CONTROL
+
+def test_derive_published_state_disengaged_off_is_off(subject):
+    subject._dvcc_engaged = False
     assert subject._derive_published_state(0) == 0
 
 def test_derive_published_state_disengaged_passes_through(subject):
@@ -338,14 +366,19 @@ def test_set_dvcc_engaged_transitions_status(subject, fake_role):
     assert fake_role["/Link/NetworkStatus"] == 4
     assert fake_role["/State"] == 4
 
-def test_set_dvcc_engaged_off_device_stays_off(subject, fake_role):
+def test_set_dvcc_engaged_off_device_shows_external_control(subject,
+                                                           fake_role):
     fake_role["/State"] = 0
     subject._last_advertised_state = 0
     fake_role["/Link/NetworkStatus"] = 4
 
     subject._set_dvcc_engaged(fake_role, True)
     assert fake_role["/Link/NetworkStatus"] == 1
-    # Off stays off.
+    # Standby under external control reads 252, and disengaging
+    # re-derives back down to plain Off.
+    assert fake_role["/State"] == bcc.STATE_EXTERNAL_CONTROL
+
+    subject._set_dvcc_engaged(fake_role, False)
     assert fake_role["/State"] == 0
 
 def test_set_dvcc_engaged_idempotent_when_unchanged(subject, fake_role):
