@@ -637,9 +637,12 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         self._last_advertised_state = 0
         for role_service in list(self._role_services.values()):
             with role_service:
-                # Off stays off regardless of DVCC engagement — there's no
-                # power flowing for "external control" to claim.
-                self._publish_value(role_service, "/State", 0)
+                # While the BMS link follower / DVCC is engaged the off
+                # frame is almost always *our own doing* (charge current
+                # limit written to 0 A → firmware standby), so surface
+                # external control instead of a dead-looking "Off".
+                self._publish_value(role_service, "/State",
+                                    self._derive_published_state(0))
                 # Actively clear measurement paths.  SensorPublisher writes
                 # None through (clearing) the first time per path; repeated
                 # off-state ads then skip.  Without this, a stale value
