@@ -218,9 +218,10 @@ without modification.  Fields surfaced today:
 GATT writes from this driver land on the charge-profile VREGs only —
 absorption voltage (`0xEDF7`), float voltage (`0xEDF6`), battery type
 (`0xEDF1`), and battery max current (`0xEDF0`).  All of them go through
-the per-device write queue in `ChargerCommonMixin._enqueue_write`,
-which pauses the passive scan loop, opens a GATT session, drains the
-slot, and resumes scanning.
+the per-device write queue in `ChargerCommonMixin._enqueue_write`, which
+collapses repeat setpoints and drains one write at a time.  The link
+itself is placed by bcmv2 — see
+[`ble-connection-layer.md`](ble-connection-layer.md).
 
 There is no `/Mode` write path — the firmware probed (`fw 0.162` on
 the bench unit) does not implement `0x0200` (`DEVICE_MODE`) or any

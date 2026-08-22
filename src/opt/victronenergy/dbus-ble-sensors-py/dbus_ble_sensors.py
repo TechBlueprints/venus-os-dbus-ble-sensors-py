@@ -33,6 +33,7 @@ from sensor_publisher import SensorPublisher
 from load_throttle import LoadThrottle
 import hci_scan_control
 import platform_notifications
+from scan_claims import ScanClaims
 
 ADV_LOG_QUIET_PERIOD = 1800
 SILENCE_WARNING_SECONDS = 300
@@ -142,6 +143,11 @@ class DbusBleSensors(object):
         # discovery, etc.).
         self._dbus_ble_service.register_continuous_scan_callback(
             self._on_continuous_scan_changed)
+        # Passive vs active scanning re-applies through the same path:
+        # both are scan-parameter changes, and both should take effect
+        # on the GUI toggle rather than at the next 60 s tick.
+        self._dbus_ble_service.register_active_scan_callback(
+            self._on_continuous_scan_changed)
 
         # Settings-backed rounding policy + dedup/heartbeat publisher.
         # Constructed once here so every device driver inherits the same
@@ -174,6 +180,12 @@ class DbusBleSensors(object):
         # Replaces the old ``_registered_adapters`` from when we drove
         # scanning by registering a bluez AdvertisementMonitor.
         self._scan_enabled_adapters: set[str] = set()
+        # Soft bt-claims announcing those adapters to the other BLE
+        # services sharing these radios.  The claims layer is stdlib-only,
+        # so this costs nothing at startup — unlike the bcmv2 catcher,
+        # which pulls in bleak and is therefore installed lazily, on the
+        # first GATT write (see ble_async_loop.start).
+        self._scan_claims = ScanClaims()
         # Filter policy currently applied on each adapter — used by the
         # 60 s re-enable tick to decide whether to re-apply accept-list
         # mode (and rebuild the list) or just refresh the wide scan.
@@ -294,6 +306,7 @@ class DbusBleSensors(object):
             except Exception:
                 pass
             self._scan_enabled_adapters.discard(name)
+            self._scan_claims.release(name)
             logging.info(f"{name}: adapter removed")
 
     def _save_known_mac_types(self) -> None:
@@ -356,6 +369,26 @@ class DbusBleSensors(object):
             # configured device.
             return hci_scan_control.FILTER_POLICY_ACCEPT_ALL
 
+    def _desired_scan_type(self) -> int:
+        """Passive unless ``/Settings/BleSensors/ActiveScan`` is set.
+
+        Passive is the default because active scanning transmits a
+        SCAN_REQ at every advertiser in range and holds the channel for
+        the reply — measurably harder on the BMS links sharing these
+        radios.  The toggle exists for devices whose payload only arrives
+        in the SCAN_RSP; see ``hci_scan_control.DEFAULT_SCAN_TYPE``.
+
+        Errs passive on any failure: the neighbourly mode is the safe one
+        to fall back to.
+        """
+        try:
+            if self._dbus_ble_service.get_active_scan():
+                return hci_scan_control.SCAN_TYPE_ACTIVE
+        except Exception:
+            logging.exception("could not read ActiveScan setting — "
+                              "staying passive")
+        return hci_scan_control.SCAN_TYPE_PASSIVE
+
     def _start_passive_scan(self, adapter_name: str) -> None:
         """Issue HCI commands to put the adapter into passive scan mode.
 
@@ -386,6 +419,7 @@ class DbusBleSensors(object):
         ok = self._apply_scan_policy(idx, policy)
         if ok:
             self._scan_enabled_adapters.add(adapter_name)
+            self._scan_claims.hold(adapter_name)
             self._scan_filter_policy[adapter_name] = policy
             self._scan_failure_streak[adapter_name] = 0
             # Only log the "scan enabled" line on a real transition —
@@ -395,7 +429,9 @@ class DbusBleSensors(object):
             if not was_enabled or prev_policy != policy:
                 label = ("accept-all" if policy == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
                          else "accept-list-only")
-                logging.info(f"{adapter_name}: passive scan enabled via HCI socket ({label})")
+                mode = ("active" if self._desired_scan_type()
+                        == hci_scan_control.SCAN_TYPE_ACTIVE else "passive")
+                logging.info(f"{adapter_name}: {mode} scan enabled via HCI socket ({label})")
             else:
                 logging.debug(f"{adapter_name}: passive scan re-applied")
         else:
@@ -444,13 +480,16 @@ class DbusBleSensors(object):
                     "is empty — falling back to accept-all.  Re-enable "
                     "Continuous Scanning briefly to populate."
                 )
-                return hci_scan_control.enable_passive_scan(
+                return hci_scan_control.enable_scan(
                     adapter_index,
                     filter_policy=hci_scan_control.FILTER_POLICY_ACCEPT_ALL,
+                    scan_type=self._desired_scan_type(),
                 )
-            return hci_scan_control.apply_accept_list(adapter_index, devices)
-        return hci_scan_control.enable_passive_scan(
-            adapter_index, filter_policy=policy)
+            return hci_scan_control.apply_accept_list(
+                adapter_index, devices, scan_type=self._desired_scan_type())
+        return hci_scan_control.enable_scan(
+            adapter_index, filter_policy=policy,
+            scan_type=self._desired_scan_type())
 
     def _scan_reenable_tick(self) -> bool:
         """Re-issue the scan-enable HCI commands on every known adapter.
@@ -490,6 +529,7 @@ class DbusBleSensors(object):
                 # one transaction.
                 if self._apply_scan_policy(idx, desired):
                     self._scan_enabled_adapters.add(adapter_name)
+                    self._scan_claims.hold(adapter_name)
                     self._scan_filter_policy[adapter_name] = desired
                     label = ("accept-all" if desired == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
                              else "accept-list-only")
@@ -500,6 +540,7 @@ class DbusBleSensors(object):
                 # in case it changed (new devices learned via the tap).
                 if self._apply_scan_policy(idx, desired):
                     self._scan_enabled_adapters.add(adapter_name)
+                    self._scan_claims.hold(adapter_name)
         # Flush persisted cache once per tick if anything changed.
         self._save_known_mac_types()
         return True
@@ -700,6 +741,9 @@ class DbusBleSensors(object):
             if hci_scan_control.disable_passive_scan(idx):
                 logging.info(f"{adapter_name}: passive scan disabled (throttle)")
         self._scan_enabled_adapters.clear()
+        # We are off the air: stop telling everyone else these cards are
+        # busy, so a BMS link can be placed on one while we sit out.
+        self._scan_claims.release_all()
 
     def _on_load_trip(self, load_5m: float, load_15m: float) -> None:
         """Called by LoadThrottle when load crosses the trip threshold.

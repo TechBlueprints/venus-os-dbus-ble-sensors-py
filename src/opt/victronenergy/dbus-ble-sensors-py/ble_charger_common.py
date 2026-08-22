@@ -42,7 +42,6 @@ import dbus
 from gi.repository import GLib
 
 from orion_tr_gatt import AsyncGATTWriter
-from scan_control import pause_scanning, resume_scanning
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +386,6 @@ class ChargerCommonMixin:
         del self._pending_writes[vreg]
 
         mac = format_mac_colons(self.info["dev_mac"])
-        pause_scanning(f"{self.SETTINGS_NS_PREFIX} GATT write 0x{vreg:04X}")
 
         def on_done(success: bool):
             try:
@@ -402,8 +400,6 @@ class ChargerCommonMixin:
                             "%s: pending-write completion callback failed",
                             self._plog)
             finally:
-                resume_scanning(
-                    f"{self.SETTINGS_NS_PREFIX} GATT write 0x{vreg:04X}")
                 self._schedule_drain()
 
         writer.write_register(

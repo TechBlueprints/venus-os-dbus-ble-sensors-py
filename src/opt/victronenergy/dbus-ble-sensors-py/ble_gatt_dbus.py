@@ -1,0 +1,240 @@
+# Copyright 2026 Clint Goudie-Nice
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+"""The two BlueZ jobs bleak cannot do for us, over dbus-python.
+
+Both are deliberately kept on the GLib main thread — dbus-python and
+bleak's ``dbus_fast`` connection are separate clients of the same bus,
+and keeping each on its own thread is what makes the pairing handshake
+work: the BLE loop thread blocks awaiting ``Device1.Pair()`` while the
+GLib thread dispatches the passkey request back to BlueZ.
+
+1. **Device lookup.**  Which ``Device1`` objects BlueZ already has, so a
+   connect does not have to scan to find one.  See :mod:`ble_gatt_link`
+   for why avoiding that scan is the whole point.
+2. **The pairing agent.**  Victron peripherals want a passkey, BlueZ
+   wants an ``org.bluez.Agent1`` to supply it, and bleak registers none.
+   Without an agent, BlueZ auto-pairs with the wrong IO capability
+   (``DisplayOnly``) and firmwares that require an authenticated link
+   reject the write with "Invalid parameters".
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+
+import dbus
+import dbus.service
+from gi.repository import GLib
+
+logger = logging.getLogger(__name__)
+
+AGENT_INTERFACE = "org.bluez.Agent1"
+DEVICE_INTERFACE = "org.bluez.Device1"
+
+# KeyboardDisplay, not DisplayOnly: the capability Victron's SMP exchange
+# expects from a host that can supply a passkey.
+AGENT_CAPABILITY = "KeyboardDisplay"
+
+
+def _plain(value):
+    """Convert dbus-python types to plain Python.
+
+    The property dict crosses into bleak, which is a ``dbus_fast``
+    consumer and has no reason to understand dbus-python's subclasses.
+    """
+    if isinstance(value, dbus.ByteArray):
+        return bytes(value)
+    if isinstance(value, dbus.Boolean):
+        return bool(value)
+    if isinstance(value, (dbus.Int16, dbus.Int32, dbus.Int64, dbus.UInt16,
+                          dbus.UInt32, dbus.UInt64, dbus.Byte)):
+        return int(value)
+    if isinstance(value, dbus.Double):
+        return float(value)
+    if isinstance(value, dbus.String) or isinstance(value, dbus.ObjectPath):
+        return str(value)
+    if isinstance(value, dbus.Dictionary) or isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (dbus.Array, list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
+def lookup_device(bus, mac: str,
+                  prefer_adapter: str | None = None,
+                  ) -> tuple[str | None, dict | None]:
+    """Find the ``Device1`` BlueZ holds for *mac*, if any.
+
+    Returns ``(path, props)`` or ``(None, None)``.  A bonded device keeps
+    its object on the adapter it bonded to, so for an already-provisioned
+    charger this is the whole of device resolution — no radio involved.
+
+    When several adapters know the device, *prefer_adapter* wins if it is
+    among them (the caller remembering what worked last time), then the
+    connected one, then the bonded one.  That is the adapter the link will
+    actually use, and handing bcmv2 the wrong path would put the claims on
+    the wrong card.
+    """
+    suffix = "/dev_" + mac.upper().replace(":", "_")
+    try:
+        om = dbus.Interface(
+            bus.get_object("org.bluez", "/", introspect=False),
+            "org.freedesktop.DBus.ObjectManager")
+        objects = om.GetManagedObjects()
+    except Exception:
+        logger.exception("%s: BlueZ object lookup failed", mac)
+        return None, None
+
+    candidates = []
+    for path, interfaces in objects.items():
+        path = str(path)
+        if not path.endswith(suffix) or DEVICE_INTERFACE not in interfaces:
+            continue
+        props = _plain(interfaces[DEVICE_INTERFACE])
+        candidates.append((path, props))
+
+    if not candidates:
+        return None, None
+
+    wanted = f"/org/bluez/{prefer_adapter}/" if prefer_adapter else None
+
+    def rank(item):
+        _path, props = item
+        return (0 if wanted and _path.startswith(wanted) else 1,
+                0 if props.get("Connected") else 1,
+                0 if props.get("Paired") else 1,
+                _path)
+
+    path, props = sorted(candidates, key=rank)[0]
+    return path, props
+
+
+class _PairingAgent(dbus.service.Object):
+    """BlueZ pairing agent that answers with the Victron passkey."""
+
+    def __init__(self, bus, path, passkey):
+        super().__init__(bus, path)
+        self._passkey = passkey
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
+    def Release(self):
+        pass
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        pass
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        logger.info("Pairing agent: providing passkey for %s", device)
+        return dbus.UInt32(self._passkey)
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        pass
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        pass
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
+    def Cancel(self):
+        pass
+
+
+class PairingAgent:
+    """Register/unregister a passkey agent for one pairing attempt.
+
+    Scoped to the attempt rather than the process: while registered we are
+    BlueZ's *default* agent, which means every pairing on the box comes to
+    us, and we only know one passkey.
+    """
+
+    def __init__(self, bus, passkey: int, tag: str):
+        self._bus = bus
+        self._passkey = int(passkey)
+        self._path = "/org/victronenergy/dbus_ble_sensors/agent/%s_%d" % (
+            tag.replace(":", "").replace("/", ""), os.getpid())
+        self._agent = None
+        self._manager = None
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def register(self) -> bool:
+        try:
+            self._agent = _PairingAgent(self._bus, self._path, self._passkey)
+            self._manager = dbus.Interface(
+                self._bus.get_object("org.bluez", "/org/bluez",
+                                     introspect=False),
+                "org.bluez.AgentManager1")
+            path = dbus.ObjectPath(self._path)
+            try:
+                self._manager.UnregisterAgent(path)
+            except dbus.DBusException:
+                pass  # not registered — the normal case
+            self._manager.RegisterAgent(path, AGENT_CAPABILITY)
+            self._manager.RequestDefaultAgent(path)
+            logger.debug("pairing agent registered at %s", self._path)
+            return True
+        except Exception:
+            logger.exception("failed to register pairing agent — pairing "
+                             "will fall back to BlueZ's default handling")
+            return False
+
+    def unregister(self) -> None:
+        if self._manager is not None:
+            try:
+                self._manager.UnregisterAgent(dbus.ObjectPath(self._path))
+            except Exception:
+                pass
+            self._manager = None
+        if self._agent is not None:
+            try:
+                self._agent.remove_from_connection()
+            except Exception:
+                pass
+            self._agent = None
+
+    def __enter__(self):
+        self.register()
+        return self
+
+    def __exit__(self, *exc):
+        self.unregister()
+        return False
+
+
+def adapter_from_path(path: str | None) -> str | None:
+    """``/org/bluez/hci1/dev_AA_BB_…`` → ``hci1``."""
+    match = re.match(r"/org/bluez/(hci\d+)/", str(path or ""))
+    return match.group(1) if match else None
+
+
+async def pump_default_context(stop: asyncio.Event) -> None:
+    """Dispatch dbus-python traffic from inside an asyncio program.
+
+    The pairing agent is a dbus-python object served by the default GLib
+    main context.  In the service that context is already running, but the
+    standalone tools (:mod:`orion_tr_key_cli`, ``scripts/probe_charger_vregs``)
+    are asyncio programs with no GLib loop of their own — so they run this
+    as a background task, and iterating the context non-blockingly between
+    asyncio ticks is what lets BlueZ's passkey request reach the agent
+    while ``client.pair()`` is being awaited.
+
+    Never call this from the service: two things iterating one context is
+    a way to dispatch a callback twice.
+    """
+    context = GLib.MainContext.default()
+    while not stop.is_set():
+        while context.pending():
+            context.iteration(False)
+        await asyncio.sleep(0.01)

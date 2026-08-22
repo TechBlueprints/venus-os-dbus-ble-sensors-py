@@ -1,0 +1,174 @@
+# The BLE connection layer (bcmv2)
+
+This service touches Bluetooth in two completely different ways, and they
+are built on completely different stacks on purpose.
+
+| | Advertisements (inbound) | Connections (outbound) |
+|---|---|---|
+| What | Every sensor reading this service publishes | Charger setpoints, key provisioning, VREG probes |
+| Stack | Raw HCI monitor socket | bleak, routed through **bcmv2** |
+| Scanning | Controller-driven, passive by default | Active, but only to resolve a device BlueZ has never seen |
+| Code | `hci_scan_control.py`, `hci_advertisement_tap.py`, `scan_claims.py` | `ble_catcher.py`, `ble_async_loop.py`, `ble_gatt_link.py`, `orion_tr_gatt.py` |
+
+## Why the advertisement path is not routed through bcmv2
+
+There is no bleak scanner in that path to route.  The tap configures the
+controller itself over a raw HCI socket and reads results off the monitor
+channel, which is what keeps BlueZ from materialising a `Device1` object
+per advertiser — the growth that used to march dbus-daemon toward OOM at
+roughly 95 MB/hr.  See `hci_scan_control.py` for the full measurement.
+
+That scan is **passive by default**: it listens, and never transmits the
+SCAN_REQ an active scanner sends to every advertiser in range.
+`/Settings/BleSensors/ActiveScan` switches it, for devices whose payload
+only arrives in the SCAN_RSP — some Victron firmwares moved the encrypted
+instant-readout record there, and a passive scanner sees only the short
+product-id beacon, so the unit reads as off.
+
+### But the catcher *does* wrap the scanner
+
+`wrap_scanner=True`.  The process has exactly one bleak scanner — the
+device-resolution fallback below — and it is unambiguously an active scan.
+An active scan nobody else can see is precisely what this project has spent
+effort not inflicting on other services.  Wrapped, it takes the adapter's hard `hciN.scan` claim while it
+runs, ranks away from cards another process is already scanning on, and
+releases when it stops.
+
+`scan_to_score=False`, though.  That option buys RSSI-based placement by
+running short active sweeps *of its own* on a 10s-every-300s cadence,
+forever — recurring active scanning is exactly what the tap's passive
+default exists to avoid, and it is a different proposition from one bounded
+discovery for a device we cannot otherwise reach.  So placement stays bcmv2's least-used mode:
+occupancy and failure history, no RSSI base.
+
+## What bcmv2 does for the connection path
+
+`ble_catcher.install()` rebinds `bleak.BleakClient` process-wide, so every
+link this service opens gets:
+
+- **Claim-aware placement** over `/run/bt-claims`, the same file convention
+  dbus-serialbattery and the other services here follow.  A card another
+  process is scanning on, or has filled to its link capacity, ranks last.
+- **Failure-driven adapter rotation** for pinned devices, and connect
+  scoring for unpinned ones.
+- **Link slots** on adapters given a capacity in config, so a CSR dongle
+  is not asked for a sixth link it cannot open.
+- **Connection-parameter tuning** (habluetooth's fast-then-medium
+  supervision timeouts) on the adapter the link actually uses.
+
+Retries are *not* bcmv2's job — it routes, it never retries — so
+connections go through `bleak-retry-connector`'s `establish_connection`
+(`ble_gatt_link.connect`).
+
+## Device resolution, and the discovery we avoid
+
+Handed a bare address, bleak's BlueZ backend calls
+`BleakScanner.find_device_by_address` — an active discovery.  Doing that on
+every setpoint write would undo the whole point of the HCI tap, so
+`ble_gatt_link.resolve()` goes in order:
+
+1. **Ask BlueZ what it already knows** (`ble_gatt_dbus.lookup_device`).
+   Our chargers are bonded, and a bonded device keeps its `Device1` object
+   on its adapter across reboots.  Costs no radio time.  The resulting
+   `BLEDevice` carries its D-Bus path, which bcmv2 reads as an explicit
+   adapter choice — correct, because a bond *is* an adapter choice — and
+   still lands claims and tuning on the card the link will use.
+2. **Only if BlueZ has never seen it** — first provisioning, or a removed
+   bond — fall back to a bounded discovery.  That goes through the wrapped
+   scanner, so it holds the adapter's hard `hciN.scan` claim for its
+   duration; we pick no adapter and hold no claim by hand.
+
+## Claims we publish
+
+Connections and the resolution scan claim through bcmv2 itself.  The
+advertisement path is not routed through bcmv2, but it is not invisible to
+it either: `scan_claims.py` holds a **soft** claim
+(`hciN.use.dbus-ble-sensors-py-<pid>.scan`) for every adapter we have
+scanning enabled on, released when the adapter disappears or the load
+throttle stops scanning.
+
+Soft, not hard: passive scanning genuinely coexists with other traffic, so
+this is an announcement to rank on, not a reservation.  We never yield a
+card because of someone else's claim either — one-directional by design.
+(With `ActiveScan` turned on, a hard `hciN.scan` claim would be the more
+honest statement — a one-line change in `scan_claims.py`.)
+
+The useful consequence: our own GATT writes go through bcmv2, which ranks
+by occupancy, so a charger write now naturally prefers a card we are *not*
+scanning on.  That is the coordination `adapter-allowlist.conf` previously
+had to be hand-tuned to achieve.
+
+## Threading
+
+The service's main loop is GLib; bleak's is asyncio.  Rather than pump one
+from the other, `ble_async_loop.py` owns **one** long-lived event loop on a
+daemon thread, and results return to the GLib thread via `GLib.idle_add`.
+
+One loop, not one per operation: bleak keeps its `BlueZManager` — and under
+it a `dbus_fast` MessageBus — as a per-event-loop singleton, so a loop per
+GATT write leaks a system-bus connection each time.
+
+The split is strict:
+
+- **GLib thread** — all dbus-python: BlueZ device lookup, the pairing agent.
+- **BLE loop thread** — all bleak: resolve, connect, write.
+
+The pairing agent is why the split matters rather than merely being tidy.
+BlueZ needs an `org.bluez.Agent1` to answer Victron's passkey and bleak
+registers none, so `ble_gatt_dbus.PairingAgent` supplies one over
+dbus-python — and the BLE thread can block awaiting `Device1.Pair()`
+precisely because a *different* thread is dispatching the passkey request
+back to BlueZ.  The standalone tools have no GLib loop of their own, so
+they run `ble_gatt_dbus.pump_default_context()` as an asyncio task instead.
+
+The catcher itself is installed lazily, on the first GATT operation, so an
+installation with only tank and temperature sensors never pays bleak's
+import cost.  The claims layer is stdlib-only and loads at startup.
+
+## Configuration
+
+Optional, at `/data/apps/dbus-ble-sensors-py/ble-connect.conf`:
+
+```ini
+# Adapters usable for GATT.  Empty (or no file) means every adapter the
+# kernel exposes is a candidate, ranked by live claims.
+#   hci1                      pool entry
+#   AA:BB:CC:DD:EE:FF@hci1    pin that device to that adapter
+#                             (repeat the MAC for a preference list)
+adapters = hci1 hci2
+
+# Established-link capacity, for dongles with an undocumented limit
+# (CSR ~5, Broadcom ~7 are the field starting points).  Opt-in; uncapped
+# adapters are never slot-gated.
+link_caps = hci1:5
+```
+
+This is **not** `adapter-allowlist.conf`.  That file reserves adapters away
+from the advertisement scanner; this one bounds where GATT links may be
+placed.
+They are separate on purpose: a card reserved from our scanning is usually
+the best card to connect on.
+
+## Dependencies
+
+The stack is carried as git submodules under
+`src/opt/victronenergy/dbus-ble-sensors-py/ext/`, pinned to the same
+commits `dbus-easytouchrv` runs on Venus OS:
+
+| Submodule | Why |
+|---|---|
+| `bleak` | Venus OS ships none |
+| `bleak-connection-manager` | bcmv2 itself; its own `ext/` carries dbus-fast 5.x |
+| `bleak-retry-connector` | Retry semantics bcmv2 deliberately omits |
+| `bluetooth-adapters`, `aiooui` | bleak-retry-connector dependencies |
+
+`ble_ext_path.py` puts them ahead of site-packages, which is load-bearing
+for one of them: Venus OS ships `python3-dbus-fast` **2.21.1**, and current
+bleak needs `dbus-fast >= 4` (it imports `dbus_fast.annotations`).  Without
+the shadowing, a fresh deploy dies with `No module named
+'dbus_fast.annotations'`.
+
+`install.sh` runs `git submodule update --init --recursive` on every
+install and update, and fails loudly if it cannot: with no bleak there is
+no GATT at all.  Advertisement-driven sensors keep working regardless — a
+missing stack is reported once and degrades to "no GATT", never to a crash.

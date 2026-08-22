@@ -57,7 +57,11 @@ class DbusBleService(object):
         # to re-apply scan filter policy immediately on GUI toggle
         # rather than waiting for the 60 s polling tick.
         self._continuous_scan_callbacks: list = []
+        # Same chain for /Settings/BleSensors/ActiveScan — see
+        # init_active_scan for what the toggle actually costs.
+        self._active_scan_callbacks: list = []
         self.init_continuous_scan()
+        self.init_active_scan()
         self._dbus_ble_service.register()
 
     @staticmethod
@@ -252,6 +256,46 @@ class DbusBleService(object):
             1,
             on_change
         )
+
+    def init_active_scan(self):
+        """Expose ``/Settings/BleSensors/ActiveScan`` (default OFF).
+
+        Passive scanning listens; active scanning transmits a SCAN_REQ at
+        every advertiser it hears and holds the channel for the response.
+        On a gateway sharing a few radios with BMS links, passive is the
+        neighbourly default and the one this service ships with.
+
+        Turn it on for devices whose data only arrives in the SCAN_RSP —
+        Victron firmwares that moved the encrypted instant-readout record
+        out of the primary advertisement, where a passive scanner sees
+        only the short product-id beacon and the unit reads as off.
+        """
+        def on_change(value):
+            logging.info(
+                f"Active scanning set to {value!r} "
+                f"({'active — SCAN_REQ transmitted' if value else 'passive — listen only'})")
+            for cb in list(self._active_scan_callbacks):
+                try:
+                    cb(bool(value))
+                except Exception:
+                    logging.exception("ActiveScan change callback raised")
+        self._set_proxy_setting(
+            '/Settings/BleSensors/ActiveScan',
+            '/ActiveScan',
+            0,
+            0,
+            1,
+            on_change
+        )
+
+    def get_active_scan(self) -> bool:
+        return bool(self._dbus_ble_service['/ActiveScan'])
+
+    def register_active_scan_callback(self, callback) -> None:
+        """Register *callback* for ``/Settings/BleSensors/ActiveScan``
+        changes.  Same contract as
+        :meth:`register_continuous_scan_callback`."""
+        self._active_scan_callbacks.append(callback)
 
     def get_continuous_scan(self) -> bool:
         return bool(self._dbus_ble_service['/ContinuousScan'])

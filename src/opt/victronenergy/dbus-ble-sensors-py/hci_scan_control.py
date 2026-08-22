@@ -28,7 +28,8 @@ provisioning) still work because bleak's
 ``Adapter1.ConnectDevice(mac)`` creates the device entry on demand.
 
 This module is the Python equivalent of ``hcitool lescan
---passive --duplicates``.  We open an ``HCI_CHANNEL_RAW`` socket
+--passive --duplicates`` (and of dropping ``--passive``, when a device
+needs its SCAN_RSP read — see ``DEFAULT_SCAN_TYPE``).  We open an ``HCI_CHANNEL_RAW`` socket
 (cooperative multi-user channel — the same one hcitool uses), install
 the standard filter so Command Complete events come back to us, then
 issue the three commands that put the controller into passive scan:
@@ -40,7 +41,7 @@ issue the three commands that put the controller into passive scan:
 These commands have to be re-issued periodically because other things
 on the system (notably ``shyion-switch`` doing active scans via
 bleak) reset the controller's scan parameters.  See
-:func:`enable_passive_scan` for the recovery model.
+:func:`enable_scan` for the recovery model.
 """
 from __future__ import annotations
 
@@ -202,12 +203,37 @@ def _send_and_wait_complete(s: socket.socket, ogf: int, ocf: int,
 _DEFAULT_SCAN_INTERVAL = 0x0010
 _DEFAULT_SCAN_WINDOW = 0x0010
 
+# Scan_Type values (Core Spec Vol 4 Part E §7.8.10).
+SCAN_TYPE_PASSIVE = 0x00
+SCAN_TYPE_ACTIVE = 0x01
 
-def enable_passive_scan(adapter_index: int,
-                        interval: int = _DEFAULT_SCAN_INTERVAL,
-                        window: int = _DEFAULT_SCAN_WINDOW,
-                        filter_policy: int = FILTER_POLICY_ACCEPT_ALL) -> bool:
-    """Configure and enable passive LE scanning on the given adapter.
+# Passive by default, and that default is the whole point of this module.
+# A passive scanner listens; an active one transmits a SCAN_REQ at every
+# advertiser it hears and holds the channel to collect the response.  On a
+# gateway sharing a handful of radios with BMS links, that is the
+# difference between coexisting and interfering, and it is why the
+# advertisement path is driven from here rather than through BlueZ.
+#
+# Active is available because it is a strict superset of what passive
+# delivers: some Victron firmwares (observed on the IP22 after its 2026
+# firmware update) move the encrypted instant-readout record out of the
+# primary advertisement and into the SCAN_RSP, which a passive scanner
+# never solicits and therefore never sees — the unit reads as off.  The
+# tap parses SCAN_RSP reports through the same LE Advertising Report
+# path, so nothing downstream changes.
+#
+# Callers choose per call; ``DbusBleSensors._desired_scan_type`` maps the
+# ``/Settings/BleSensors/ActiveScan`` toggle onto it.
+DEFAULT_SCAN_TYPE = SCAN_TYPE_PASSIVE
+
+
+def enable_scan(adapter_index: int,
+                interval: int = _DEFAULT_SCAN_INTERVAL,
+                window: int = _DEFAULT_SCAN_WINDOW,
+                filter_policy: int = FILTER_POLICY_ACCEPT_ALL,
+                scan_type: int = DEFAULT_SCAN_TYPE) -> bool:
+    """Configure and enable LE scanning on the given adapter (active
+    by default — see ``DEFAULT_SCAN_TYPE`` above).
 
     Opens a short-lived HCI_CHANNEL_RAW socket, issues the three
     standard commands (disable → set params → enable), and closes the
@@ -247,9 +273,9 @@ def enable_passive_scan(adapter_index: int,
         except TimeoutError as exc:
             _log.warning(f"hci{adapter_index}: scan disable timed out: {exc}")
 
-        # 2. Set passive scan parameters.
+        # 2. Set scan parameters.
         params = struct.pack("<BHHBB",
-                             0x00,            # Scan_Type 0 = passive
+                             scan_type,       # Scan_Type (active by default)
                              interval,        # LE_Scan_Interval
                              window,          # LE_Scan_Window
                              0x00,            # Own_Address_Type 0 = public
@@ -279,6 +305,16 @@ def enable_passive_scan(adapter_index: int,
         return True
     finally:
         s.close()
+
+
+def enable_passive_scan(adapter_index: int,
+                        interval: int = _DEFAULT_SCAN_INTERVAL,
+                        window: int = _DEFAULT_SCAN_WINDOW,
+                        filter_policy: int = FILTER_POLICY_ACCEPT_ALL) -> bool:
+    """Explicitly-passive :func:`enable_scan`, regardless of the default."""
+    return enable_scan(adapter_index, interval=interval, window=window,
+                       filter_policy=filter_policy,
+                       scan_type=SCAN_TYPE_PASSIVE)
 
 
 def read_accept_list_size(adapter_index: int) -> 'int | None':
@@ -399,7 +435,8 @@ def add_device_to_accept_list(adapter_index: int, address_type: int,
 def apply_accept_list(adapter_index: int,
                       devices: 'list[tuple[str, int]]',
                       interval: int = _DEFAULT_SCAN_INTERVAL,
-                      window: int = _DEFAULT_SCAN_WINDOW) -> bool:
+                      window: int = _DEFAULT_SCAN_WINDOW,
+                      scan_type: int = DEFAULT_SCAN_TYPE) -> bool:
     """Atomically replace the controller's accept list and (re)enable scanning
     in accept-list-only mode.
 
@@ -455,7 +492,7 @@ def apply_accept_list(adapter_index: int,
         # Set parameters with filter_policy=1 then re-enable.
         params = struct.pack(
             "<BHHBB",
-            0x00,        # passive
+            scan_type,   # passive unless the caller asked otherwise
             interval,
             window,
             0x00,        # public own_addr_type

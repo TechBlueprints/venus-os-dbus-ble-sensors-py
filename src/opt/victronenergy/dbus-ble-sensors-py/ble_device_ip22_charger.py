@@ -50,7 +50,6 @@ from ip22_key_settings import (
     set_firmware_version,
     set_preferred_adapter,
 )
-from scan_control import pause_scanning, resume_scanning
 from ve_types import VE_UN8
 
 # Behaviours shared between IP22 and Orion-TR (in charger / alternator
@@ -466,7 +465,6 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             self._plog,
         )
 
-        pause_scanning("ip22 key provisioning")
         _provision_busy = True
 
         pref_adapter = get_preferred_adapter(self._dbus_settings,
@@ -487,7 +485,6 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 self._persist_provisioning_result(payload)
             finally:
                 _provision_busy = False
-                resume_scanning("ip22 key provisioning")
 
         threading.Thread(
             target=worker, name=f"ip22-keyprov-{mac_colon}",
@@ -579,7 +576,6 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
 
         pref_adapter = get_preferred_adapter(self._dbus_settings,
                                              self.info["dev_mac"])
-        pause_scanning("ip22 daily refresh")
         _provision_busy = True
 
         def worker():
@@ -594,7 +590,6 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 self._persist_provisioning_result(payload)
             finally:
                 _provision_busy = False
-                resume_scanning("ip22 daily refresh")
 
         threading.Thread(
             target=worker, name=f"ip22-daily-{mac_colon}",

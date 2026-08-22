@@ -17,6 +17,16 @@ src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/**/*.pyc
 # See ext/victron-bluetooth-safety/VENDORED.md for details.
 !src/opt/victronenergy/dbus-ble-sensors-py/ext/victron-bluetooth-safety
 !src/opt/victronenergy/dbus-ble-sensors-py/ext/victron-bluetooth-safety/**
+# Exception: BLE connection stack, carried as submodules (upstream repos).
+# bleak + bleak-connection-manager (bcmv2, whose own ext/ carries the
+# dbus-fast 5.x that must shadow Venus OS's site-packages 2.21.1) +
+# bleak-retry-connector and its deps.  Pinned to the same commits
+# dbus-easytouchrv runs on Venus OS.  install.sh inits/updates them.
+!src/opt/victronenergy/dbus-ble-sensors-py/ext/aiooui
+!src/opt/victronenergy/dbus-ble-sensors-py/ext/bleak
+!src/opt/victronenergy/dbus-ble-sensors-py/ext/bleak-connection-manager
+!src/opt/victronenergy/dbus-ble-sensors-py/ext/bleak-retry-connector
+!src/opt/victronenergy/dbus-ble-sensors-py/ext/bluetooth-adapters
 *.iml
 .idea/
 *.code-workspace

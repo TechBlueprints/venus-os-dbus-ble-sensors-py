@@ -12,6 +12,33 @@ API.
 The tap does not issue any commands and does not interfere with BlueZ or
 tie up any adapter.
 
+## Scan type
+
+The tap scans **passively** by default: it listens, and never transmits the
+SCAN_REQ that an active scanner sends to every advertiser in range.  On a
+gateway sharing a few radios with BMS links, that is the difference between
+coexisting and interfering.
+
+`/Settings/BleSensors/ActiveScan` switches the controller to active
+scanning.  Turn it on only when a device needs it — some Victron firmwares
+moved the encrypted instant-readout record out of the primary advertisement
+and into the SCAN_RSP, which a passive scanner never solicits, so the unit
+shows only its short product-id beacon and reads as off.  Active delivers
+everything passive does plus the scan responses, and the tap parses them
+through the same LE Advertising Report path, so nothing downstream changes.
+
+The toggle re-applies immediately (same path as `ContinuousScan`) rather
+than waiting for the 60 s scan-re-enable tick.
+
+## Relationship to the connection path
+
+This is the **inbound** half of the Bluetooth stack only.  Outbound GATT —
+charger setpoints, key provisioning — is a separate stack: bleak, routed
+through bcmv2 for claim-aware adapter placement.  The two meet only in
+`/run/bt-claims`, where the tap publishes a soft claim per adapter it has
+passive scan enabled on so connections rank around it.  See
+[`ble-connection-layer.md`](ble-connection-layer.md).
+
 ## Processing Pipeline
 
 The diagram below shows every filter stage a raw HCI packet passes through
