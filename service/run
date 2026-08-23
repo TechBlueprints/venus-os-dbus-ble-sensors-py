@@ -27,12 +27,48 @@ if [ "$(get_setting /Settings/Services/BleSensors)" != 1 ]; then
   exit 1
 fi
 
-# AdvertisementMonitor1 passive scanning requires bluetoothd with --experimental.
-# Start it if not running; log a note if running without -E.
+# Passive scanning wants bluetoothd with --experimental.  Start it only
+# if nothing else has, and start it so that it OUTLIVES US.
+#
+# Two defects lived here, both found the hard way on prod (2026-08-23).
+#
+# 1. `bluetoothd -E &` made the daemon a CHILD of this service.  With no
+#    stock bluetooth entry in /service, we became the box's de facto
+#    owner of bluetoothd — so every restart of this service killed it
+#    with our process group and spawned a new one, taking org.bluez off
+#    the system bus for EVERY BLE consumer.  That is what produced
+#    org.freedesktop.DBus.Error.ServiceUnknown in other services, dropped
+#    thermostat monitors, and BMS reconnects, once per deploy.
+#
+# 2. We ignored the box's own configuration.  /etc/default/bluetooth sets
+#    "-E -f /etc/bluetooth/ble.conf", and that file carries
+#    ControllerMode = le, ReverseServiceDiscovery = false and
+#    Privacy = device.  Starting bare `bluetoothd -E` applied none of it
+#    (main.conf holds no active settings), so a controller configured to
+#    be LE-only silently ran dual-mode instead — on whichever bluetoothd
+#    we had spawned, which was most of them.
+#
+# So: prefer the init script, which owns both the options and the
+# lifetime.  Failing that, honour /etc/default/bluetooth's options and
+# detach with setsid so a restart of ours is not a restart of the box's
+# Bluetooth.  The right long-term answer is a proper runit service entry
+# for bluetoothd; this only stops us making its lifetime our accident.
 if ! pidof bluetoothd > /dev/null 2>&1; then
-  if [ -x /usr/libexec/bluetooth/bluetoothd ]; then
-    echo "Starting bluetoothd with experimental features for passive scanning..."
-    /usr/libexec/bluetooth/bluetoothd -E &
+  if [ -x /etc/init.d/bluetooth ]; then
+    echo "Starting bluetoothd via /etc/init.d/bluetooth (its own config and lifetime)..."
+    /etc/init.d/bluetooth start || true
+    sleep 2
+  elif [ -x /usr/libexec/bluetooth/bluetoothd ]; then
+    BT_OPTS="-E"
+    [ -f /etc/bluetooth/ble.conf ] && BT_OPTS="$BT_OPTS -f /etc/bluetooth/ble.conf"
+    echo "Starting bluetoothd detached ($BT_OPTS)..."
+    if command -v setsid > /dev/null 2>&1; then
+      setsid /usr/libexec/bluetooth/bluetoothd $BT_OPTS < /dev/null > /dev/null 2>&1 &
+    else
+      # No setsid: still better than nothing, but this one dies with us.
+      echo "Note: setsid unavailable — bluetoothd will not survive a restart of this service"
+      /usr/libexec/bluetooth/bluetoothd $BT_OPTS &
+    fi
     sleep 2
   fi
 elif ! cat /proc/$(pidof bluetoothd)/cmdline 2>/dev/null | tr '\0' ' ' | grep -qE '\-E|--experimental'; then
