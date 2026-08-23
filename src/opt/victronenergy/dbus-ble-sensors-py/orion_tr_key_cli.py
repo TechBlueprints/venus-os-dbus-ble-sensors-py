@@ -573,6 +573,7 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
         await _handshake(client)
         await _prime(client, collector)
         voltage = await _fetch_vreg(client, collector, 0xED8D, "voltage")
+        current = await _fetch_vreg(client, collector, 0xED8F, "current")
         state = await _fetch_vreg(client, collector, 0x0201, "state")
         try:
             await client.write_gatt_char(
@@ -587,6 +588,7 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
             _err(f"0xEC7D write failed (non-fatal): {exc}")
         return {
             "voltage": voltage,
+            "current": current,
             "device_state": state,
             "adapter": adapter,
         }
@@ -608,7 +610,7 @@ def main() -> int:
     ap.add_argument("--preferred-adapter", default=None,
                     help="Try this adapter first (e.g. hci1)")
     ap.add_argument("--telemetry", action="store_true",
-                    help="Read live voltage/state and enable Instant Readout")
+                    help="Read live voltage/current/state and enable Instant Readout")
     args = ap.parse_args()
 
     mac = args.mac.upper()

@@ -414,8 +414,12 @@ def test_apply_telemetry_payload_publishes_voltage(ip22_module):
     device._dvcc_engaged = True
     device._apply_telemetry_payload({
         "voltage": "7905",
+        "current": "0000",
         "device_state": "00",
     })
-    assert device._role_services["charger"].values["/Dc/0/Voltage"] == 14.01
-    assert device._role_services["charger"].values["/State"] == 252
+    role = device._role_services["charger"]
+    assert role.values["/Dc/0/Voltage"] == 14.01
+    assert role.values["/Dc/0/Current"] == 0.0
+    assert role.values["/Dc/0/Power"] == 0.0
+    assert role.values["/State"] == 252
     assert device._instant_readout_enabled is True

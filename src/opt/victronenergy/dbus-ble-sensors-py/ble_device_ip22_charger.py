@@ -86,11 +86,12 @@ VREG_ABSORPTION_VOLTAGE  = 0xEDF7   # u16 LE, 0.01 V
 VREG_ADVERTISEMENT_MODE  = vreg.VREG_BLE_ADVERTISEMENT_MODE
 VREG_DEVICE_STATE        = vreg.VREG_DEVICE_STATE
 VREG_OUTPUT_VOLTAGE      = vreg.VREG_OUTPUT_VOLTAGE
+VREG_OUTPUT_CURRENT      = vreg.VREG_OUTPUT_CURRENT
 
 # HEX live reads when Instant Readout ads are only the 4-byte beacon
 # (standby / 0 A DVCC limit).  Same GetValue path the IP22 already
-# answers for 0xED8D.
-_HEX_LIVE_REGS = (VREG_OUTPUT_VOLTAGE, VREG_DEVICE_STATE)
+# answers for 0xED8D / 0xED8F.
+_HEX_LIVE_REGS = (VREG_OUTPUT_VOLTAGE, VREG_OUTPUT_CURRENT, VREG_DEVICE_STATE)
 _HEX_TELEMETRY_BACKOFF_S = 45.0
 
 # Optional charge-profile VREGs that the standard Victron solar /
@@ -533,6 +534,7 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         values: dict[int, bytes] = {}
         for key, register_id in (
                 ("voltage", VREG_OUTPUT_VOLTAGE),
+                ("current", VREG_OUTPUT_CURRENT),
                 ("device_state", VREG_DEVICE_STATE),
         ):
             raw = payload.get(key)

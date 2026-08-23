@@ -116,6 +116,15 @@ def test_decode_ip22_vreg_voltage_from_live_push() -> None:
     assert vreg.decode_ip22_vreg(reg, payload)["output_voltage1"] == 14.01
 
 
+def test_decode_ip22_vreg_current_from_live_push() -> None:
+    # F2:86 GetValue 0xED8F returned bstr 0000 while held at 0 A.
+    # Scale is 0.1 A, same as the charger VE.Direct current register.
+    assert vreg.decode_ip22_vreg(vreg.VREG_OUTPUT_CURRENT, b"\x00\x00")[
+        "output_current1"] == 0.0
+    assert vreg.decode_ip22_vreg(vreg.VREG_OUTPUT_CURRENT, b"\x2c\x01")[
+        "output_current1"] == 30.0
+
+
 def test_decode_ip22_vreg_device_state_and_mode() -> None:
     assert vreg.decode_ip22_vreg(vreg.VREG_DEVICE_STATE, b"\x05")[
         "device_state"] == 5

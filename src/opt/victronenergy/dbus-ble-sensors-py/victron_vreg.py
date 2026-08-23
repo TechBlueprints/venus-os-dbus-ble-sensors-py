@@ -50,6 +50,7 @@ VREG_BLE_MAC_ADDRESS = 0xEC66
 VREG_BLE_ADVERTISEMENT_MODE = 0xEC7D  # 1 = Instant Readout extra mfr data
 VREG_DEVICE_STATE = 0x0201
 VREG_OUTPUT_VOLTAGE = 0xED8D
+VREG_OUTPUT_CURRENT = 0xED8F  # charger current, 0.1 A
 
 # HEX command opcodes (first CBOR uint of a DATA_LAST write).
 OPCODE_GET_DEVICES = 0x01
@@ -284,6 +285,8 @@ def decode_ip22_vreg(vreg_id: int, payload: bytes) -> dict:
     out: dict = {}
     if vreg_id == VREG_OUTPUT_VOLTAGE and len(payload) >= 2:
         out["output_voltage1"] = le_sint(payload[:2]) / 100.0
+    elif vreg_id == VREG_OUTPUT_CURRENT and len(payload) >= 2:
+        out["output_current1"] = le_sint(payload[:2]) / 10.0
     elif vreg_id == VREG_DEVICE_STATE and payload:
         out["device_state"] = payload[0]
     elif vreg_id == VREG_BLE_ADVERTISEMENT_MODE and payload:
