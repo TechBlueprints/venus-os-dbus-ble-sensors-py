@@ -69,6 +69,27 @@ if "gi" not in sys.modules:
     sys.modules["gi"] = gi
     sys.modules["gi.repository"] = gi_repo
 
+# ble_role.BleRole is the base every role class inherits from.  Stub it
+# ONCE, here, because four test modules used to each install their own
+# shape into sys.modules and the last writer won: an arg-less
+# ``type("BleRole", (), {})`` left BleRoleBattery inheriting a base whose
+# __init__ is object.__init__, so ``BleRoleBattery(config)`` raised
+# "object.__init__() takes exactly one argument" — but only when that
+# module happened to be imported first, which made it an alphabetical
+# accident rather than a reproducible failure.  Modules that want the
+# stub now find it already present and leave it alone.
+if "ble_role" not in sys.modules:
+    sys.modules["ble_role"] = types.ModuleType("ble_role")
+if not hasattr(sys.modules["ble_role"], "BleRole"):
+    class _BleRoleBase:
+        # Accepts the config argument the real base takes; roles call
+        # super().__init__(config) unconditionally.
+        def __init__(self, config: dict = None):
+            self.config = config
+            self.info: dict = {}
+
+    sys.modules["ble_role"].BleRole = _BleRoleBase
+
 # orion_tr_gatt provides AsyncGATTWriter — replace with a stub that
 # tests can introspect for write_register calls.
 if "orion_tr_gatt" not in sys.modules:

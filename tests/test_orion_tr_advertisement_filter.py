@@ -51,7 +51,12 @@ def orion_module():
         "DEVICE_CLASSES": {},
         "info": {},
     })
-    sys.modules["ble_role"].BleRole = type("BleRole", (), {})
+    # conftest installs the canonical BleRole stub (one that accepts the
+    # config argument roles pass to super().__init__).  Only fill in if
+    # something has not already provided one — overwriting it here used
+    # to break every later test that instantiates a role.
+    if not hasattr(sys.modules["ble_role"], "BleRole"):
+        sys.modules["ble_role"].BleRole = type("BleRole", (), {})
     sys.modules["dbus_role_service"].DbusRoleService = type(
         "DbusRoleService", (), {})
     sys.modules["dbus_ble_service"].DbusBleService = type(

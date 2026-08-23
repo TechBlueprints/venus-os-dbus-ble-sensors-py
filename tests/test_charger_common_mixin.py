@@ -232,7 +232,11 @@ def test_publish_history_skips_charged_ah_settings_flush_too(
     """The persisted settings entry for ChargedAh must also be skipped
     when the device hasn't seen current — otherwise we'd persist a
     bogus 0 that survives a service restart."""
-    subject._history_last_flush = 0.0  # force flush window
+    # Force the flush window open.  Not 0.0: time.monotonic() is
+    # seconds-since-boot on Linux but starts near zero on macOS, so
+    # a literal 0.0 only clears the 60 s window on a host that has
+    # been up a while.  Same idiom as the sibling test below.
+    subject._history_last_flush = time.monotonic() - 61.0
     subject._tick_history(state=3, current_a=None)
     subject._publish_history(fake_role)
     op_path = "/Settings/Devices/test_aabbccddeeff/History/OperationTime"
