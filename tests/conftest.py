@@ -40,7 +40,26 @@ if "dbus" not in sys.modules:
     dbus.SessionBus = lambda: None
     dbus.Interface = lambda *a, **kw: None
     dbus.DBusException = Exception
+
+    # dbus.service, so modules that define a BlueZ agent (ble_gatt_dbus,
+    # and anything importing it) can be imported under the stubs.  The
+    # agent is never dispatched in tests; it only has to build.
+    dbus_service = types.ModuleType("dbus.service")
+
+    class _StubServiceObject:
+        def __init__(self, *a, **kw):
+            pass
+
+    def _stub_method(*_a, **_kw):
+        def decorate(fn):
+            return fn
+        return decorate
+
+    dbus_service.Object = _StubServiceObject
+    dbus_service.method = _stub_method
+    dbus.service = dbus_service
     sys.modules["dbus"] = dbus
+    sys.modules["dbus.service"] = dbus_service
 
 if "gi" not in sys.modules:
     gi = types.ModuleType("gi")

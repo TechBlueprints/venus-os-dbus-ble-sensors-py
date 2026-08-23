@@ -46,8 +46,49 @@ _SCAN_VREGS = _LIVE_VREGS + (
 )
 
 _RECONNECT_S = 5.0
+
+# How often an ongoing "device is not answering" condition may be logged,
+# per MAC.  A sensor that is switched off or out of range fails on every
+# reconnect for as long as it stays away, and a full traceback each time
+# writes tens of KB a minute onto the eMMC (measured on prod: ~700 B/s,
+# roughly 57 MiB/day, with multilog rotating every ~20s).  The condition
+# still needs to be visible, so log it once, then once every quarter hour
+# with a count of what was suppressed.
+_UNREACHABLE_LOG_INTERVAL_S = 900.0
+
 _started: set[str] = set()
 _callbacks: dict[str, Callable[[dict], None]] = {}
+# mac -> (last logged monotonic, suppressed count, last message)
+_unreachable_state: dict[str, tuple[float, int, str]] = {}
+
+
+def _note_unreachable(mac: str, exc: BaseException) -> None:
+    """Log an expected "not answering" failure, at most once per window.
+
+    Deliberately one line and no traceback: the stack is identical every
+    time and says nothing the message does not.
+    """
+    message = str(exc) or type(exc).__name__
+    now = time.monotonic()
+    last, suppressed, previous = _unreachable_state.get(mac, (0.0, 0, ""))
+    # Log immediately when the condition is new or its message changed —
+    # a different error is different news.
+    if message == previous and (now - last) < _UNREACHABLE_LOG_INTERVAL_S:
+        _unreachable_state[mac] = (last, suppressed + 1, previous)
+        logger.debug("SmartShunt HEX %s still unreachable: %s", mac, message)
+        return
+    if suppressed:
+        logger.warning(
+            "SmartShunt HEX %s unreachable: %s (%d further attempt(s) "
+            "since the last report)", mac, message, suppressed)
+    else:
+        logger.warning("SmartShunt HEX %s unreachable: %s", mac, message)
+    _unreachable_state[mac] = (now, 0, message)
+
+
+def _note_reachable(mac: str) -> None:
+    """Forget the suppression state once a session succeeds."""
+    _unreachable_state.pop(mac, None)
 
 
 class _Collector:
@@ -332,8 +373,18 @@ async def _run_forever(mac: str, passkey: int,
                 return
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("SmartShunt HEX session dropped for %s", mac)
+        except Exception as exc:
+            # A device that is off, out of range, or not near an adapter
+            # we may scan on fails identically on every reconnect.  That
+            # is an expected steady state, not a fault worth a stack per
+            # attempt — see _note_unreachable.  Anything else keeps its
+            # traceback, because anything else is a bug.
+            if ble_gatt_link.unreachable(exc):
+                _note_unreachable(mac, exc)
+            else:
+                logger.exception("SmartShunt HEX session dropped for %s", mac)
+        else:
+            _note_reachable(mac)
         await asyncio.sleep(_RECONNECT_S)
 
 

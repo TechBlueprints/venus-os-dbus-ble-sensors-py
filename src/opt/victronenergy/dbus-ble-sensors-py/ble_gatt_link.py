@@ -112,6 +112,27 @@ class DeviceNotFound(Exception):
     """Raised when a device can be neither looked up nor discovered."""
 
 
+def unreachable(exc: BaseException) -> bool:
+    """Whether *exc* just means "the device is not answering right now".
+
+    Callers retry these on a timer, so they are an expected steady state
+    for a sensor that is switched off, out of range, or simply not near
+    an adapter we are allowed to use — not a fault to be reported with a
+    stack trace on every attempt.  Anything else is a real bug and should
+    keep its traceback.
+
+    bleak's own error for this is raised from several layers, so match on
+    the type names rather than importing them: BleakNotFoundError comes
+    from bleak-retry-connector, BleakDeviceNotFoundError from bleak, and
+    :class:`DeviceNotFound` from our own resolution step.
+    """
+    if isinstance(exc, DeviceNotFound):
+        return True
+    chain = (exc, exc.__cause__, exc.__context__)
+    names = {type(link).__name__ for link in chain if link is not None}
+    return bool(names & {"BleakNotFoundError", "BleakDeviceNotFoundError"})
+
+
 async def connect(device, name: str | None = None):
     """Connect to *device* through bcmv2, with retry semantics.
 
