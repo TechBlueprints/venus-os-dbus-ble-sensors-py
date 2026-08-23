@@ -93,6 +93,14 @@ CANDIDATES = {
         0xEDF3, 0xEDF4, 0xEDF5, 0xEDFA, 0xEDFB, 0xEDFC, 0xEDFD,
         0xEDFE, 0xEDFF,
     ],
+    # SmartShunt / BMV live + identity + Instant Readout key.
+    "smartshunt": [
+        0x0100, 0x0102, 0x010A, 0x010B, 0x010C, 0x0140, 0x0150,
+        0x0FFE, 0x0FFF, 0x1000,
+        0xED8C, 0xED8D, 0xED8F,
+        0xEEFF, 0xEEB0, 0xEEB1, 0xEEB2, 0xEEB3, 0xEEB4, 0xEEB5,
+        0xEEB7, 0xEEB8, 0xEC65, 0xEC66, 0xEC7D, 0xEE00, 0x0300, 0x034F,
+    ],
 }
 
 # --- BLE plumbing -----------------------------------------------------------
@@ -326,7 +334,7 @@ def main():
                    help="Inclusive 0xAAAA-0xBBBB or single 0xAAAA")
     p.add_argument("--candidates", choices=sorted(CANDIDATES.keys()),
                    help="Use a named candidate set "
-                        "(core / current / function / ip22-optional)")
+                        "(core / current / function / ip22-optional / smartshunt)")
     p.add_argument("--write-sentinel", action="store_true",
                    help="Use 1-byte SetValue instead of GetValue.  Returns "
                         "code 2 for registers that exist but didn't accept "

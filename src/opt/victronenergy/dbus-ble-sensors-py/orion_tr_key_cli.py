@@ -41,10 +41,14 @@ Protocol notes, all of them hard-won on real hardware:
 * **Prime before asking.**  A GetValue sent as the very first CBOR request
   is sometimes swallowed before the device has established its outgoing
   stream, so a plain subscribe to a chatty public register goes first.
-* **0xEC65 wants the privileged opcode.**  Plain GetValue (0x05) returns
-  RequestedEncryptionNotSupported; 0x25 is the variant that works, and on
-  firmwares that still refuse it we fall back to full PUK + PIN auth and
-  retry once.
+* **Official key fetch is GetDevices, then instance-0 GetValues.**  The
+  HEX client asks for the device list (opcode ``0x01``), subscribes
+  instance ``0``, then GetValues ``0x05`` for ``[0xEC66, 0xEC65]`` in
+  one request.  It never sends opcode ``0x25``.
+* **0x25 is an Orion fallback only.**  Some charger firmwares ACK plain
+  GetValue with RequestedEncryptionNotSupported; ``0x05 | 0x20`` still
+  works there.  After PUK+PIN we retry the official batch, then ``0x25``,
+  then a lone ``0x05``, then the ASCII HEX Get.
 """
 from __future__ import annotations
 
@@ -78,8 +82,12 @@ _CTRL_CREDITS = bytes([vreg.OPCODE_READY_TO_RECV, 0x80])
 VREG_TEMPERATURE = 0xEDDB
 _PRIME = bytes([0x03, 0x00, 0x9F, 0x19, 0xED, 0xDB, 0xFF])
 
-# GetValue 0xEC65, privileged opcode.
+# Official key fetch: GetValues instance 0 for MAC + advertisement key.
+# 0x25 remains an Orion-only fallback when 0x05 is refused.
+_GET_KEY_OFFICIAL = vreg.encode_read_commands(
+    [vreg.VREG_BLE_MAC_ADDRESS, vreg.VREG_ADVERTISEMENT_KEY])
 _GET_KEY = bytes([0x25, 0x00, 0x9F, 0x19, 0xEC, 0x65, 0xFF])
+_SUBSCRIBE_INSTANCE0 = vreg.encode_subscribe_instance(0)
 
 VREG_FIRMWARE = 0x0140
 VREG_PRODUCT_ID = 0x0100
@@ -247,39 +255,157 @@ async def _puk_pin_auth(client, collector: _Collector, passkey: int) -> None:
         _err(f"PIN step failed (non-fatal): {exc}")
 
 
+def _scan_hex_key(frames) -> bytes | None:
+    """Pull a 16-byte key out of a VE.Direct HEX ``:8...`` reply."""
+    joined = b"".join(frames)
+    text = joined.decode("ascii", errors="ignore")
+    cbor = vreg.scan_for_key(frames)
+    if cbor is not None:
+        return cbor
+    # ``:8 <id_lo> <id_hi> <flags> <32 hex chars of key> <cs>``
+    marker = "8" + "65EC"
+    idx = text.upper().find(marker)
+    if idx >= 0:
+        rest = text[idx + len(marker):]
+        # skip optional 2-hex flags, then take 32 hex digits
+        hexdigits = "".join(c for c in rest if c in "0123456789abcdefABCDEF")
+        if len(hexdigits) >= 34:
+            blob = hexdigits[2:34]
+            try:
+                raw = bytes.fromhex(blob)
+            except ValueError:
+                raw = b""
+            if len(raw) == 16:
+                return raw
+        if len(hexdigits) >= 32:
+            try:
+                raw = bytes.fromhex(hexdigits[:32])
+            except ValueError:
+                raw = b""
+            if len(raw) == 16:
+                return raw
+    return None
+
+
+async def _ask_key(client, collector: _Collector, request: bytes,
+                   label: str, window: float) -> bytes | None:
+    collector.reset()
+    _err(f"Get 0xEC65 ({label}): {request.hex() if request[:1] != b':' else request!r}")
+    await client.write_gatt_char(vreg.CHAR_DATA_LAST, request, response=False)
+    deadline = time.monotonic() + window
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+        key = _scan_hex_key(collector.frames)
+        if key is not None:
+            _err(f"Recovered key: {len(key)}B")
+            return key
+        await _credits(client)
+    return None
+
+
+def _parse_device_list_instances(frames) -> list[int]:
+    """Instances from a GetDevices Push ``02 9F <uints...> FF``.
+
+    Wire we see is a flat uint list in pairs ``(instance, extra)``.
+    """
+    joined = b"".join(frames)
+    start = joined.find(b"\x02\x9f")
+    if start < 0:
+        return [0]
+    body = joined[start + 2:]
+    end = body.find(b"\xff")
+    if end < 0:
+        return [0]
+    vals = []
+    i = 0
+    data = body[:end]
+    while i < len(data):
+        if data[i] < 24:
+            vals.append(data[i])
+            i += 1
+        else:
+            break
+    instances = vals[0::2] or [0]
+    _err(f"GetDevices instances: {instances} (raw {data.hex()})")
+    return instances
+
+
+async def _official_key_preamble(client, collector: _Collector) -> None:
+    """GetDevices, then subscribe every instance the list returned."""
+    collector.reset()
+    devices = vreg.encode_get_devices()
+    _err(f"GetDevices: {devices.hex()}")
+    await client.write_gatt_char(vreg.CHAR_DATA_LAST, devices, response=False)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.4)
+        await _credits(client)
+    instances = _parse_device_list_instances(collector.frames)
+    for inst in instances:
+        req = vreg.encode_subscribe_instance(inst)
+        _err(f"Subscribe instance {inst}: {req.hex()}")
+        await client.write_gatt_char(vreg.CHAR_DATA_LAST, req, response=False)
+        await asyncio.sleep(0.5)
+        await _credits(client)
+    return instances
+
+
 async def _read_key(client, collector: _Collector, passkey: int,
                     timeout_s: float) -> bytes:
-    """Fetch VREG 0xEC65, falling back to authenticated access."""
-    for phase in ("fast", "authed"):
-        collector.reset()
-        _err(f"GetValue 0xEC65 ({phase}, opcode 0x25): {_GET_KEY.hex()}")
-        await client.write_gatt_char(vreg.CHAR_DATA_LAST, _GET_KEY,
-                                     response=False)
-        window = _FAST_PHASE_S if phase == "fast" else min(timeout_s, 15.0)
-        deadline = time.monotonic() + window
-        refused = False
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.5)
-            key = vreg.scan_for_key(collector.frames)
-            if key is not None:
-                _err(f"Recovered key: {len(key)}B")
-                return key
-            if _refused_encryption(collector.frames):
-                refused = True
-                _err("Device refused with encryption error — "
-                     "falling back to PUK+PIN auth")
-                break
-            await _credits(client)
-        if phase == "fast" and refused:
-            await _puk_pin_auth(client, collector, passkey)
-            # The session may have reset under us: redo the handshake and
-            # the prime before asking again.
-            await _handshake(client)
-            await client.write_gatt_char(vreg.CHAR_DATA_LAST, _PRIME,
-                                         response=False)
-            await asyncio.sleep(1.5)
-            continue
-        break
+    """Fetch VREG 0xEC65 the way the official HEX client does, then fall back.
+
+    Lead with GetDevices + subscribe of every listed instance, then
+    GetValues ``[0xEC66, 0xEC65]`` (opcode ``0x05``).  Some Orion
+    firmwares still need ``0x25`` after PUK+PIN; that stays a fallback.
+    """
+    instances = await _official_key_preamble(client, collector)
+    voltage = vreg.encode_read_command(0xED8D)
+    await _ask_key(client, collector, voltage, "voltage 0xED8D", 4.0)
+    for inst in instances:
+        batch = vreg.encode_read_commands(
+            [vreg.VREG_BLE_MAC_ADDRESS, vreg.VREG_ADVERTISEMENT_KEY],
+            instance=inst)
+        key = await _ask_key(
+            client, collector, batch,
+            f"0x05 [EC66,EC65] inst {inst}", 8.0)
+        if key is not None:
+            return key
+
+    key = await _ask_key(client, collector, _GET_KEY, "fast 0x25", 6.0)
+    if key is not None:
+        return key
+
+    refused = _refused_encryption(collector.frames)
+    _err("No key on per-instance 0x05 / fast 0x25"
+         + (" (encryption refused)" if refused else " (F7 / no EC65 push)")
+         + " — trying PUK+PIN")
+    try:
+        await _puk_pin_auth(client, collector, passkey)
+    except Exception as exc:
+        _err(f"PUK+PIN failed (continuing): {exc}")
+    await _handshake(client)
+    instances = await _official_key_preamble(client, collector)
+
+    authed_window = min(timeout_s, 12.0)
+    for inst in instances:
+        batch = vreg.encode_read_commands(
+            [vreg.VREG_BLE_MAC_ADDRESS, vreg.VREG_ADVERTISEMENT_KEY],
+            instance=inst)
+        key = await _ask_key(
+            client, collector, batch,
+            f"authed 0x05 [EC66,EC65] inst {inst}", authed_window)
+        if key is not None:
+            return key
+        priv = bytes([0x25, inst, 0x9F, 0x19, 0xEC, 0x65, 0xFF])
+        key = await _ask_key(
+            client, collector, priv, f"authed 0x25 inst {inst}", 6.0)
+        if key is not None:
+            return key
+
+    hex_cmd = vreg.encode_vedirect_hex_get(vreg.VREG_ADVERTISEMENT_KEY)
+    key = await _ask_key(client, collector, hex_cmd, "VE.Direct HEX", 8.0)
+    if key is not None:
+        return key
 
     raise RuntimeError(
         f"no 16-byte key in VREG 0xEC65 response "
@@ -424,6 +550,56 @@ async def provision(mac: str, passkey: int, timeout_s: float,
             pass
 
 
+async def telemetry(mac: str, passkey: int, timeout_s: float,
+                    preferred_adapter: str | None = None) -> dict:
+    """Short live-VREG session: voltage + state, then enable Instant Readout."""
+    bus = dbus.SystemBus()
+    _pre_disconnect(bus, mac)
+    path, props = ble_gatt_dbus.lookup_device(bus, mac,
+                                              prefer_adapter=preferred_adapter)
+    device = await ble_gatt_link.resolve(mac, path, props)
+    adapter = ble_gatt_dbus.adapter_from_path(
+        (getattr(device, "details", None) or {}).get("path"))
+    stop = asyncio.Event()
+    pump = asyncio.create_task(ble_gatt_dbus.pump_default_context(stop))
+    client = None
+    try:
+        client = await ble_gatt_link.connect(device, mac)
+        collector = _Collector()
+        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl)
+        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last)
+        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk)
+        await asyncio.sleep(0.4)
+        await _handshake(client)
+        await _prime(client, collector)
+        voltage = await _fetch_vreg(client, collector, 0xED8D, "voltage")
+        state = await _fetch_vreg(client, collector, 0x0201, "state")
+        try:
+            await client.write_gatt_char(
+                vreg.CHAR_DATA_LAST,
+                vreg.encode_write_command(
+                    vreg.VREG_BLE_ADVERTISEMENT_MODE, b"\x01"),
+                response=False)
+            _err("Set 0xEC7D = 01")
+            await asyncio.sleep(0.5)
+            await _credits(client)
+        except Exception as exc:
+            _err(f"0xEC7D write failed (non-fatal): {exc}")
+        return {
+            "voltage": voltage,
+            "device_state": state,
+            "adapter": adapter,
+        }
+    finally:
+        if client is not None:
+            await ble_gatt_link.disconnect(client)
+        stop.set()
+        try:
+            await pump
+        except asyncio.CancelledError:
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("mac")
@@ -431,6 +607,8 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=40.0)
     ap.add_argument("--preferred-adapter", default=None,
                     help="Try this adapter first (e.g. hci1)")
+    ap.add_argument("--telemetry", action="store_true",
+                    help="Read live voltage/state and enable Instant Readout")
     args = ap.parse_args()
 
     mac = args.mac.upper()
@@ -443,14 +621,16 @@ def main() -> int:
              "(run 'git submodule update --init --recursive')")
         return 1
 
+    work = telemetry if args.telemetry else provision
+    label = "telemetry" if args.telemetry else "key provisioning"
     try:
         result = asyncio.run(
             asyncio.wait_for(
-                provision(mac, args.passkey, args.timeout,
-                          preferred_adapter=args.preferred_adapter),
+                work(mac, args.passkey, args.timeout,
+                     preferred_adapter=args.preferred_adapter),
                 timeout=args.timeout + 30.0))
     except Exception as exc:
-        _err(f"key provisioning failed: {exc}")
+        _err(f"{label} failed: {exc}")
         return 1
 
     sys.stdout.write(json.dumps(result) + "\n")

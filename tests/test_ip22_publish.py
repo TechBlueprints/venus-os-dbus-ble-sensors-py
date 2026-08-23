@@ -242,6 +242,9 @@ def _make_device(ip22_module):
     device._plog = "test:ip22"   # used in mixin debug logging on KeyError
     # ChargerCommonMixin state — call _init_charger_common to set up.
     device._init_charger_common()
+    device._init_hex_telemetry()
+    device._pairing_passkey = 14916
+    device._adv_key_hex = "4cbc36dbd1e9c61b0c626a7a1180d3dc"
     return device
 
 def test_publish_off_state_writes_none_for_dc_paths(ip22_module):
@@ -372,3 +375,47 @@ def test_publish_running_telemetry_sets_dc_paths(ip22_module):
     assert role.values["/Dc/0/Current"] == 15.0
     assert role.values["/Dc/0/Power"] == round(14.7 * 15.0, 2)
     assert role.values["/State"] == 4
+
+
+def test_publish_hex_telemetry_sets_voltage_under_dvcc(ip22_module):
+    device = _make_device(ip22_module)
+    role = device._role_services["charger"]
+    device._dvcc_engaged = True
+    device._publish_hex_telemetry({
+        0xED8D: bytes([0x79, 0x05]),
+        0x0201: b"\x00",
+    })
+    assert role.values["/Dc/0/Voltage"] == 14.01
+    assert role.values["/State"] == 252
+    assert device._last_full_telemetry_at > 0
+    assert device._last_hex_telemetry_at > 0
+
+
+def test_short_beacon_does_not_clear_voltage_while_hex_inflight(ip22_module):
+    device = _make_device(ip22_module)
+    role = device._role_services["charger"]
+    role.values["/Dc/0/Voltage"] = 14.01
+    device._hex_telemetry_busy = True
+    device.handle_manufacturer_data(b"\x10\x00\x30\xa3")
+    assert role.values["/Dc/0/Voltage"] == 14.01
+
+
+def test_short_beacon_keeps_voltage_when_dvcc_engaged(ip22_module):
+    device = _make_device(ip22_module)
+    role = device._role_services["charger"]
+    role.values["/Dc/0/Voltage"] = 14.4
+    device._dvcc_engaged = True
+    device.handle_manufacturer_data(b"\x10\x00\x30\xa3")
+    assert role.values["/Dc/0/Voltage"] == 14.4
+
+
+def test_apply_telemetry_payload_publishes_voltage(ip22_module):
+    device = _make_device(ip22_module)
+    device._dvcc_engaged = True
+    device._apply_telemetry_payload({
+        "voltage": "7905",
+        "device_state": "00",
+    })
+    assert device._role_services["charger"].values["/Dc/0/Voltage"] == 14.01
+    assert device._role_services["charger"].values["/State"] == 252
+    assert device._instant_readout_enabled is True

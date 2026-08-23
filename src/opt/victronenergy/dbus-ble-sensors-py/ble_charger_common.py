@@ -400,13 +400,20 @@ class ChargerCommonMixin:
                             "%s: pending-write completion callback failed",
                             self._plog)
             finally:
-                self._schedule_drain()
+                if self._pending_writes:
+                    self._schedule_drain()
+                else:
+                    self._on_gatt_queue_idle()
 
         writer.write_register(
             mac, self._pairing_passkey,
             vreg, value_bytes,
             on_done=on_done,
         )
+
+    def _on_gatt_queue_idle(self) -> None:
+        """Called when the last queued VREG write has settled."""
+        return
 
     def _schedule_drain(self) -> None:
         if self._pending_drain_scheduled or not self._pending_writes:

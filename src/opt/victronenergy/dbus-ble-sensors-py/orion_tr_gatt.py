@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Callable, Optional
 
 import dbus
@@ -68,6 +69,137 @@ async def _perform_write(address: str, path: Optional[str],
             logger.info("%s: pairing", address)
             await client.pair()
         await victron_vreg.write_register(client, register_id, value_bytes)
+    finally:
+        await ble_gatt_link.disconnect(client)
+
+
+class _ReadCollector:
+    """Assemble DATA_BULK + DATA_LAST into complete HEX frames."""
+
+    def __init__(self) -> None:
+        self.frames: list[bytes] = []
+        self._bulk = bytearray()
+        self.f7_n = 0x80
+
+    def on_last(self, _char, data) -> None:
+        self.frames.append(bytes(self._bulk) + bytes(data))
+        self._bulk.clear()
+
+    def on_bulk(self, _char, data) -> None:
+        self._bulk.extend(data)
+
+    def on_ctrl(self, _char, data) -> None:
+        raw = bytes(data)
+        if raw[:1] == b"\xf7" and len(raw) >= 3:
+            self.f7_n = int.from_bytes(raw[1:3], "little") or 0x80
+
+
+async def _start_notify(client, char, callback) -> None:
+    try:
+        await client.start_notify(char, callback,
+                                  bluez={"use_start_notify": False})
+        return
+    except Exception:
+        pass
+    try:
+        await client.start_notify(char, callback)
+    except Exception:
+        logger.warning("HEX notify failed on %s", char)
+
+
+def _push_payload(frames: list[bytes], register_id: int) -> Optional[bytes]:
+    """Walk assembled HEX frames for a Push of *register_id*."""
+    for frame in frames:
+        parsed = victron_vreg.parse_push_frame(frame)
+        if parsed is None:
+            continue
+        _inst, vreg_id, payload = parsed
+        if vreg_id == register_id and payload:
+            return payload
+    return None
+
+
+async def _credits(client, n: int = 0x80) -> None:
+    try:
+        await client.write_gatt_char(
+            victron_vreg.CHAR_CONTROL,
+            bytes([victron_vreg.OPCODE_READY_TO_RECV, n & 0xFF]),
+            response=False)
+    except Exception:
+        pass
+
+
+async def _perform_read(address: str, path: Optional[str],
+                        props: Optional[dict], register_ids: list[int],
+                        extra_writes: list[tuple[int, bytes]],
+                        pair: bool) -> dict[int, bytes]:
+    """Resolve → connect → GetValue (and optional SetValue) → disconnect."""
+    device = await ble_gatt_link.resolve(address, path, props)
+    client = await ble_gatt_link.connect(device, address)
+    values: dict[int, bytes] = {}
+    try:
+        if pair:
+            logger.info("%s: pairing", address)
+            await client.pair()
+        collector = _ReadCollector()
+        await _start_notify(client, victron_vreg.CHAR_CONTROL,
+                            collector.on_ctrl)
+        await _start_notify(client, victron_vreg.CHAR_DATA_LAST,
+                            collector.on_last)
+        await _start_notify(client, victron_vreg.CHAR_DATA_BULK,
+                            collector.on_bulk)
+        # CTRL read switches the peripheral into CBOR mode.
+        try:
+            await client.read_gatt_char(victron_vreg.CHAR_CONTROL)
+        except Exception:
+            pass
+        await client.write_gatt_char(
+            victron_vreg.CHAR_CONTROL, b"\xFA\x80\xFF", response=False)
+        await asyncio.sleep(victron_vreg.HANDSHAKE_SETTLE_S)
+        await _credits(client, 0x80)
+        await asyncio.sleep(victron_vreg.HANDSHAKE_SETTLE_S)
+        # A GetValue as the first CBOR request is often swallowed.
+        # Subscribe the public temperature register to open the Push
+        # stream — not instance 0, which floods the IP22.
+        await client.write_gatt_char(
+            victron_vreg.CHAR_DATA_LAST,
+            bytes([0x03, 0x00, 0x9F, 0x19, 0xED, 0xDB, 0xFF]),
+            response=False)
+        await asyncio.sleep(0.8)
+        await _credits(client, collector.f7_n)
+
+        # Read first.  A SetValue (Instant Readout enable) can flood
+        # the tunnel and starve the GetValue Push we actually need.
+        for register_id in register_ids:
+            await client.write_gatt_char(
+                victron_vreg.CHAR_DATA_LAST,
+                victron_vreg.encode_read_command(register_id),
+                response=False)
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.3)
+                raw = victron_vreg.scan_for_vreg(collector.frames, register_id)
+                if raw is None:
+                    raw = _push_payload(collector.frames, register_id)
+                if raw is not None:
+                    values[register_id] = raw
+                    break
+                await _credits(client, collector.f7_n)
+
+        for register_id, value_bytes in extra_writes:
+            await client.write_gatt_char(
+                victron_vreg.CHAR_DATA_LAST,
+                victron_vreg.encode_write_command(register_id, value_bytes),
+                response=False)
+            logger.info("%s: HEX write 0x%04X = %s",
+                        address, register_id, value_bytes.hex())
+            await asyncio.sleep(0.4)
+            await _credits(client, collector.f7_n)
+
+        if not values:
+            logger.info("%s: HEX read saw %d frames, no live VREGs",
+                        address, len(collector.frames))
+        return values
     finally:
         await ble_gatt_link.disconnect(client)
 
@@ -148,6 +280,77 @@ class AsyncGATTWriter:
             logger.error("%s: could not schedule GATT write 0x%04X",
                          mac, register_id)
             self._finish(on_done, False)
+
+    def read_registers(self, mac: str, passkey: int,
+                       register_ids: list[int],
+                       extra_writes: Optional[list[tuple[int, bytes]]] = None,
+                       on_done: Optional[Callable] = None):
+        """Short HEX GetValue session.  ``on_done(success, values)``.
+
+        ``extra_writes`` is a list of ``(register_id, value_bytes)`` applied
+        before the reads — used to turn Instant Readout on (``0xEC7D=1``)
+        without a second connect.  The slot is the same one as
+        :meth:`write_register`, so a DVCC setpoint and a telemetry poll
+        never overlap.
+        """
+        if self._busy:
+            logger.warning("GATT writer busy, rejecting read for %s", mac)
+            if on_done:
+                on_done(False, {})
+            return
+
+        mac = mac.upper()
+        self._busy = True
+        writes = list(extra_writes or [])
+
+        if not ble_async_loop.start():
+            logger.error("%s: BLE connection stack unavailable — cannot "
+                         "read VREGs", mac)
+            self._finish_read(on_done, False, {})
+            return
+
+        path, props = ble_gatt_dbus.lookup_device(self._bus, mac)
+        needs_pair = not (props or {}).get("Paired")
+        if needs_pair:
+            self._agent = ble_gatt_dbus.PairingAgent(self._bus, passkey, mac)
+            self._agent.register()
+
+        logger.info("HEX read starting for %s: regs=%s writes=%s",
+                    mac, [f"0x{r:04X}" for r in register_ids],
+                    [f"0x{r:04X}" for r, _v in writes])
+
+        def make_coro():
+            return asyncio.wait_for(
+                _perform_read(mac, path, props, list(register_ids),
+                              writes, needs_pair),
+                timeout=OPERATION_TIMEOUT_S)
+
+        def settled(result, error):
+            if error is not None:
+                if isinstance(error, asyncio.TimeoutError):
+                    logger.error("%s: HEX read timed out after %.0fs",
+                                 mac, OPERATION_TIMEOUT_S)
+                else:
+                    logger.error("%s: HEX read failed: %s", mac, error)
+                self._finish_read(on_done, False, {})
+                return
+            self._finish_read(on_done, True, result or {})
+
+        if not ble_async_loop.submit(make_coro, settled):
+            logger.error("%s: could not schedule HEX read", mac)
+            self._finish_read(on_done, False, {})
+
+    def _finish_read(self, on_done: Optional[Callable], success: bool,
+                     values: dict) -> None:
+        if self._agent is not None:
+            self._agent.unregister()
+            self._agent = None
+        self._busy = False
+        if on_done is not None:
+            try:
+                on_done(success, values)
+            except Exception:
+                logger.exception("HEX read completion callback raised")
 
     def _finish(self, on_done: Optional[Callable], success: bool) -> None:
         """Release the slot and the agent, then report to the caller."""

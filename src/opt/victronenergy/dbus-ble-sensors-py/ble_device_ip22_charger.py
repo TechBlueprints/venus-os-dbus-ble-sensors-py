@@ -41,6 +41,7 @@ from victron_ble.exceptions import (  # type: ignore
 
 from orion_tr_gatt import AsyncGATTWriter
 from orion_tr_pin import resolve_pairing_passkey
+import victron_vreg as vreg
 from ip22_key_settings import (
     advertisement_key_setting_path,
     get_advertisement_key,
@@ -82,6 +83,15 @@ VREG_BATTERY_MAX_CURRENT = 0xEDF0   # u16 LE, 0.1 A
 VREG_BATTERY_TYPE        = 0xEDF1   # u8;  0xFF = USER (unlocks voltage writes)
 VREG_FLOAT_VOLTAGE       = 0xEDF6   # u16 LE, 0.01 V
 VREG_ABSORPTION_VOLTAGE  = 0xEDF7   # u16 LE, 0.01 V
+VREG_ADVERTISEMENT_MODE  = vreg.VREG_BLE_ADVERTISEMENT_MODE
+VREG_DEVICE_STATE        = vreg.VREG_DEVICE_STATE
+VREG_OUTPUT_VOLTAGE      = vreg.VREG_OUTPUT_VOLTAGE
+
+# HEX live reads when Instant Readout ads are only the 4-byte beacon
+# (standby / 0 A DVCC limit).  Same GetValue path the IP22 already
+# answers for 0xED8D.
+_HEX_LIVE_REGS = (VREG_OUTPUT_VOLTAGE, VREG_DEVICE_STATE)
+_HEX_TELEMETRY_BACKOFF_S = 45.0
 
 # Optional charge-profile VREGs that the standard Victron solar /
 # Phoenix Smart layout puts in this range — equalize voltage /
@@ -198,6 +208,47 @@ def _run_key_cli(mac: str, passkey: int,
     payload["key"] = key
     return payload
 
+
+def _run_telemetry_cli(mac: str, passkey: int,
+                       timeout_s: float = 35.0) -> Optional[Dict[str, Any]]:
+    """Same HEX client as key provision, but only live VREGs + 0xEC7D."""
+    cmd = [
+        "python3", _KEY_CLI_PATH,
+        mac,
+        "--passkey", str(passkey),
+        "--timeout", str(int(timeout_s)),
+        "--telemetry",
+    ]
+    logger.info("Spawning IP22 telemetry subprocess: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s + 15.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("ip22 telemetry subprocess timed out for %s", mac)
+        return None
+    except Exception:
+        logger.exception("failed to spawn ip22 telemetry subprocess")
+        return None
+    if result.returncode != 0:
+        logger.warning("ip22 telemetry exited %d: %s",
+                       result.returncode, (result.stderr or "").strip())
+        return None
+    raw = (result.stdout or "").strip()
+    if raw:
+        raw = raw.splitlines()[-1]
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        logger.warning("ip22 telemetry non-JSON output: %r", raw)
+        return None
+    return payload
+
+
 def _format_firmware_version(raw_hex: Optional[str]) -> Optional[str]:
     if not raw_hex:
         return None
@@ -282,7 +333,19 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         # GATT queue / history / DVCC engagement / persistence-dedupe
         # state — all initialised by the shared mixin.
         self._init_charger_common()
+        self._init_hex_telemetry()
         super().__init__(dev_mac)
+
+    def _init_hex_telemetry(self) -> None:
+        self._last_hex_telemetry_at = 0.0
+        self._last_hex_attempt = 0.0
+        self._hex_telemetry_busy = False
+        self._hex_retry_scheduled = False
+        self._instant_readout_enabled = False
+
+    @staticmethod
+    def _gatt_writer() -> AsyncGATTWriter:
+        return _gatt()
 
     def configure(self, manufacturer_data: bytes):
         pid = struct.unpack("<H", manufacturer_data[2:4])[0]
@@ -330,6 +393,10 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                 current = role_service["/CustomName"]
                 if not current:
                     self._publish_value(role_service, "/CustomName", adv_name)
+        # Short beacons are byte-identical, so the tap dedupes them for
+        # minutes.  A one-shot after the startup DVCC burst still gets
+        # a HEX voltage if Instant Readout never comes back.
+        GLib.timeout_add_seconds(50, self._hex_retry_tick)
 
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
         return self.matches_manufacturer_data(manufacturer_data)
@@ -372,17 +439,23 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             return
 
         # Short "off" frame: just the product-id prefix, no encrypted
-        # payload.  Some IP22 firmwares interleave short beacons with full
-        # telemetry advertisements as a power-saving feature even while the
-        # charger is running, so do not treat a short frame as authoritative
-        # off-state if a full telemetry frame arrived recently — let the
-        # most recent decoded telemetry stand.  Only honour the short frame
-        # as "off" once the IP22 has gone quiet for ``_OFF_FRAME_GRACE_S``.
+        # payload.  A BMS 0 A limit (or Instant Readout disabled via
+        # 0xEC7D) leaves the unit in this mode permanently — HEX GetValue
+        # still returns live voltage, so poll that instead of clearing
+        # /Dc/0/* after the grace window.
         if len(manufacturer_data) < 10:
             now = time.monotonic()
             last_full = getattr(self, "_last_full_telemetry_at", 0.0)
             if now - last_full >= self._OFF_FRAME_GRACE_S:
-                self._publish_off_state()
+                self._schedule_hex_retry()
+                last_hex = getattr(self, "_last_hex_telemetry_at", 0.0)
+                # A BMS 0 A limit leaves the charger on the short beacon
+                # while HEX/Instant Readout still have a live voltage —
+                # do not wipe /Dc/0/* as if the AC side were unplugged.
+                if (not self._dvcc_engaged
+                        and not self._hex_telemetry_busy
+                        and now - last_hex >= self._OFF_FRAME_GRACE_S):
+                    self._publish_off_state()
             return
 
         try:
@@ -408,6 +481,112 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         self._last_full_telemetry_at = time.monotonic()
         self._publish(parsed)
         self._maybe_daily_refresh()
+
+    def _maybe_hex_telemetry(self) -> bool:
+        """Start a short GetValue session when ads are only the 4-byte beacon.
+
+        Returns True when a session was started (or is already in flight)
+        so the caller can skip publishing off-state.
+        """
+        if self._hex_telemetry_busy:
+            return True
+        now = time.monotonic()
+        if (self._last_hex_attempt > 0
+                and now - self._last_hex_attempt < _HEX_TELEMETRY_BACKOFF_S):
+            return False
+        writer = self._gatt_writer()
+        if writer.busy:
+            self._schedule_hex_retry()
+            return True
+
+        self._last_hex_attempt = now
+        self._hex_telemetry_busy = True
+        mac = _format_mac_colons(self.info["dev_mac"])
+        logger.info("%s: HEX telemetry poll (Instant Readout ads are short)",
+                    self._plog)
+
+        def worker():
+            try:
+                with _provision_lock:
+                    payload = _run_telemetry_cli(mac, self._pairing_passkey)
+            except Exception:
+                logger.exception("%s: HEX telemetry subprocess failed",
+                                 self._plog)
+                payload = None
+
+            def deliver() -> bool:
+                self._hex_telemetry_busy = False
+                if payload:
+                    self._apply_telemetry_payload(payload)
+                else:
+                    logger.info("%s: HEX telemetry returned no live VREGs",
+                                self._plog)
+                return False
+
+            GLib.idle_add(deliver)
+
+        threading.Thread(
+            target=worker, name=f"ip22-hex-{mac}", daemon=True).start()
+        return True
+
+    def _apply_telemetry_payload(self, payload: Dict[str, Any]) -> None:
+        values: dict[int, bytes] = {}
+        for key, register_id in (
+                ("voltage", VREG_OUTPUT_VOLTAGE),
+                ("device_state", VREG_DEVICE_STATE),
+        ):
+            raw = payload.get(key)
+            if not raw:
+                continue
+            try:
+                blob = bytes.fromhex(str(raw).strip())
+            except ValueError:
+                continue
+            if blob:
+                values[register_id] = blob
+        self._instant_readout_enabled = True
+        if values:
+            self._publish_hex_telemetry(values)
+
+    def _hex_retry_tick(self) -> bool:
+        self._hex_retry_scheduled = False
+        try:
+            self._maybe_hex_telemetry()
+        except Exception:
+            logger.exception("%s: HEX telemetry retry failed", self._plog)
+        return False
+
+    def _schedule_hex_retry(self) -> None:
+        if self._hex_retry_scheduled:
+            return
+        self._hex_retry_scheduled = True
+        GLib.timeout_add(5000, self._hex_retry_tick)
+
+    def _on_gatt_queue_idle(self) -> None:
+        self._maybe_hex_telemetry()
+
+    def _publish_hex_telemetry(self, values: dict) -> None:
+        parsed = {
+            "device_state": 0,
+            "charger_error": 0,
+            "output_voltage1": None,
+            "output_voltage2": None,
+            "output_voltage3": None,
+            "output_current1": None,
+            "output_current2": None,
+            "output_current3": None,
+            "temperature": None,
+            "ac_current": None,
+            "model_name": self.info.get("product_name"),
+        }
+        for register_id, payload in values.items():
+            parsed.update(vreg.decode_ip22_vreg(int(register_id), payload))
+        if parsed.get("output_voltage1") is None:
+            return
+        now = time.monotonic()
+        self._last_hex_telemetry_at = now
+        self._last_full_telemetry_at = now
+        self._publish(parsed)
 
     @staticmethod
     def _decode_advertisement(key_hex: str, manufacturer_data: bytes):

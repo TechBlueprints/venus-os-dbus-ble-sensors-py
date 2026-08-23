@@ -56,6 +56,15 @@ if "gi" not in sys.modules:
             cls.scheduled.append((ms, fn))
             return 0
 
+        @classmethod
+        def timeout_add_seconds(cls, seconds, fn):
+            return cls.timeout_add(int(seconds) * 1000, fn)
+
+        @classmethod
+        def idle_add(cls, fn, *args):
+            cls.scheduled.append((0, fn))
+            return 0
+
     gi_repo.GLib = _GLibStub
     sys.modules["gi"] = gi
     sys.modules["gi.repository"] = gi_repo
@@ -83,6 +92,19 @@ if "orion_tr_gatt" not in sys.modules:
             # test wires .next_result = False.
             if on_done is not None:
                 on_done(getattr(self, "next_result", True))
+
+        def read_registers(self, mac, passkey, register_ids,
+                           extra_writes=None, on_done=None):
+            self.calls.append({
+                "mac": mac,
+                "passkey": passkey,
+                "register_ids": list(register_ids),
+                "extra_writes": list(extra_writes or []),
+                "on_done": on_done,
+            })
+            if on_done is not None:
+                on_done(getattr(self, "next_result", True),
+                        getattr(self, "next_read", {}))
 
     otg.AsyncGATTWriter = _StubAsyncGATTWriter
     sys.modules["orion_tr_gatt"] = otg

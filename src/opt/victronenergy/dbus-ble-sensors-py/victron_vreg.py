@@ -43,8 +43,19 @@ CHAR_PIN = "97580003-ddf1-48be-b73e-182664615d8e"
 OPCODE_CHUNK_SIZE = 0xFA
 OPCODE_READY_TO_RECV = 0xF9
 
-# The register holding the advertisement encryption key.
+# The register holding the advertisement encryption key, and the MAC
+# the official client fetches in the same GetValues.
 VREG_ADVERTISEMENT_KEY = 0xEC65
+VREG_BLE_MAC_ADDRESS = 0xEC66
+VREG_BLE_ADVERTISEMENT_MODE = 0xEC7D  # 1 = Instant Readout extra mfr data
+VREG_DEVICE_STATE = 0x0201
+VREG_OUTPUT_VOLTAGE = 0xED8D
+
+# HEX command opcodes (first CBOR uint of a DATA_LAST write).
+OPCODE_GET_DEVICES = 0x01
+OPCODE_SUBSCRIBE = 0x03
+OPCODE_GET_VALUE = 0x05
+OPCODE_SET_VALUE = 0x06
 
 # Flow-control payloads, as the Victron app sends them.
 _CHUNK_SIZE_VALUE = 0x14
@@ -70,8 +81,20 @@ def cbor_uint(n: int) -> bytes:
                   (n >> 8) & 0xFF, n & 0xFF])
 
 
-def cbor_array(items: list) -> bytes:
-    """Indefinite-length array — 0x9F … 0xFF, as the peripheral expects."""
+def cbor_array(items: list, definite: bool = False) -> bytes:
+    """CBOR array of already-encoded items.
+
+    IP22 / Orion want the indefinite form ``0x9F … 0xFF``.  SmartShunt
+    protocol header ``0004…`` rejects that (CTRL ``F7``) and answers
+    definite-length arrays instead.
+    """
+    if definite:
+        n = len(items)
+        if n < 24:
+            return bytes([0x80 | n]) + b"".join(items)
+        if n < 256:
+            return bytes([0x98, n]) + b"".join(items)
+        return bytes([0x99, (n >> 8) & 0xFF, n & 0xFF]) + b"".join(items)
     return bytes([0x9F]) + b"".join(items) + bytes([0xFF])
 
 
@@ -88,16 +111,47 @@ def encode_write_command(register_id: int, value_bytes: bytes) -> bytes:
             + cbor_array([cbor_uint(register_id), cbor_bstr(value_bytes)]))
 
 
-# GetValue.  0x05 is the plain variant; the advertisement-key register
-# needs the privileged 0x25 instead (see orion_tr_key_cli), which is why
-# this helper is not used for it.
-OPCODE_GET_VALUE = 0x05
+def encode_get_devices() -> bytes:
+    """CBOR GetDevices.  Official client sends this before any VREG read."""
+    return cbor_uint(OPCODE_GET_DEVICES)
 
 
-def encode_read_command(register_id: int) -> bytes:
-    """CBOR for "push the current value of *register_id*"."""
-    return (cbor_uint(OPCODE_GET_VALUE) + cbor_uint(0)
+def encode_subscribe_instance(instance: int = 0) -> bytes:
+    """CBOR Subscribe for a device-list instance (not a single VREG)."""
+    return cbor_uint(OPCODE_SUBSCRIBE) + cbor_uint(instance)
+
+
+def encode_subscribe_vreg(register_id: int, instance: int = 0) -> bytes:
+    """CBOR Subscribe one register on *instance*."""
+    return (cbor_uint(OPCODE_SUBSCRIBE) + cbor_uint(instance)
             + cbor_array([cbor_uint(register_id)]))
+
+
+def encode_read_command(register_id: int, instance: int = 0,
+                        definite: bool = False) -> bytes:
+    """CBOR GetValue for one register on *instance* (default the unit)."""
+    return encode_read_commands([register_id], instance, definite=definite)
+
+
+def encode_read_commands(register_ids: list[int], instance: int = 0,
+                         definite: bool = False) -> bytes:
+    """CBOR GetValues.  Official key fetch is instance 0, [0xEC66, 0xEC65]."""
+    return (cbor_uint(OPCODE_GET_VALUE) + cbor_uint(instance)
+            + cbor_array([cbor_uint(r) for r in register_ids],
+                         definite=definite))
+
+
+def encode_vedirect_hex_get(register_id: int) -> bytes:
+    """ASCII VE.Direct HEX Get (``:7<lo><hi><cs>\\n``).
+
+    Last-resort Get for a register (including ``0xEC65``) when a CBOR
+    session ACKs but never Pushes.  Prefer GetDevices + official
+    GetValues first; this is only a fallback.
+    """
+    lo = register_id & 0xFF
+    hi = (register_id >> 8) & 0xFF
+    checksum = (0x55 - (0x07 + lo + hi)) & 0xFF
+    return f":7{lo:02X}{hi:02X}{checksum:02X}\n".encode("ascii")
 
 
 def scan_for_vreg(blobs, vreg: int) -> bytes | None:
@@ -125,6 +179,116 @@ def scan_for_vreg(blobs, vreg: int) -> bytes | None:
             if start + length <= len(joined):
                 return joined[start:start + length]
         idx = after
+
+
+def _cbor_read_uint(data: bytes, i: int) -> tuple[int | None, int]:
+    if i >= len(data):
+        return None, i
+    b = data[i]
+    if b < 24:
+        return b, i + 1
+    if b == 0x18 and i + 2 <= len(data):
+        return data[i + 1], i + 2
+    if b == 0x19 and i + 3 <= len(data):
+        return (data[i + 1] << 8) | data[i + 2], i + 3
+    if b == 0x1A and i + 5 <= len(data):
+        return int.from_bytes(data[i + 1:i + 5], "big"), i + 5
+    return None, i
+
+
+def _cbor_read_bstr(data: bytes, i: int) -> tuple[bytes | None, int]:
+    if i >= len(data):
+        return None, i
+    b = data[i]
+    if 0x40 <= b <= 0x57:
+        n = b & 0x1F
+        end = i + 1 + n
+        if end <= len(data):
+            return data[i + 1:end], end
+    if b == 0x58 and i + 2 <= len(data):
+        n = data[i + 1]
+        end = i + 2 + n
+        if end <= len(data):
+            return data[i + 2:end], end
+    return None, i
+
+
+def parse_push_frame(frame: bytes) -> tuple[int, int, bytes] | None:
+    """Split a HEX Push (``08 <instance> <cbor vreg> <cbor payload>``)."""
+    if not frame or frame[0] != 0x08 or len(frame) < 3:
+        return None
+    instance = frame[1]
+    vreg, i = _cbor_read_uint(frame, 2)
+    if vreg is None:
+        return None
+    payload, _ = _cbor_read_bstr(frame, i)
+    if payload is not None:
+        return instance, vreg, payload
+    value, _ = _cbor_read_uint(frame, i)
+    if value is None:
+        return None
+    width = max(1, (value.bit_length() + 7) // 8)
+    return instance, vreg, value.to_bytes(width, "little")
+
+
+def le_sint(data: bytes) -> int:
+    return int.from_bytes(data, "little", signed=True)
+
+
+def le_uint(data: bytes) -> int:
+    return int.from_bytes(data, "little", signed=False)
+
+
+def decode_smartshunt_vreg(vreg_id: int, payload: bytes) -> dict:
+    """Map one SmartShunt Push payload to battery-path fields."""
+    out: dict = {}
+    if vreg_id == 0x0100 and payload:
+        out["product_id"] = le_uint(payload[:2]) if len(payload) >= 2 else le_uint(payload)
+    elif vreg_id == 0xED8D and len(payload) >= 2:
+        out["voltage"] = le_sint(payload[:2]) / 100.0
+    elif vreg_id == 0xED8C and len(payload) >= 4:
+        raw = le_sint(payload[:4])
+        if raw != 0x7FFFFFFF:
+            out["current"] = raw / 1000.0
+    elif vreg_id == 0xED8F and len(payload) >= 2:
+        out.setdefault("current", le_sint(payload[:2]) / 10.0)
+    elif vreg_id == 0x0FFF and len(payload) >= 2:
+        out["soc"] = le_uint(payload[:2]) / 100.0
+    elif vreg_id == 0x0FFE and len(payload) >= 2:
+        mins = le_uint(payload[:2])
+        if mins not in (0, 0xFFFF):
+            out["ttg_s"] = int(mins) * 60
+    elif vreg_id == 0xEEFF and len(payload) >= 4:
+        out["consumed_ah"] = le_sint(payload[:4]) / 10.0
+    elif vreg_id == 0x010A and payload:
+        try:
+            out["serial"] = payload.split(b"\x00", 1)[0].decode("ascii")
+        except UnicodeDecodeError:
+            pass
+    elif vreg_id == 0x010B and payload:
+        try:
+            out["model_name"] = payload.split(b"\x00", 1)[0].decode("ascii")
+        except UnicodeDecodeError:
+            pass
+    elif vreg_id == VREG_ADVERTISEMENT_KEY and len(payload) == 16:
+        out["advertisement_key"] = payload.hex()
+    elif vreg_id == 0x0140:
+        out["firmware"] = payload.hex()
+    if "voltage" in out and "current" in out:
+        out["power"] = round(out["voltage"] * out["current"], 2)
+    return out
+
+
+def decode_ip22_vreg(vreg_id: int, payload: bytes) -> dict:
+    """Map one IP22 Push payload to charger-path fields."""
+    out: dict = {}
+    if vreg_id == VREG_OUTPUT_VOLTAGE and len(payload) >= 2:
+        out["output_voltage1"] = le_sint(payload[:2]) / 100.0
+    elif vreg_id == VREG_DEVICE_STATE and payload:
+        out["device_state"] = payload[0]
+    elif vreg_id == VREG_BLE_ADVERTISEMENT_MODE and payload:
+        out["advertisement_mode"] = payload[0]
+    return out
 
 
 def scan_for_key(blobs) -> bytes | None:
