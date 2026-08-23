@@ -684,15 +684,22 @@ class DbusBleSensors(object):
                 dev_instance = self._known_mac[dev_mac]
 
             now = time.monotonic()
-            if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+            # One INFO line per device per quiet period; everything in
+            # between goes to debug.  A device advertises every second or
+            # two, so anything unconditional here is a log flood.
+            verbose = (now - self._last_adv_seen.get(dev_mac, 0)
+                       >= ADV_LOG_QUIET_PERIOD)
+            if verbose:
                 logging.info(f"{dev_mac}: received manufacturer data: {man_data!r}")
             else:
                 logging.debug(f"{dev_mac}: received manufacturer data: {man_data!r}")
             self._last_adv_seen[dev_mac] = now
             if dev_instance.check_manufacturer_data(man_data):
                 dev_instance.handle_manufacturer_data(man_data)
-            else:
+            elif verbose:
                 logging.info(f"{dev_mac}: ignoring manufacturer data due to data check")
+            else:
+                logging.debug(f"{dev_mac}: ignoring manufacturer data due to data check")
 
     def _glib_process_tap(self, adv: TappedAdvertisement):
         """GLib idle callback — bridges from tap thread to main thread."""
