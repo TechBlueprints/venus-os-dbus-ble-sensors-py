@@ -432,6 +432,39 @@ def add_device_to_accept_list(adapter_index: int, address_type: int,
         s.close()
 
 
+def accept_list_slices(adapter_keys, capacities, device_count):
+    """Contiguous accept-list slice per adapter, as {key: (offset, count)}.
+
+    A controller's accept list is a fixed-size hardware table — 25 and 32
+    entries on the two cards prod scans with — and adding past the end
+    silently fails.  Handing every adapter the same sorted list therefore
+    caps total coverage at the LARGEST single table, and because the list
+    is sorted by MAC the devices that fall off the end are always the same
+    ones: on prod, four sensors whose addresses begin with ``f`` went
+    unheard for exactly this reason while lower addresses kept working.
+
+    Giving each adapter a different slice makes the tables add up instead
+    of overlap: 25 + 32 covers 46 devices where 32 alone cannot.  Slices
+    are contiguous and assigned in *adapter_keys* order so a device stays
+    on the same card across re-applies, which matters because changing
+    which card watches a device loses it for one scan cycle.
+
+    A capacity of None means "unknown" — the caller falls back to giving
+    that adapter everything, which is the historical behaviour.
+    """
+    slices = {}
+    offset = 0
+    for key in adapter_keys:
+        capacity = capacities.get(key)
+        if capacity is None:
+            slices[key] = None
+            continue
+        take = max(0, min(int(capacity), device_count - offset))
+        slices[key] = (offset, take)
+        offset += take
+    return slices
+
+
 def apply_accept_list(adapter_index: int,
                       devices: 'list[tuple[str, int]]',
                       interval: int = _DEFAULT_SCAN_INTERVAL,

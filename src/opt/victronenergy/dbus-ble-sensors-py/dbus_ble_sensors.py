@@ -204,6 +204,13 @@ class DbusBleSensors(object):
         # we drive, so a failing secondary is rarely a problem in
         # practice.
         self._scan_failure_streak: dict[str, int] = {}
+        # adapter key -> controller accept-list capacity (entries), read
+        # once per adapter.  None means the read failed and we fall back
+        # to handing that card the whole list.
+        self._accept_list_size: dict[str, 'int | None'] = {}
+        # Last shortfall we warned about, so a permanent overflow does not
+        # log on every re-apply tick.
+        self._accept_list_warned: 'tuple[int, int] | None' = None
         # Persistent cache mapping canonical MAC → BLE address type
         # (0 public / 1 random).  Populated by the HCI tap as it sees
         # ads from devices we recognise, persisted to
@@ -469,7 +476,7 @@ class DbusBleSensors(object):
         policy = self._desired_filter_policy()
         was_enabled = key in self._scan_enabled_adapters
         prev_policy = self._scan_filter_policy.get(key)
-        ok = self._apply_scan_policy(idx, policy)
+        ok = self._apply_scan_policy(key, idx, policy)
         if ok:
             self._scan_enabled_adapters.add(key)
             self._scan_claims.hold(key, exclusive=self._scanning_actively())
@@ -511,7 +518,58 @@ class DbusBleSensors(object):
                 logging.debug(
                     f"{label}: scan enable failed (streak={streak})")
 
-    def _apply_scan_policy(self, adapter_index: int, policy: int) -> bool:
+    def _accept_list_capacity(self, key: str) -> 'int | None':
+        """Controller accept-list size for an adapter, read once and cached."""
+        if key in self._accept_list_size:
+            return self._accept_list_size[key]
+        idx = adapter_identity.index_for(key)
+        size = None
+        if idx is not None:
+            try:
+                size = hci_scan_control.read_accept_list_size(idx)
+            except Exception:
+                logging.exception("%s: accept-list size read failed",
+                                  adapter_identity.label(key))
+        if not size:
+            size = None
+        self._accept_list_size[key] = size
+        return size
+
+    def _accept_list_for(self, key: str, devices: list) -> list:
+        """The slice of *devices* this adapter should watch for.
+
+        Falls back to the whole list if any adapter's capacity is unknown
+        — that is exactly the historical behaviour, and it is better to
+        overlap than to leave a device assigned to no card at all.
+        """
+        keys = sorted(self._adapters)
+        if key not in keys:
+            return devices
+        capacities = {k: self._accept_list_capacity(k) for k in keys}
+        if any(capacities[k] is None for k in keys):
+            return devices
+        slices = hci_scan_control.accept_list_slices(
+            keys, capacities, len(devices))
+        covered = sum(count for _off, count in slices.values())
+        if covered < len(devices):
+            state = (len(devices), covered)
+            if self._accept_list_warned != state:
+                self._accept_list_warned = state
+                detail = ", ".join(
+                    f"{adapter_identity.label(k)}={capacities[k]}" for k in keys)
+                logging.warning(
+                    f"accept-list capacity exceeded: {len(devices)} known "
+                    f"devices, room for {covered} across the adapters we scan "
+                    f"on ({detail}).  {len(devices) - covered} device(s) will "
+                    "not be heard while Continuous scanning is OFF — turn it "
+                    "on, or scan on another adapter, or prune the cache.")
+        else:
+            self._accept_list_warned = None
+        offset, count = slices[key]
+        return devices[offset:offset + count]
+
+    def _apply_scan_policy(self, key: str, adapter_index: int,
+                           policy: int) -> bool:
         """Apply a scan filter policy on the given adapter.
 
         ``FILTER_POLICY_ACCEPT_ALL`` is just the plain enable; the
@@ -538,8 +596,11 @@ class DbusBleSensors(object):
                     filter_policy=hci_scan_control.FILTER_POLICY_ACCEPT_ALL,
                     scan_type=self._desired_scan_type(),
                 )
+            mine = self._accept_list_for(key, devices)
+            logging.debug("%s: accept list %d of %d known devices",
+                          adapter_identity.label(key), len(mine), len(devices))
             return hci_scan_control.apply_accept_list(
-                adapter_index, devices, scan_type=self._desired_scan_type())
+                adapter_index, mine, scan_type=self._desired_scan_type())
         return hci_scan_control.enable_scan(
             adapter_index, filter_policy=policy,
             scan_type=self._desired_scan_type())
@@ -580,7 +641,7 @@ class DbusBleSensors(object):
                 # Policy change — go through the full apply path so
                 # accept-list rebuild + scan-params update happen as
                 # one transaction.
-                if self._apply_scan_policy(idx, desired):
+                if self._apply_scan_policy(key, idx, desired):
                     self._scan_enabled_adapters.add(key)
                     self._scan_claims.hold(key, exclusive=self._scanning_actively())
                     self._scan_filter_policy[key] = desired
@@ -592,7 +653,7 @@ class DbusBleSensors(object):
                 # Steady-state re-issue using the policy we already
                 # have.  For accept-list mode, also re-apply the list
                 # in case it changed (new devices learned via the tap).
-                if self._apply_scan_policy(idx, desired):
+                if self._apply_scan_policy(key, idx, desired):
                     self._scan_enabled_adapters.add(key)
                     self._scan_claims.hold(key, exclusive=self._scanning_actively())
         # Flush persisted cache once per tick if anything changed.
