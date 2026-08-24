@@ -55,3 +55,46 @@ def get_bus(cache_key: str) -> dbus.bus.BusConnection:
             else SystemBus()
         )
     return _bus_instances[cache_key]
+
+
+def get_private_unattached_bus() -> dbus.bus.BusConnection:
+    """A private connection with NO GLib main loop integration.
+
+    For code that must run OFF the mainloop thread.  dbus-python's
+    ``DBusGMainLoop`` supports only the DEFAULT main context
+    (``dbus_glib_native_mainloop(NULL)`` — "Non-default main contexts are
+    not currently supported"), so a normally-constructed connection
+    attaches its watches, timeouts and dispatch source to the MAIN
+    thread's context no matter which thread creates it.  A worker thread
+    then makes synchronous calls on a connection the main thread is
+    simultaneously dispatching, which libdbus does not support
+    (freedesktop dbus#15, open since 2009).  On Venus that showed up as
+    six SIGABRTs on dev-cerbo with ``malloc(): unaligned fastbin chunk
+    detected`` — free-list corruption, diagnosed from the cores by the
+    BCM crash-analysis session.
+
+    ``NULL_MAIN_LOOP`` opts out entirely: no GSources are registered, so
+    nothing on the main thread ever dispatches this connection and the
+    owning thread has it to itself.
+
+    Rules for callers, each learned the hard way:
+
+    * Create it INSIDE the thread that will use it, and share it with no
+      other thread.
+    * Reuse it.  Do NOT create and close one per tick — that is the
+      pattern that crashed dbus-serialbattery.
+    * Close it when the owning thread stops; otherwise it leaks an fd and
+      counts against ``max_connections_per_user``.
+    * Synchronous calls only.  Signals cannot be delivered without a main
+      loop, which is fine for callers that only Get and Set with explicit
+      timeouts.
+
+    Deliberately NOT part of :func:`get_bus`: that cache exists to share
+    mainloop-integrated connections, and its callers want signal delivery.
+    """
+    from dbus.mainloop import NULL_MAIN_LOOP
+
+    kind = (dbus.bus.BusConnection.TYPE_SESSION
+            if "DBUS_SESSION_BUS_ADDRESS" in os.environ
+            else dbus.bus.BusConnection.TYPE_SYSTEM)
+    return dbus.bus.BusConnection(kind, mainloop=NULL_MAIN_LOOP)

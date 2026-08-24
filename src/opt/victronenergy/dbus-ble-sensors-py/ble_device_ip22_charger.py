@@ -663,7 +663,13 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                         "%s: key provisioning did not produce a 16-byte "
                         "key; will retry after backoff", self._plog)
                     return
-                self._persist_provisioning_result(payload)
+                # Settings writes and role-service publishes are
+                # dbus-python on a connection owned by the GLib main
+                # context.  This is a worker thread, so marshal the whole
+                # persist onto the mainloop rather than calling across
+                # threads — the cross-thread case is what corrupted the
+                # heap (see dbus_bus.get_private_unattached_bus).
+                GLib.idle_add(self._persist_provisioning_result, payload)
             finally:
                 _provision_busy = False
 
@@ -768,7 +774,13 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
                                            preferred_adapter=pref_adapter)
                 if not payload:
                     return
-                self._persist_provisioning_result(payload)
+                # Settings writes and role-service publishes are
+                # dbus-python on a connection owned by the GLib main
+                # context.  This is a worker thread, so marshal the whole
+                # persist onto the mainloop rather than calling across
+                # threads — the cross-thread case is what corrupted the
+                # heap (see dbus_bus.get_private_unattached_bus).
+                GLib.idle_add(self._persist_provisioning_result, payload)
             finally:
                 _provision_busy = False
 

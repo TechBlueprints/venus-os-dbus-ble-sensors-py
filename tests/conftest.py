@@ -58,8 +58,30 @@ if "dbus" not in sys.modules:
     dbus_service.Object = _StubServiceObject
     dbus_service.method = _stub_method
     dbus.service = dbus_service
+
+    # dbus.bus, so dbus_bus.py can be imported: it subclasses
+    # BusConnection at module scope.
+    dbus_bus_mod = types.ModuleType("dbus.bus")
+
+    class _StubBusConnection:
+        TYPE_SESSION = 0
+        TYPE_SYSTEM = 1
+
+        def __new__(cls, *_a, **_kw):
+            return object.__new__(cls)
+
+        def get_is_connected(self):
+            return True
+
+        def close(self):
+            pass
+
+    dbus_bus_mod.BusConnection = _StubBusConnection
+    dbus.bus = dbus_bus_mod
+
     sys.modules["dbus"] = dbus
     sys.modules["dbus.service"] = dbus_service
+    sys.modules["dbus.bus"] = dbus_bus_mod
 
 if "gi" not in sys.modules:
     gi = types.ModuleType("gi")

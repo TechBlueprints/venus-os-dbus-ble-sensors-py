@@ -69,9 +69,25 @@ class DbusBusOps(object):
     BUS_ITEM = "com.victronenergy.BusItem"
 
     def __init__(self):
-        from dbus_bus import get_bus
+        from dbus_bus import get_private_unattached_bus
 
-        self._bus = get_bus("bms-link-follower")
+        # NOT get_bus(): that returns a connection wired into the default
+        # GLib context, i.e. the main thread's.  We run on our own thread
+        # (see the module docstring for why that is required), and calling
+        # synchronously on a connection the main thread dispatches is the
+        # unsupported case that corrupted the heap.  This one has no main
+        # loop at all and belongs to this thread alone.
+        self._bus = get_private_unattached_bus()
+
+    def close(self):
+        """Release the connection.  Called when the follower stops."""
+        bus, self._bus = self._bus, None
+        if bus is None:
+            return
+        try:
+            bus.close()
+        except Exception:
+            logger.exception("bms-link-follower: closing bus failed")
 
     def _item(self, service, path):
         import dbus
@@ -130,8 +146,15 @@ class BmsLinkFollower(object):
 
     def _run(self):
         # the bus connection is created inside the thread that will use it
-        while not self._stop.wait(self._interval_s):
-            self.tick()
+        try:
+            while not self._stop.wait(self._interval_s):
+                self.tick()
+        finally:
+            # Close from the owning thread, and only once the loop is done
+            # — a connection left open leaks an fd per follower restart.
+            ops, self._ops = self._ops, None
+            if ops is not None:
+                ops.close()
 
     def tick(self):
         """One bridge pass; safe against every failure but a coding error."""

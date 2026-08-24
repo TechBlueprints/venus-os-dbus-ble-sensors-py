@@ -43,4 +43,10 @@ if svstat /service/dbus-ble-sensors 2>/dev/null | grep -q "up"; then
   sleep 2
 fi
 
+# A SIGABRT from the C layer (heap corruption, a libdbus assertion)
+# kills us with no Python traceback anywhere — six such aborts on
+# dev-cerbo went unnoticed for sixteen hours because nothing was written
+# to the log.  faulthandler prints the stack of every thread on fatal
+# signals, which is what makes the next one identifiable in one look.
+export PYTHONFAULTHANDLER=1
 exec python3 "$SCRIPT_DIR/dbus_ble_sensors.py"
