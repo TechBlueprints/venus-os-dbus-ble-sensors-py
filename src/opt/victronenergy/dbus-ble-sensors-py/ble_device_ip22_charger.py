@@ -471,6 +471,23 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
             self._adv_key_hex = None
             self._maybe_provision_key()
             return
+        except ValueError as exc:
+            # A field the parser could not map — most often an
+            # OperationMode byte outside the documented enum.  The frame
+            # is DROPPED, not partially published: the decode either
+            # produced a coherent record or it did not, and publishing
+            # some fields from a frame we could not fully parse would put
+            # unvalidated values on D-Bus where nothing downstream could
+            # tell they were suspect.
+            #
+            # One line, rate-limited, rather than a traceback per
+            # advertisement.  A charger reporting an unexpected value
+            # does so on every frame it sends — 19 identical
+            # "108 is not a valid OperationMode" tracebacks on dev were
+            # what surfaced this — and the stack says nothing the message
+            # does not.
+            self._note_undecodable(exc)
+            return
         except Exception:
             logger.exception("%s: IP22 advertisement decode error",
                              self._plog)
@@ -482,6 +499,39 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         self._last_full_telemetry_at = time.monotonic()
         self._publish(parsed)
         self._maybe_daily_refresh()
+
+    # How often one distinct undecodable-frame message may be logged.
+    _UNDECODABLE_LOG_INTERVAL_S = 1800.0
+
+    def _note_undecodable(self, exc: Exception) -> None:
+        """Report an unparseable advertisement once per message per window.
+
+        Keyed by the message text so a NEW failure mode is reported
+        immediately rather than being swallowed by a window opened for a
+        different one.
+        """
+        message = str(exc) or type(exc).__name__
+        now = time.monotonic()
+        last, suppressed, previous = getattr(
+            self, "_undecodable_state", (0.0, 0, ""))
+        if (message == previous
+                and now - last < self._UNDECODABLE_LOG_INTERVAL_S):
+            self._undecodable_state = (last, suppressed + 1, previous)
+            logger.debug("%s: advertisement still undecodable: %s",
+                         self._plog, message)
+            return
+        if suppressed:
+            logger.warning(
+                "%s: advertisement could not be decoded: %s "
+                "(%d more like it since the last report; frames dropped, "
+                "nothing published from them)",
+                self._plog, message, suppressed)
+        else:
+            logger.warning(
+                "%s: advertisement could not be decoded: %s "
+                "(frame dropped, nothing published from it)",
+                self._plog, message)
+        self._undecodable_state = (now, 0, message)
 
     def _maybe_hex_telemetry(self) -> bool:
         """Start a short GetValue session when ads are only the 4-byte beacon.
