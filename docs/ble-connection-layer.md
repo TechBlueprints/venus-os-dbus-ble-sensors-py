@@ -212,5 +212,26 @@ install and update, and fails loudly if it cannot: with no bleak there is
 no GATT at all.  The `/data/bcm` step is the softer of the two — if it
 cannot converge, the install reports it and continues on the vendored
 copies, because GATT still works; what is lost is sharing the fleet's
-claim semantics.  Advertisement-driven sensors keep working regardless — a
+claim semantics.
+
+That softness has a consequence worth stating, because it inverts the
+usual intuition about fallbacks: **the fallback is taken precisely when
+something has already gone wrong.**  A vendored copy left behind the
+shared checkout therefore means the box quietly drops to an older BLE
+stack at the exact moment it has just reported being unhealthy — a
+silent downgrade rather than a safety net.
+
+BCM's `CONSUMER_MIGRATION.md` offers two acceptable resolutions, to be
+picked deliberately: keep both paths current, or make convergence fatal
+so a broken one is loud.  **We keep both current** — the submodule is
+bumped whenever the shared checkout moves — because a fatal convergence
+step would turn a transient network failure on an RV uplink into a
+failed install of a service that would otherwise run fine.
+
+Keeping them current is a promise a person has to remember, so
+`install.sh` checks it rather than trusting it: after converging
+`/data/bcm` it compares the two shas and, if the vendored copy is an
+ancestor, says how far behind it is and what that would cost.  Behind is
+the only direction it reports — ahead or diverged is a deliberate pin,
+not a downgrade.  Advertisement-driven sensors keep working regardless — a
 missing stack is reported once and degrades to "no GATT", never to a crash.

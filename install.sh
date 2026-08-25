@@ -185,6 +185,38 @@ echo ""
 # — but it is reported, because running on vendored copies means we are
 # no longer sharing the fleet's claim semantics.
 
+# Whether the vendored fallback is still current enough to be one.
+# This exists because of the order the two paths are reached in: the
+# fallback is taken *precisely when* converging the shared checkout has
+# just failed.  A stale fallback therefore means the box quietly drops
+# to an older BLE stack at the exact moment it has reported being
+# unhealthy — a silent downgrade wearing a safety net's clothes.
+#
+# Our chosen resolution (BCM's CONSUMER_MIGRATION.md offers two) is to
+# keep both paths current by bumping the submodule whenever the shared
+# checkout moves.  That is a promise a person has to keep, so check it
+# out loud at the one moment both shas are in front of us.
+check_fallback_currency() {
+    vendored_dir="$INSTALL_DIR/$APP_DIR/ext/bleak-connection-manager"
+    [ -d "$vendored_dir/.git" ] || return 0
+
+    shared=$(git -C "$BCM_DIR" rev-parse HEAD 2>/dev/null) || return 0
+    vendored=$(git -C "$vendored_dir" rev-parse HEAD 2>/dev/null) || return 0
+    [ "$shared" = "$vendored" ] && return 0
+
+    # Ahead or diverged is not this check's business — only behind is,
+    # because only behind makes the fallback a downgrade.
+    if git -C "$BCM_DIR" merge-base --is-ancestor \
+            "$vendored" "$shared" 2>/dev/null; then
+        behind=$(git -C "$BCM_DIR" rev-list --count \
+                 "$vendored".."$shared" 2>/dev/null || echo "?")
+        echo "  NOTE: vendored BLE fallback is $behind commit(s) behind the shared checkout"
+        echo "        ($(git -C "$vendored_dir" rev-parse --short HEAD) vs $(git -C "$BCM_DIR" rev-parse --short HEAD))."
+        echo "        If convergence ever fails, this box runs the older stack."
+        echo "        Bump the submodule to keep the fallback worth falling back to."
+    fi
+}
+
 echo "Step 3c: Converging shared BLE stack at /data/bcm..."
 BCM_DIR="/data/bcm"
 BCM_URL="https://github.com/TechBlueprints/bleak-connection-manager"
@@ -208,6 +240,7 @@ if [ "$BCM_OK" = true ]; then
     # No --autowire: that is a fleet-level per-box decision, not ours.
     if "$BCM_DIR/install.sh"; then
         echo "  shared BLE stack ready ($(git -C "$BCM_DIR" rev-parse --short HEAD))"
+        check_fallback_currency
     else
         echo "  WARN: $BCM_DIR/install.sh failed — see its rollback hint above"
         BCM_OK=false
