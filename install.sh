@@ -147,6 +147,38 @@ else
 fi
 echo ""
 
+# --- Step 3a: Remove the old vendored BLE stack ---
+#
+# These were git submodules until the stack moved to /data/bcm.  A `git
+# checkout` that drops a gitlink cannot remove the submodule's working
+# tree — git warns "unable to rmdir ... Directory not empty" and leaves
+# ~9 MB of an older stack behind as untracked files.
+#
+# Nothing imports them: ble_ext_path adds no paths and the service runs
+# under the shim.  They are removed anyway, because an inert copy of the
+# stack sitting next to the code is exactly the thing someone finds in
+# six months and reasonably assumes is in use — and because the whole
+# point of this migration is that there is ONE stack on the box.
+#
+# Matched by name rather than by glob: ext/ also holds victron_ble and
+# victron-bluetooth-safety, which are service-specific and stay.
+
+echo "Step 3a: Removing the old vendored BLE stack..."
+OLD_EXT="$INSTALL_DIR/$APP_DIR/ext"
+REMOVED=0
+for stale in aiooui bleak bleak-connection-manager \
+             bleak-retry-connector bluetooth-adapters; do
+    if [ -d "$OLD_EXT/$stale" ]; then
+        rm -rf "$OLD_EXT/$stale" && REMOVED=$((REMOVED + 1))
+    fi
+done
+if [ "$REMOVED" -gt 0 ]; then
+    echo "  removed $REMOVED leftover vendored package(s)"
+else
+    echo "  none present"
+fi
+echo ""
+
 # --- Step 3b: Converge the shared BLE stack at /data/bcm ---
 #
 # Every BLE consumer on this box (this service, dbus-shyion-switch,
