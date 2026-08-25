@@ -165,9 +165,25 @@ the best card to connect on.
 
 ## Dependencies
 
-The stack is carried as git submodules under
+On a Venus device the stack comes from **`/data/bcm`**, a single
+checkout of `bleak-connection-manager` shared by every BLE consumer on
+the box (this service, `dbus-shyion-switch`, `dbus-power-watchdog`,
+`dbus-easytouchrv`, `serialbattery`).  Sharing it is what makes the
+claims in `/run/bt-claims` mean the same thing to all of them: adapter
+placement and drain cooperation are a protocol *between* services, so a
+fix has to land for all of them at once rather than per-repo as each
+bumps a submodule to a different sha.
+
+`install.sh` converges that checkout — fast-forward only, so a stale
+installer can never move the fleet backwards — and then runs BCM's own
+installer, which smoke-imports the stack before writing the interpreter
+shim `/data/bcm/python3`.  Our run scripts exec through that shim and
+fall back to plain `python3` when it is absent.
+
+The same stack is *also* carried as git submodules under
 `src/opt/victronenergy/dbus-ble-sensors-py/ext/`, pinned to the same
-commits `dbus-easytouchrv` runs on Venus OS:
+commits `dbus-easytouchrv` runs on Venus OS, so that a bare clone works
+for anyone without a Cerbo:
 
 | Submodule | Why |
 |---|---|
@@ -176,13 +192,25 @@ commits `dbus-easytouchrv` runs on Venus OS:
 | `bleak-retry-connector` | Retry semantics bcmv2 deliberately omits |
 | `bluetooth-adapters`, `aiooui` | bleak-retry-connector dependencies |
 
-`ble_ext_path.py` puts them ahead of site-packages, which is load-bearing
-for one of them: Venus OS ships `python3-dbus-fast` **2.21.1**, and current
+`ble_ext_path.install()` adds those vendored paths **only when nothing
+else provides the stack** — it checks `sys.modules` first (cheap, and it
+is what lets test stubs win), then `importlib.util.find_spec`.  Under the
+shim it therefore adds nothing; inserting our copies ahead of the shared
+checkout would silently pin this service to a different sha of the claim
+protocol.  A broken `find_spec` degrades to inserting the vendored paths,
+which is the safe direction: worst case we shadow the shim, never run
+with no stack at all.
+
+When they *are* used, they go ahead of site-packages, which is
+load-bearing for one of them: Venus OS ships `python3-dbus-fast` **2.21.1**, and current
 bleak needs `dbus-fast >= 4` (it imports `dbus_fast.annotations`).  Without
 the shadowing, a fresh deploy dies with `No module named
 'dbus_fast.annotations'`.
 
 `install.sh` runs `git submodule update --init --recursive` on every
 install and update, and fails loudly if it cannot: with no bleak there is
-no GATT at all.  Advertisement-driven sensors keep working regardless — a
+no GATT at all.  The `/data/bcm` step is the softer of the two — if it
+cannot converge, the install reports it and continues on the vendored
+copies, because GATT still works; what is lost is sharing the fleet's
+claim semantics.  Advertisement-driven sensors keep working regardless — a
 missing stack is reported once and degrades to "no GATT", never to a crash.

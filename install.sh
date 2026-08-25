@@ -168,6 +168,57 @@ fi
 echo "  BLE submodules in sync"
 echo ""
 
+# --- Step 3c: Converge the shared BLE stack at /data/bcm ---
+#
+# Every BLE consumer on this box (this service, dbus-shyion-switch,
+# dbus-power-watchdog, dbus-easytouchrv, serialbattery) runs off one
+# checkout of bleak-connection-manager at /data/bcm.  That is what makes
+# the adapter claims in /run/bt-claims mean the same thing to all of
+# them: a fix to placement or drain cooperation reaches every service on
+# its next restart, instead of waiting for each repo to bump a submodule
+# to a different sha and briefly disagree about the protocol.
+#
+# Idempotent, and safe when another consumer's installer got here first:
+# --ff-only means a stale installer can never move the fleet backwards.
+# The submodules synced in 3b stay as the standalone fallback for a bare
+# clone (see ble_ext_path.install), so this step is allowed to fail soft
+# — but it is reported, because running on vendored copies means we are
+# no longer sharing the fleet's claim semantics.
+
+echo "Step 3c: Converging shared BLE stack at /data/bcm..."
+BCM_DIR="/data/bcm"
+BCM_URL="https://github.com/TechBlueprints/bleak-connection-manager"
+BCM_OK=true
+if [ -d "$BCM_DIR/.git" ]; then
+    if ! (git -C "$BCM_DIR" fetch -q origin \
+          && git -C "$BCM_DIR" merge -q --ff-only origin/main); then
+        echo "  WARN: could not fast-forward $BCM_DIR"
+        BCM_OK=false
+    fi
+elif ! git clone -q "$BCM_URL" "$BCM_DIR"; then
+    echo "  WARN: could not clone $BCM_URL"
+    BCM_OK=false
+fi
+
+if [ "$BCM_OK" = true ]; then
+    # Unpiped on purpose: its exit code is the smoke-import verdict, and
+    # a pipe into tee/tail would hand us the pager's status instead.  On
+    # failure it leaves the previous shim in place and prints a rollback
+    # command, so the box keeps running the last stack that imported.
+    # No --autowire: that is a fleet-level per-box decision, not ours.
+    if "$BCM_DIR/install.sh"; then
+        echo "  shared BLE stack ready ($(git -C "$BCM_DIR" rev-parse --short HEAD))"
+    else
+        echo "  WARN: $BCM_DIR/install.sh failed — see its rollback hint above"
+        BCM_OK=false
+    fi
+fi
+if [ "$BCM_OK" != true ]; then
+    echo "  Falling back to this repo's vendored ext/ copies."
+    echo "  GATT will work, but we are not sharing the fleet's BLE stack."
+fi
+echo ""
+
 # --- Step 4: Fetch velib_python ---
 
 echo "Step 4: Fetching velib_python dependencies..."

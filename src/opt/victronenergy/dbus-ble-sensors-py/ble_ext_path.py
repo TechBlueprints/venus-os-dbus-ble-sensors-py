@@ -79,6 +79,30 @@ def install() -> bool:
     if _installed is not None:
         return _installed
 
+    # If the interpreter already provides the stack, use it and add
+    # nothing.  That is the /data/bcm shim (see install.sh): one shared
+    # checkout serving every BLE consumer on the box, so a fix landed
+    # there reaches us on restart instead of waiting for a submodule
+    # bump here.  Our ext/ copies stay as the standalone fallback for a
+    # bare clone.
+    #
+    # The sys.modules check comes first because it is cheap and because
+    # it is what lets test stubs win: a ModuleType with __spec__ = None
+    # makes find_spec raise ValueError, which is why that is caught too.
+    if "bleak_connection_manager" in sys.modules:
+        _installed = True
+        return True
+    try:
+        import importlib.util
+        if importlib.util.find_spec("bleak_connection_manager") is not None:
+            _installed = True
+            return True
+    except (ImportError, ValueError):
+        # A weird interpreter state degrades to inserting our own paths,
+        # which is the safe direction: worst case we shadow the shim with
+        # a vendored copy, never run with no stack at all.
+        pass
+
     for sub in _SUBDIRS:
         if os.path.isdir(sub) and sub not in sys.path:
             sys.path.insert(0, sub)
