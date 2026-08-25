@@ -13,22 +13,76 @@ get_setting() {
   awk '/int32/ { print $NF; exit }'
 }
 
+# Overridable so the control logic can be exercised in tests
+# against a temporary tree; never set in production.
+SVC_LINK="${SVC_LINK:-/service/dbus-ble-sensors-py}"
+
+# svc talks to supervise through a control fifo.  If supervise is not
+# running, svc prints a warning, changes nothing, and the caller has no
+# idea its request evaporated.  That is tolerable when we are shutting
+# down (the installer tears the tree down on purpose, in that order),
+# and not tolerable when a setting change asked us to start or stop the
+# service — which is the whole reason this process exists.
+#
+# So: control() waits up to $2 seconds for supervise, and reports what
+# actually happened.  Callers that care wait; the teardown path passes 0
+# and accepts "already gone" as success.
+#
+# Returns 0 on success, 1 if supervise never appeared, 2 if svc failed.
+control() {
+  flag="$1"
+  wait_s="$2"
+  waited=0
+  while [ ! -p "$SVC_LINK/supervise/control" ]; do
+    if [ "$waited" -ge "$wait_s" ]; then
+      return 1
+    fi
+    waited=$((waited + 1))
+    sleep 1
+  done
+  svc "$flag" "$SVC_LINK" || return 2
+  return 0
+}
+
 start() {
   [ "$STATE" = "1" ] && return
   echo "Starting dbus-ble-sensors-py service..."
-  svc -u /service/dbus-ble-sensors-py
-  STATE="1"
+  if control -u 5; then
+    STATE="1"
+  else
+    # Deliberately do NOT record the new state on failure.  Believing we
+    # started something we did not is worse than trying again: the next
+    # setting change would short-circuit on the cached STATE and the
+    # service would stay down with nothing in the log to say why.
+    echo "  FAILED to start: supervise for $SVC_LINK is not running."
+    echo "  BLE sensors are DOWN and will stay down until this is fixed."
+  fi
 }
 
 stop() {
   [ "$STATE" = "0" ] && return
   echo "Stopping dbus-ble-sensors-py service..."
-  svc -d /service/dbus-ble-sensors-py
-  STATE="0"
+  if control -d 5; then
+    STATE="0"
+  else
+    echo "  FAILED to stop: supervise for $SVC_LINK is not running."
+    echo "  The service may still be running; check with svstat."
+  fi
 }
 
 quit() {
-  stop
+  # Teardown, not a setting change.  If supervise is already gone the
+  # service is going down with it, so there is nothing to stop and no
+  # reason to wait or to log a scary line about it — this is the normal
+  # shape of an install or a disable.
+  if [ "$STATE" != "0" ]; then
+    if [ -p "$SVC_LINK/supervise/control" ]; then
+      echo "Stopping dbus-ble-sensors-py service..."
+      control -d 0 || echo "  stop failed; check svstat $SVC_LINK"
+    else
+      echo "Launcher exiting; $SVC_LINK supervise is already gone."
+    fi
+  fi
   [ -n "$FIFO" ] && rm -f "$FIFO"
   exit 0
 }
