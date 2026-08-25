@@ -83,6 +83,23 @@ if "dbus" not in sys.modules:
     sys.modules["dbus.service"] = dbus_service
     sys.modules["dbus.bus"] = dbus_bus_mod
 
+# vedbus comes from velib_python, which install.sh fetches onto the
+# device rather than vendoring here — so it is absent in a checkout.
+# Only the two names dbus_settings_service imports are needed; nothing
+# in the tests dispatches through them.
+
+if "vedbus" not in sys.modules:
+    vedbus = types.ModuleType("vedbus")
+
+    class _StubVeDbusItem:
+        def __init__(self, *a, **kw):
+            pass
+
+    vedbus.VeDbusItemImport = _StubVeDbusItem
+    vedbus.VeDbusItemExport = _StubVeDbusItem
+    vedbus.VeDbusService = _StubVeDbusItem
+    sys.modules["vedbus"] = vedbus
+
 if "gi" not in sys.modules:
     gi = types.ModuleType("gi")
     gi_repo = types.ModuleType("gi.repository")

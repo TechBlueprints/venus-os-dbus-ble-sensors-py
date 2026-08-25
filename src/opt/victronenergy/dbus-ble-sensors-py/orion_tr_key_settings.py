@@ -10,6 +10,7 @@ import logging
 import re
 from typing import Optional
 
+import adapter_identity
 from dbus_settings_service import DbusSettingsService
 
 logger = logging.getLogger(__name__)
@@ -86,14 +87,26 @@ def get_preferred_adapter(settings: DbusSettingsService,
     raw = settings.try_get_value(path)
     if raw is None:
         return None
+    # Canonicalize on read too, so a value written before this was
+    # MAC-keyed is upgraded in flight rather than needing a settings
+    # migration.  An unresolvable legacy name passes through unchanged:
+    # it may still be correct, and this is a preference, not a pin.
     s = str(raw).strip()
-    return s or None
+    return adapter_identity.canonical(s) if s else None
 
 def set_preferred_adapter(settings: DbusSettingsService,
                           dev_mac: str, adapter: str) -> None:
-    """Store which BlueZ adapter (e.g. ``hci1``) last connected successfully."""
+    """Store which adapter last connected successfully, by MAC.
+
+    Stored as the card's own MAC, never as ``hciN``.  This value outlives
+    reboots and replugs in com.victronenergy.settings and hciN numbering
+    does not, so a stored ``hci0`` can come to name a different radio
+    after a USB reset — at which point a "preferred adapter" sends the
+    device to the wrong card.  That is the precise failure MAC identity
+    exists to prevent, arriving through a setting meant to help.
+    """
     mk = _mac_key(dev_mac)
-    s = str(adapter).strip()
+    s = adapter_identity.canonical(str(adapter).strip())
     if not s:
         return
     path = preferred_adapter_setting_path(dev_mac)
