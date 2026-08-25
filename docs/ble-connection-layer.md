@@ -180,58 +180,48 @@ installer, which smoke-imports the stack before writing the interpreter
 shim `/data/bcm/python3`.  Our run scripts exec through that shim and
 fall back to plain `python3` when it is absent.
 
-The same stack is *also* carried as git submodules under
-`src/opt/victronenergy/dbus-ble-sensors-py/ext/`, pinned to the same
-commits `dbus-easytouchrv` runs on Venus OS, so that a bare clone works
-for anyone without a Cerbo:
+This repo carries **no copy of its own**.  It used to, as a fallback for
+a bare clone, and the fallback was removed for two reasons that only
+became clear once it existed:
 
-| Submodule | Why |
+* Adapter placement and drain cooperation are a protocol between
+  services.  A private copy of that protocol is a private opinion about
+  it — the claims in `/run/bt-claims` only mean something if everyone
+  reading and writing them agrees.
+* The fallback was reached *precisely when* converging `/data/bcm` had
+  just failed, so a stale copy meant the box silently dropped to an
+  older stack at the exact moment it had reported being unhealthy.  Prod
+  was found in that state on 2026-08-25 — running BCM `a96aef1` from the
+  shim while this repo pinned `32197b1`, five commits ahead, with
+  nothing announcing the gap.
+
+`install.sh` therefore treats the stack as required, but distinguishes
+two failures that a single "did it converge?" check would conflate:
+
+| Situation | Install behaviour |
 |---|---|
-| `bleak` | Venus OS ships none |
-| `bleak-connection-manager` | bcmv2 itself; its own `ext/` carries dbus-fast 5.x |
-| `bleak-retry-connector` | Retry semantics bcmv2 deliberately omits |
-| `bluetooth-adapters`, `aiooui` | bleak-retry-connector dependencies |
+| Fetch failed, `/data/bcm/python3` already present | Warn, continue on what is there — it may be behind |
+| No shim at all | **Fatal.** There is nothing to run GATT on |
 
-`ble_ext_path.install()` adds those vendored paths **only when nothing
-else provides the stack** — it checks `sys.modules` first (cheap, and it
-is what lets test stubs win), then `importlib.util.find_spec`.  Under the
-shim it therefore adds nothing; inserting our copies ahead of the shared
-checkout would silently pin this service to a different sha of the claim
-protocol.  A broken `find_spec` degrades to inserting the vendored paths,
-which is the safe direction: worst case we shadow the shim, never run
-with no stack at all.
+That split is what keeps a transient failure on an RV uplink (Starlink,
+LTE, sometimes neither) from failing an install of a service that would
+otherwise run perfectly, without pretending an absent stack is
+survivable.
 
-When they *are* used, they go ahead of site-packages, which is
-load-bearing for one of them: Venus OS ships `python3-dbus-fast` **2.21.1**, and current
-bleak needs `dbus-fast >= 4` (it imports `dbus_fast.annotations`).  Without
-the shadowing, a fresh deploy dies with `No module named
-'dbus_fast.annotations'`.
+BCM's `CONSUMER_MIGRATION.md` offers two acceptable resolutions to a
+fallback that can go stale: keep both paths current, or make convergence
+fatal so a broken one is loud.  We first chose the former and enforced
+it with a sha comparison in `install.sh`.  That check was itself an
+adjacent predicate — it answered "is the fallback stale relative to the
+shared checkout", standing in for "is this box running the stack we
+think it is".  The two questions coincided while the vendored copy was
+the live path and stopped coinciding the moment the shim became it, so
+when prod ran an *older* `/data/bcm` than the pin, the check reported
+nothing: it only looked for the fallback being behind, never ahead.
 
-`install.sh` runs `git submodule update --init --recursive` on every
-install and update, and fails loudly if it cannot: with no bleak there is
-no GATT at all.  The `/data/bcm` step is the softer of the two — if it
-cannot converge, the install reports it and continues on the vendored
-copies, because GATT still works; what is lost is sharing the fleet's
-claim semantics.
+Removing the copy resolves it by deletion rather than by a better check.
+There is one stack, the shim provides it, and there is no second sha for
+anything to be silently behind.
 
-That softness has a consequence worth stating, because it inverts the
-usual intuition about fallbacks: **the fallback is taken precisely when
-something has already gone wrong.**  A vendored copy left behind the
-shared checkout therefore means the box quietly drops to an older BLE
-stack at the exact moment it has just reported being unhealthy — a
-silent downgrade rather than a safety net.
-
-BCM's `CONSUMER_MIGRATION.md` offers two acceptable resolutions, to be
-picked deliberately: keep both paths current, or make convergence fatal
-so a broken one is loud.  **We keep both current** — the submodule is
-bumped whenever the shared checkout moves — because a fatal convergence
-step would turn a transient network failure on an RV uplink into a
-failed install of a service that would otherwise run fine.
-
-Keeping them current is a promise a person has to remember, so
-`install.sh` checks it rather than trusting it: after converging
-`/data/bcm` it compares the two shas and, if the vendored copy is an
-ancestor, says how far behind it is and what that would cost.  Behind is
-the only direction it reports — ahead or diverged is a deliberate pin,
-not a downgrade.  Advertisement-driven sensors keep working regardless — a
+Advertisement-driven sensors keep working regardless — a
 missing stack is reported once and degrades to "no GATT", never to a crash.

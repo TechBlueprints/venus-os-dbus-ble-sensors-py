@@ -632,7 +632,7 @@ def main() -> int:
     if not ble_catcher.install(owner="dbus-ble-sensors-py.keycli",
                                extra_adapters=pins):
         _err("BLE connection stack unavailable — cannot provision "
-             "(run 'git submodule update --init --recursive')")
+             "(run install.sh, or /data/bcm/install.sh directly)")
         return 1
 
     work = telemetry if args.telemetry else provision

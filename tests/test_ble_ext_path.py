@@ -1,13 +1,16 @@
-"""Path bootstrap: vendored copies are the fallback, not the default.
+"""The stack comes from the shared checkout, and nothing else.
 
-The fleet's BLE consumers share one checkout at /data/bcm so that a
-placement or drain fix reaches every service on its next restart, and so
-that the claims in /run/bt-claims mean the same thing to all of them.
-The /data/bcm/python3 shim already puts that stack on sys.path, so when
-we run under it we must add nothing — inserting our ext/ copies ahead of
-it would silently pin this service to a different sha of the shared
-protocol.  A bare clone with no shim still has to work, which is why the
-vendored set stays.
+/data/bcm is one checkout of bleak-connection-manager serving every BLE
+consumer on the box, which is what makes the claims in /run/bt-claims
+mean the same thing to all of them.  This repo used to carry its own
+copy as a fallback; it was removed because the fallback was reached
+precisely when converging the shared checkout had failed, so a stale one
+meant silently running an older stack at the moment the box had just
+reported being unhealthy.  Found in exactly that state on prod, five
+commits behind, having announced nothing.
+
+So install() adds nothing to sys.path.  Its whole job is to answer
+"did the stack arrive", and to say something actionable when it did not.
 """
 from __future__ import annotations
 
@@ -15,80 +18,78 @@ import importlib
 import sys
 import types
 
-import pytest
-
 import ble_ext_path
 
 
-@pytest.fixture(autouse=True)
-def _clean_sys_path():
-    """Start each test with our ext/ dirs off sys.path.
-
-    Any earlier test that imported an entry point may have installed
-    them already, which would make "did install() add anything?"
-    trivially false for reasons unrelated to the branch under test.
-    """
-    saved = list(sys.path)
-    sys.path[:] = [p for p in sys.path if ble_ext_path._EXT_DIR not in p]
-    try:
-        yield
-    finally:
-        sys.path[:] = saved
-
-
 def _fresh():
-    mod = importlib.reload(ble_ext_path)
-    return mod
+    return importlib.reload(ble_ext_path)
 
 
-def test_defers_to_a_stack_already_imported(monkeypatch) -> None:
+def test_reports_available_when_the_shim_provided_the_stack(monkeypatch) -> None:
     mod = _fresh()
-    stub = types.ModuleType("bleak_connection_manager")
-    stub.__spec__ = None          # what makes find_spec raise ValueError
-    monkeypatch.setitem(sys.modules, "bleak_connection_manager", stub)
+    for name in ("bleak_connection_manager", "bleak"):
+        stub = types.ModuleType(name)
+        stub.__spec__ = None      # what makes find_spec raise ValueError
+        monkeypatch.setitem(sys.modules, name, stub)
     before = list(sys.path)
 
     assert mod.install() is True
-    assert sys.path == before, "must not shadow the shim's stack"
+    assert mod.available() is True
+    assert sys.path == before, "install() must not touch sys.path any more"
 
 
-def test_defers_to_a_stack_the_shim_put_on_the_path(monkeypatch) -> None:
+def test_reports_unavailable_and_says_what_to_do(monkeypatch, caplog) -> None:
     mod = _fresh()
-    monkeypatch.delitem(sys.modules, "bleak_connection_manager", raising=False)
-    monkeypatch.setattr(
-        importlib.util, "find_spec",
-        lambda name, *a, **k: object() if name == "bleak_connection_manager"
-        else None)
-    before = list(sys.path)
-
-    assert mod.install() is True
-    assert sys.path == before
-
-
-def test_falls_back_to_vendored_when_nothing_provides_it(monkeypatch) -> None:
-    mod = _fresh()
-    monkeypatch.delitem(sys.modules, "bleak_connection_manager", raising=False)
+    for name in ("bleak_connection_manager", "bleak"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(importlib.util, "find_spec",
                         lambda name, *a, **k: None)
-    before = list(sys.path)
 
-    mod.install()
-    added = [p for p in sys.path if p not in before]
-    assert added, "a bare clone has to get the vendored stack"
-    assert all("/ext/" in p or p.endswith("/ext") for p in added)
+    caplog.set_level("WARNING", logger="ble_ext_path")
+    assert mod.install() is False
+    assert mod.available() is False
+    # A bare "unavailable" sends the reader looking in the wrong repo.
+    assert "/data/bcm/python3" in caplog.text
+    assert "install.sh" in caplog.text
 
 
-def test_a_broken_find_spec_degrades_to_vendored(monkeypatch) -> None:
-    # The safe direction: shadowing the shim with our own copy beats
-    # running with no stack at all.
+def test_a_broken_find_spec_reads_as_unavailable(monkeypatch) -> None:
+    # Degrade to "no stack" rather than to a wrong claim that one is
+    # present: the caller's next move is importing bleak, which would
+    # fail anyway, and saying so first is more useful than a traceback.
     mod = _fresh()
-    monkeypatch.delitem(sys.modules, "bleak_connection_manager", raising=False)
+    for name in ("bleak_connection_manager", "bleak"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
 
     def _boom(name, *a, **k):
         raise ValueError("weird interpreter state")
 
     monkeypatch.setattr(importlib.util, "find_spec", _boom)
-    before = list(sys.path)
+    assert mod.install() is False
 
-    mod.install()
-    assert [p for p in sys.path if p not in before]
+
+def test_claims_are_available_without_bleak(monkeypatch) -> None:
+    # The point of the separate check: the advertisement scanner
+    # publishes claims and never touches bleak, so a box with the claims
+    # layer but no bleak still coordinates adapters correctly.
+    mod = _fresh()
+    stub = types.ModuleType("bleak_connection_manager")
+    stub.__spec__ = None
+    monkeypatch.setitem(sys.modules, "bleak_connection_manager", stub)
+    monkeypatch.delitem(sys.modules, "bleak", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name, *a, **k: None)
+
+    assert mod.claims_available() is True
+    assert mod.install() is False
+
+
+def test_install_is_idempotent(monkeypatch) -> None:
+    mod = _fresh()
+    stub = types.ModuleType("bleak_connection_manager")
+    stub.__spec__ = None
+    monkeypatch.setitem(sys.modules, "bleak_connection_manager", stub)
+    monkeypatch.setitem(sys.modules, "bleak", stub)
+    assert mod.install() is True
+    monkeypatch.delitem(sys.modules, "bleak_connection_manager")
+    assert mod.install() is True, "the answer is cached, not re-derived"

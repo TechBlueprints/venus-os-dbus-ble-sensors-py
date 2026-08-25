@@ -140,35 +140,14 @@ if [ -d "$INSTALL_DIR" ]; then
     fi
 else
     echo "  Cloning repository..."
-    git clone --recurse-submodules -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+    git clone -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
     cd "$INSTALL_DIR"
     git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
     echo "  Repository cloned"
 fi
 echo ""
 
-# --- Step 3b: Sync BLE dependency submodules ---
-#
-# The BLE connection stack (bleak, bleak-connection-manager, bleak-retry-
-# connector and its deps) is carried as git submodules under
-# $APP_DIR/ext/.  A `git reset --hard` moves the gitlinks but does not
-# touch the submodule working trees, and an install that predates the
-# submodules has empty directories, so sync unconditionally rather than
-# only on the clone path.  Venus OS ships no bleak and its dbus-fast is
-# 2.21.1 (bleak needs >= 4), so a missing submodule means no GATT at all
-# — loud enough to be worth failing the install over.
-
-echo "Step 3b: Syncing BLE dependency submodules..."
-cd "$INSTALL_DIR"
-if ! git submodule update --init --recursive; then
-    echo "Error: failed to fetch BLE dependency submodules."
-    echo "       Charger GATT writes and key provisioning need them."
-    exit 1
-fi
-echo "  BLE submodules in sync"
-echo ""
-
-# --- Step 3c: Converge the shared BLE stack at /data/bcm ---
+# --- Step 3b: Converge the shared BLE stack at /data/bcm ---
 #
 # Every BLE consumer on this box (this service, dbus-shyion-switch,
 # dbus-power-watchdog, dbus-easytouchrv, serialbattery) runs off one
@@ -180,49 +159,15 @@ echo ""
 #
 # Idempotent, and safe when another consumer's installer got here first:
 # --ff-only means a stale installer can never move the fleet backwards.
-# The submodules synced in 3b stay as the standalone fallback for a bare
-# clone (see ble_ext_path.install), so this step is allowed to fail soft
-# — but it is reported, because running on vendored copies means we are
-# no longer sharing the fleet's claim semantics.
-
-# Whether the vendored fallback is still current enough to be one.
-# This exists because of the order the two paths are reached in: the
-# fallback is taken *precisely when* converging the shared checkout has
-# just failed.  A stale fallback therefore means the box quietly drops
-# to an older BLE stack at the exact moment it has reported being
-# unhealthy — a silent downgrade wearing a safety net's clothes.
 #
-# Our chosen resolution (BCM's CONSUMER_MIGRATION.md offers two) is to
-# keep both paths current by bumping the submodule whenever the shared
-# checkout moves.  That is a promise a person has to keep, so check it
-# out loud at the one moment both shas are in front of us.
-check_fallback_currency() {
-    vendored_dir="$INSTALL_DIR/$APP_DIR/ext/bleak-connection-manager"
+# This is the ONLY source of the stack.  The repo used to vendor a copy
+# as a fallback, which was removed: the fallback was reached precisely
+# when this step had just failed, so a stale one meant silently dropping
+# to an older stack at the moment the box had reported being unhealthy.
+# Prod was found in exactly that state, five commits behind, announcing
+# nothing.
 
-    # Ask git whether this is a checkout rather than looking for a .git
-    # DIRECTORY: in a submodule .git is a *file* pointing into the
-    # superproject, so a -d test silently answers "no" for every real
-    # deployment.  That is what this check ran into on its first live
-    # firing, and the reason the shell test now builds an actual
-    # submodule instead of a plain clone.
-    shared=$(git -C "$BCM_DIR" rev-parse HEAD 2>/dev/null) || return 0
-    vendored=$(git -C "$vendored_dir" rev-parse HEAD 2>/dev/null) || return 0
-    [ "$shared" = "$vendored" ] && return 0
-
-    # Ahead or diverged is not this check's business — only behind is,
-    # because only behind makes the fallback a downgrade.
-    if git -C "$BCM_DIR" merge-base --is-ancestor \
-            "$vendored" "$shared" 2>/dev/null; then
-        behind=$(git -C "$BCM_DIR" rev-list --count \
-                 "$vendored".."$shared" 2>/dev/null || echo "?")
-        echo "  NOTE: vendored BLE fallback is $behind commit(s) behind the shared checkout"
-        echo "        ($(git -C "$vendored_dir" rev-parse --short HEAD) vs $(git -C "$BCM_DIR" rev-parse --short HEAD))."
-        echo "        If convergence ever fails, this box runs the older stack."
-        echo "        Bump the submodule to keep the fallback worth falling back to."
-    fi
-}
-
-echo "Step 3c: Converging shared BLE stack at /data/bcm..."
+echo "Step 3b: Converging shared BLE stack at /data/bcm..."
 BCM_DIR="/data/bcm"
 BCM_URL="https://github.com/TechBlueprints/bleak-connection-manager"
 BCM_OK=true
@@ -245,15 +190,35 @@ if [ "$BCM_OK" = true ]; then
     # No --autowire: that is a fleet-level per-box decision, not ours.
     if "$BCM_DIR/install.sh"; then
         echo "  shared BLE stack ready ($(git -C "$BCM_DIR" rev-parse --short HEAD))"
-        check_fallback_currency
     else
         echo "  WARN: $BCM_DIR/install.sh failed — see its rollback hint above"
         BCM_OK=false
     fi
 fi
+# There is no fallback any more — this repo carries no copy of the stack
+# — so the question is not "did we converge" but "is there a usable
+# stack".  Those are different, and the difference is what keeps a
+# transient failure on an RV uplink from failing an install of a service
+# that would otherwise run perfectly:
+#
+#   fetch failed, shim already present  -> warn, continue on what is there
+#   no shim at all                      -> fatal, because GATT cannot work
 if [ "$BCM_OK" != true ]; then
-    echo "  Falling back to this repo's vendored ext/ copies."
-    echo "  GATT will work, but we are not sharing the fleet's BLE stack."
+    if [ -x "$BCM_DIR/python3" ]; then
+        echo "  Continuing on the stack already at $BCM_DIR"
+        echo "  ($(git -C "$BCM_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown))."
+        echo "  It may be behind; re-run this installer when the link is back."
+    else
+        echo ""
+        echo "Error: no BLE connection stack available."
+        echo "       $BCM_DIR/python3 does not exist and could not be created."
+        echo "       This repo no longer vendors its own copy: the stack is"
+        echo "       shared with every other BLE consumer on this box so that"
+        echo "       the adapter claims in /run/bt-claims mean the same thing"
+        echo "       to all of them."
+        echo "       Fix connectivity to $BCM_URL and re-run."
+        exit 1
+    fi
 fi
 echo ""
 

@@ -1,10 +1,9 @@
 """Run the shell-level tests as part of the suite.
 
-install.sh and the launcher are /bin/sh scripts, so their logic cannot
-be imported.  Each shell test extracts the real function from the
-shipping script and drives it; these wrappers just make them fail the
-normal `tests/run.sh` run rather than waiting to be remembered
-separately.
+The launcher is a /bin/sh script, so its logic cannot be imported.  The
+shell test extracts the real function from the shipping script and
+drives it; this wrapper just makes it fail the normal `tests/run.sh` run
+rather than waiting to be remembered separately.
 """
 from __future__ import annotations
 
@@ -14,7 +13,7 @@ import subprocess
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHELL_TESTS = ["test_launcher_control.sh", "test_fallback_currency.sh"]
+SHELL_TESTS = ["test_launcher_control.sh"]
 
 
 @pytest.mark.parametrize("name", SHELL_TESTS)

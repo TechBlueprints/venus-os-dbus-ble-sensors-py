@@ -83,14 +83,13 @@ This installs to `/data/apps/dbus-ble-sensors-py/`, which persists across firmwa
 
 To update, re-run the same command.
 
-On a Venus device the BLE connection stack comes from the shared
-checkout at `/data/bcm`, which every BLE consumer on the box runs off;
-`install.sh` converges it and the service execs through its `python3`
-shim.  The same stack is also carried as git submodules under `ext/` for
-running from a bare clone, so cloning by hand needs `git clone
---recurse-submodules` (or `git submodule update --init --recursive`
-afterwards) — without either source the advertisement-driven sensors
-still work, but GATT writes and key provisioning cannot run.  See
+The BLE connection stack comes from the shared checkout at `/data/bcm`,
+which every BLE consumer on the box runs off; `install.sh` converges it
+and the service execs through its `python3` shim.  This repo carries no
+copy of its own — adapter claims are a protocol *between* services, and
+a private copy is a private opinion about a shared protocol.  Without
+`/data/bcm` the advertisement-driven sensors still work, but GATT writes
+and key provisioning cannot run.  See
 [`docs/ble-connection-layer.md`](docs/ble-connection-layer.md).
 
 To disable:

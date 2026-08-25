@@ -363,8 +363,8 @@ def main():
     pins = [f"{args.mac.upper()}@{args.adapter}"] if args.adapter else []
     if not ble_catcher.install(owner="dbus-ble-sensors-py.probe",
                                extra_adapters=pins):
-        sys.exit("BLE connection stack unavailable - run "
-                 "'git submodule update --init --recursive'")
+        sys.exit("BLE connection stack unavailable - run install.sh, "
+                 "or /data/bcm/install.sh directly")
 
     print(f"Probing {len(regs)} VREG(s) on {args.mac} "
           f"({'write sentinel' if args.write_sentinel else 'GetValue'}, "
