@@ -71,6 +71,10 @@ stop() {
 }
 
 quit() {
+  # Disarm first.  quit is the handler for INT, TERM *and* EXIT, and
+  # the exit below re-enters it through the EXIT trap — which is why
+  # the previous version printed "Stopping" twice on every signal.
+  trap - INT TERM EXIT
   # Teardown, not a setting change.  If supervise is already gone the
   # service is going down with it, so there is nothing to stop and no
   # reason to wait or to log a scary line about it — this is the normal
