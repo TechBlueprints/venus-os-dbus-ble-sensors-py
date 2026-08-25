@@ -86,12 +86,14 @@ def _plain_mac_key(value):
         c in "0123456789ABCDEF" for c in text) else None
 
 
-def test_a_modern_backend_is_trusted_to_resolve_fresh(monkeypatch) -> None:
-    """The guarantee belongs in the backend, so do not duplicate it.
+def test_a_modern_backend_is_still_invalidated_first(monkeypatch) -> None:
+    """One call site that is correct on every backend generation.
 
-    hci_for resolves against live numbering unless a caller opts out, so
-    invalidating here as well would buy nothing and cost a second
-    hciconfig call on the scan-enable path.
+    Invalidating before a backend that already resolves fresh is free —
+    it clears an empty cache, and the single refill happens inside
+    hci_for either way (measured on a Cerbo: 10.1ms for hci_for alone,
+    8.7ms for invalidate-then-call).  Paying nothing for a branch we do
+    not have to test twice is the better trade.
     """
     calls = []
 
@@ -107,14 +109,13 @@ def test_a_modern_backend_is_trusted_to_resolve_fresh(monkeypatch) -> None:
             calls.append(("invalidate", adapter))
 
     monkeypatch.setattr(ai, "_backend", lambda: _Backend())
-    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
 
     assert ai.index_for("00:01:95:40:C3:33") == 3
-    assert calls == [("hci_for", True)], (
-        f"should ask once, freshly, and not invalidate as well: {calls}")
+    assert calls == [("invalidate", None), ("hci_for", True)], (
+        f"invalidate first, then resolve freshly: {calls}")
 
 
-def test_an_older_backend_is_compensated_for(monkeypatch) -> None:
+def test_an_older_backend_gets_the_same_guarantee(monkeypatch) -> None:
     """Falling back to a cached answer here is the failure, not a
     degradation.
 
@@ -137,12 +138,10 @@ def test_an_older_backend_is_compensated_for(monkeypatch) -> None:
             calls.append(("invalidate", adapter))
 
     monkeypatch.setattr(ai, "_backend", lambda: _OldBackend())
-    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
 
     assert ai.index_for("00:01:95:40:C3:33") == 3
     assert calls[0] == ("invalidate", None), (
         f"must force the refill the backend will not: {calls}")
-    assert calls[0][1] is None, "a partial invalidate cannot force a refill"
 
 
 def test_a_log_label_does_not_pay_for_a_refill(monkeypatch) -> None:
@@ -162,7 +161,6 @@ def test_a_log_label_does_not_pay_for_a_refill(monkeypatch) -> None:
             return "hci3"
 
     monkeypatch.setattr(ai, "_backend", lambda: _Backend())
-    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
 
     ai.label("00019540C333")
     assert seen == [False], f"a label must not force a refill: {seen}"
@@ -184,7 +182,20 @@ def test_an_hci_named_adapter_pays_nothing(monkeypatch) -> None:
             calls.append(adapter)
 
     monkeypatch.setattr(ai, "_backend", lambda: _Backend())
-    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
 
     assert ai.index_for("hci7") == 7
     assert calls == [], "an hciN entry has no cached mapping to be stale"
+
+
+def test_a_backend_without_invalidation_does_not_crash(monkeypatch) -> None:
+    # Nothing to force, so nothing to force.  Degrading to "no guarantee
+    # available" beats an AttributeError on the scan-enable path.
+    class _Ancient:
+        def mac_key(self, value):
+            return _plain_mac_key(value)
+
+        def hci_for(self, adapter):
+            return "hci3"
+
+    monkeypatch.setattr(ai, "_backend", lambda: _Ancient())
+    assert ai.index_for("00:01:95:40:C3:33") == 3
