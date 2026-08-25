@@ -26,6 +26,7 @@ import ble_async_loop
 import ble_gatt_dbus
 import ble_gatt_link
 import victron_vreg as vreg
+from dbus_bus import get_bus
 
 logger = logging.getLogger(__name__)
 
@@ -406,7 +407,13 @@ def start(mac: str, passkey: int,
         return False
     _started.add(mac)
 
-    bus = dbus.SystemBus()
+    # get_bus, not dbus.SystemBus(): the latter is a second
+    # process-wide connection to the same daemon for the same
+    # purpose, and connections are the resource under pressure.
+    # Main-thread only — start() is reached from the
+    # advertisement handler, and only path/props cross to the
+    # BLE loop thread.
+    bus = get_bus("org.bluez")
     suffix = "/dev_" + mac.replace(":", "_")
     try:
         om = dbus.Interface(bus.get_object("org.bluez", "/"),

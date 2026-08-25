@@ -491,6 +491,13 @@ class BleDevice(object):
                 DbusBleService.get().unregister_role_service(role_service)
             except Exception:
                 logging.exception(f"{self._plog} error unregistering role service from BLE service")
+            try:
+                # This device aged out of the store, so its connection
+                # is not being reused by anyone.  Held, it would be a
+                # permanent connection per departed device.
+                role_service.close()
+            except Exception:
+                logging.exception(f"{self._plog} error closing role service bus")
         self._role_services.clear()
 
     def __del__(self):

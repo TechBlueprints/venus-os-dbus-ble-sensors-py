@@ -989,6 +989,13 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
             except Exception:
                 logger.exception("%s: unregister failed for role %r",
                                  self._plog, name)
+            try:
+                # The new role gets a different service name, so this
+                # one is retired for good and its connection with it.
+                role_service.close()
+            except Exception:
+                logger.exception("%s: closing bus failed for role %r",
+                                 self._plog, name)
         self._role_services.clear()
 
         # Register the new role

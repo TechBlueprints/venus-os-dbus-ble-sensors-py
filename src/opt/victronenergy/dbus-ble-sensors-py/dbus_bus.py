@@ -19,9 +19,12 @@ Usage::
     bus = get_bus("com.victronenergy.settings")
 """
 
+import logging
 import os
 import dbus
 import dbus.bus
+
+_logger = logging.getLogger(__name__)
 
 class SystemBus(dbus.bus.BusConnection):
     def __new__(cls):
@@ -50,11 +53,76 @@ def get_bus(cache_key: str) -> dbus.bus.BusConnection:
     """
     bus = _bus_instances.get(cache_key)
     if bus is None or not bus.get_is_connected():
-        _bus_instances[cache_key] = (
-            SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ
-            else SystemBus()
-        )
+        # Close the stale one before dropping it.  Losing the reference
+        # does not close the socket: the GLib watches described at the
+        # top of this file keep it alive at the C level where the GC
+        # cannot see it, so the daemon keeps counting it.
+        if bus is not None:
+            _close_quietly(bus, cache_key)
+        try:
+            _bus_instances[cache_key] = (
+                SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ
+                else SystemBus()
+            )
+        except dbus.DBusException as exc:
+            if exc.get_dbus_name() == \
+                    "org.freedesktop.DBus.Error.LimitsExceeded":
+                # Worth its own line because of how this failure looks
+                # from outside: the caller is usually registering a
+                # newly discovered device, and a device that cannot
+                # register simply never appears.  There is no alarm and
+                # no SENSOR_NOVALUE for a service that was never
+                # created — its absence is indistinguishable from the
+                # device being out of range.  Say so explicitly, or the
+                # only evidence is an anonymous traceback.
+                _logger.critical(
+                    "D-Bus refused a new connection for %r: per-UID limit "
+                    "reached (root's default is 256, and every service on "
+                    "this box shares it).  Holding %d connection(s) here.  "
+                    "Anything being registered right now is being dropped "
+                    "silently — it will look like it was never in range.",
+                    cache_key, len(_bus_instances))
+            raise
     return _bus_instances[cache_key]
+
+
+def _close_quietly(bus: dbus.bus.BusConnection, cache_key: str) -> None:
+    try:
+        bus.close()
+    except Exception:
+        # Already closed, or the daemon dropped us first.  Either way
+        # the connection is gone, which is the outcome we wanted.
+        _logger.debug("closing bus for %r failed", cache_key, exc_info=True)
+
+
+def release_bus(cache_key: str,
+                bus: dbus.bus.BusConnection = None) -> None:
+    """Close and forget the connection cached under *cache_key*.
+
+    Call this when the owner of a cache key is gone for good — a role
+    service torn down by ``BleDevice.delete()`` after its advertisements
+    expired, or the losing side of an Orion-TR role swap.  Without it the
+    cache is append-only: one connection per service name ever seen,
+    held until the process exits.  In a vehicle that moves, "a device we
+    will never see again" is a matter of when, not if.
+
+    This is NOT the path for a device that merely went quiet.  Those keep
+    their connection on purpose, because they keep their identity — see
+    ``DbusRoleService.disconnect``, which releases the bus *name* and
+    leaves the connection ready for the device to come back on.
+
+    Passing *bus* makes the eviction identity-checked: if the cache has
+    since handed this key a different connection (the device came back
+    and re-registered before the old owner was torn down), the live one
+    is left alone.
+    """
+    cached = _bus_instances.get(cache_key)
+    if cached is None:
+        return
+    if bus is not None and cached is not bus:
+        return
+    del _bus_instances[cache_key]
+    _close_quietly(cached, cache_key)
 
 
 def get_private_unattached_bus() -> dbus.bus.BusConnection:

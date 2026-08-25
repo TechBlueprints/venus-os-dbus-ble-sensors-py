@@ -1,6 +1,6 @@
 import logging
 import dbus
-from dbus_bus import get_bus
+from dbus_bus import get_bus, release_bus
 from dbus_settings_service import DbusSettingsService
 from ble_role import BleRole
 from functools import partial
@@ -137,6 +137,18 @@ class DbusRoleService(object):
         self._dbus_service._dbusname.__del__()
         self._dbus_service._dbusname = None
         self._connected = False
+
+    def close(self):
+        """Release this service's D-Bus connection for good.
+
+        Only for a role service that is never coming back — the device
+        expired out of the store, or an Orion-TR swapped to a different
+        role and this service name will never be used again.  A device
+        that merely went quiet keeps its connection; see ``disconnect``.
+        """
+        self.disconnect()
+        release_bus(self._service_name, self._bus)
+        self._bus = None
 
     def on_enabled_changed(self, is_enabled: int):
         if is_enabled:
