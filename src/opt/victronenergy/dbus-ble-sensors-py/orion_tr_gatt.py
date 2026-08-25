@@ -70,7 +70,13 @@ async def _perform_write(address: str, path: Optional[str],
             await client.pair()
         await victron_vreg.write_register(client, register_id, value_bytes)
     finally:
-        await ble_gatt_link.disconnect(client)
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
 
 
 class _ReadCollector:
@@ -201,7 +207,13 @@ async def _perform_read(address: str, path: Optional[str],
                         address, len(collector.frames))
         return values
     finally:
-        await ble_gatt_link.disconnect(client)
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
 
 
 class AsyncGATTWriter:

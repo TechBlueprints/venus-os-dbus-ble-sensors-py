@@ -166,7 +166,13 @@ async def main():
             print(f"EC7D after write={None if found is None else found.hex()}",
                   flush=True)
     finally:
-        await ble_gatt_link.disconnect(client)
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
         stop.set()
         pump.cancel()
         try:

@@ -540,7 +540,13 @@ async def provision(mac: str, passkey: int, timeout_s: float,
         }
     finally:
         if client is not None:
-            await ble_gatt_link.disconnect(client)
+            try:
+                await ble_gatt_link.disconnect(client)
+            finally:
+                # Synchronous, so it still runs if the await above is
+                # cut short by cancellation — that is when the socket
+                # is most likely to be stranded.
+                ble_gatt_link.force_close(client)
         if agent is not None:
             agent.unregister()
         stop.set()
@@ -594,7 +600,13 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
         }
     finally:
         if client is not None:
-            await ble_gatt_link.disconnect(client)
+            try:
+                await ble_gatt_link.disconnect(client)
+            finally:
+                # Synchronous, so it still runs if the await above is
+                # cut short by cancellation — that is when the socket
+                # is most likely to be stranded.
+                ble_gatt_link.force_close(client)
         stop.set()
         try:
             await pump

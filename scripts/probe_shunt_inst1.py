@@ -151,7 +151,13 @@ async def go():
         await w("pathlist 0B", b"\x0B", 1.5)
         print("done frames", len(c.frames), flush=True)
     finally:
-        await ble_gatt_link.disconnect(client)
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
         stop.set()
         try:
             await pump

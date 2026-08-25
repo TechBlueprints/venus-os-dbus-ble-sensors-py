@@ -155,13 +155,60 @@ async def connect(device, name: str | None = None):
     )
 
 
+def force_close(client) -> None:
+    """Close the client's own D-Bus connection if bleak did not.
+
+    bleak's ``disconnect()`` closes ``self._bus`` in its last statements,
+    AFTER its try/finally — so a BlueZ ``Disconnect`` that raises skips
+    them and the connection is stranded.  ``_cleanup_all()`` does not
+    touch ``_bus`` either, despite promising to free leaked resources.
+
+    Every stranded connection counts against the system bus's
+    ``max_connections_per_user``, which on Venus is the built-in 256 for
+    root: the limit line in ``system.conf`` is commented out, and the
+    generous override lives in ``session.conf``, which does not govern
+    the system bus.  A thermostat leaking one connection per retry
+    exhausted that ceiling on prod, and the first symptom was every
+    service that tried to RESTART failing to reach the bus at all.
+
+    Synchronous on purpose.  It is called from ``finally`` blocks that
+    may be unwinding a cancellation, where any ``await`` would re-raise
+    immediately and never run.
+    """
+    backend = getattr(client, "_backend", None)
+    bus = getattr(backend, "_bus", None)
+    if bus is None:
+        return
+    try:
+        bus.disconnect()
+    except Exception:
+        logger.debug("forcing bus close failed", exc_info=True)
+    finally:
+        try:
+            backend._bus = None
+        except Exception:
+            pass
+
+
 async def disconnect(client) -> None:
-    """Best-effort teardown; a failed disconnect must not fail the write."""
+    """Best-effort teardown; a failed disconnect must not fail the write.
+
+    Always ends with :func:`force_close`, because "we asked BlueZ to
+    disconnect" and "the D-Bus socket is closed" are different claims and
+    only the second one bounds the connection count.
+    """
     try:
         await client.disconnect()
+    except asyncio.CancelledError:
+        # Our own wait_for timeout unwinds through here.  The graceful
+        # path is gone, but the socket still has to go.
+        force_close(client)
+        raise
     except Exception:
         logger.debug("disconnect failed (link probably already gone)",
                      exc_info=True)
+    finally:
+        force_close(client)
 
 
 async def settle(seconds: float) -> None:

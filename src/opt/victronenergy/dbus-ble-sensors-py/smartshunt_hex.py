@@ -360,7 +360,13 @@ async def _session(mac: str, passkey: int,
                 next_key = time.monotonic() + 60.0
         return False
     finally:
-        await ble_gatt_link.disconnect(client)
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
 
 
 async def _run_forever(mac: str, passkey: int,

@@ -314,7 +314,13 @@ async def _run(args, regs) -> None:
             else:
                 print(f"  {tag}: silent (no response)")
     finally:
-        await ble_gatt_link.disconnect(client)
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
         if agent is not None:
             agent.unregister()
         stop.set()

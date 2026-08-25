@@ -179,7 +179,13 @@ async def session(mac: str, passkey: int, adapter: str, extra: bool) -> None:
             if fr[:1] not in (b"\x07",) or True:
                 print(f"  [{i}] {fr.hex()}", flush=True)
     finally:
-        await ble_gatt_link.disconnect(client)
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
         stop.set()
         try:
             await pump
