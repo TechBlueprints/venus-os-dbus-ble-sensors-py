@@ -198,8 +198,13 @@ echo ""
 # out loud at the one moment both shas are in front of us.
 check_fallback_currency() {
     vendored_dir="$INSTALL_DIR/$APP_DIR/ext/bleak-connection-manager"
-    [ -d "$vendored_dir/.git" ] || return 0
 
+    # Ask git whether this is a checkout rather than looking for a .git
+    # DIRECTORY: in a submodule .git is a *file* pointing into the
+    # superproject, so a -d test silently answers "no" for every real
+    # deployment.  That is what this check ran into on its first live
+    # firing, and the reason the shell test now builds an actual
+    # submodule instead of a plain clone.
     shared=$(git -C "$BCM_DIR" rev-parse HEAD 2>/dev/null) || return 0
     vendored=$(git -C "$vendored_dir" rev-parse HEAD 2>/dev/null) || return 0
     [ "$shared" = "$vendored" ] && return 0

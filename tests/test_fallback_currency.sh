@@ -14,6 +14,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 # Two commits in one repo; clone it twice so shared and vendored can sit
 # at different points of the same history.
+fail_early() { echo "FAIL: $1"; exit 1; }
+
 SRC="$TMP/src"
 mkdir -p "$SRC"
 git -C "$SRC" init -q
@@ -28,8 +30,17 @@ export INSTALL_DIR="$TMP/install"
 export APP_DIR="app"
 VENDORED="$INSTALL_DIR/$APP_DIR/ext/bleak-connection-manager"
 git clone -q "$SRC" "$BCM_DIR"
-mkdir -p "$(dirname "$VENDORED")"
-git clone -q "$SRC" "$VENDORED"
+
+# The vendored copy must be a real SUBMODULE, not a plain clone.  A
+# submodule's .git is a file pointing into the superproject, not a
+# directory, and the first version of this check tested for a directory
+# — so it silently passed here and silently did nothing on the box.
+# The test has to supply the fact production supplies.
+git -C "$INSTALL_DIR" init -q 2>/dev/null || { mkdir -p "$INSTALL_DIR"; git -C "$INSTALL_DIR" init -q; }
+git -C "$INSTALL_DIR" config user.email t@t; git -C "$INSTALL_DIR" config user.name t
+git -C "$INSTALL_DIR" -c protocol.file.allow=always submodule add -q \
+    "$SRC" "$APP_DIR/ext/bleak-connection-manager"
+[ -f "$VENDORED/.git" ] || fail_early "test setup: vendored copy is not a submodule"
 
 sed -n '/^check_fallback_currency() {/,/^}/p' "$HERE/../install.sh" > "$TMP/fn.sh"
 
