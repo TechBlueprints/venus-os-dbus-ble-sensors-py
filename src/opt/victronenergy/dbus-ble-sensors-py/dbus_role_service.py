@@ -42,9 +42,33 @@ class DbusRoleService(object):
         # ``BleDevice.handle_manufacturer_data`` — without this cache,
         # ``is_connected`` round-trips the daemon via ``NameHasOwner``
         # on every call (~140 RPCs/s on a busy gateway, accounting for
-        # most of the service's CPU time).  The bus name only changes
-        # via the connect/disconnect paths in this process, so a local
-        # flag is authoritative.
+        # most of the service's CPU time).
+        #
+        # What makes the flag authoritative is NOT that "the bus name
+        # only changes via the connect/disconnect paths in this process"
+        # — a bus name also dies with its connection, and connections do
+        # die (``dbus_bus.get_bus`` has a branch for exactly that).  The
+        # real reason is that we do not outlive our connection:
+        # exit_on_disconnect is armed by default on every connection
+        # ``get_bus`` hands out, and dbus-python does not clear it, so a
+        # daemon-side disconnect terminates the process (exit 1) rather
+        # than leaving this object holding a corpse.  runit restarts us
+        # and every service re-registers on a live bus.  Verified on
+        # dev-cerbo: an identical connection dies with the daemon and
+        # only survives if exit_on_disconnect is explicitly cleared.
+        #
+        # So the flag can only go stale if something clears
+        # exit_on_disconnect on a connection we keep using.  One place
+        # does — ``dbus_bus._close_quietly`` — and it clears the flag
+        # only in the statement before ``close()``, on a connection
+        # being discarded.  ``DbusRoleService.close`` reaches it via
+        # ``release_bus``, after ``disconnect`` has already set
+        # ``_connected`` False, and never uses the service again.
+        # Arming that opt-out any earlier (say, at construction in
+        # ``get_bus``) would re-open the gap: this flag would stay True
+        # over a dead bus, ``connect`` would short-circuit on it, and
+        # the service would be silently absent from D-Bus while
+        # believing it was published.  ``test_dbus_bus.py`` pins that.
         self._connected: bool = False
         self._init_dbus_service()
 

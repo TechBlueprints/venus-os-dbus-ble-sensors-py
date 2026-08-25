@@ -87,6 +87,33 @@ def get_bus(cache_key: str) -> dbus.bus.BusConnection:
 
 
 def _close_quietly(bus: dbus.bus.BusConnection, cache_key: str) -> None:
+    # Disarm exit-on-disconnect BEFORE closing, or this function takes
+    # the whole service with it.
+    #
+    # libdbus arms exit_on_disconnect on every bus connection and
+    # dbus-python does not clear it, so the Disconnected message reaches
+    # the process as exit(1).  For a *daemon-side* disconnect that is
+    # exactly what we want: a connection we did not release is a
+    # connection we cannot get back, and dying so runit restarts us is
+    # better than running on with a dead bus.  It is also what makes the
+    # ``_connected`` cache in ``DbusRoleService`` safe.
+    #
+    # But ``dbus_connection_close()`` queues that same Disconnected
+    # locally, so our own cleanup trips the same wire.  ``release_bus``
+    # runs whenever a device ages out of the store or an Orion-TR swaps
+    # roles — one departed tank sensor would take every other device on
+    # the gateway down with it.
+    #
+    # Verified on dev-cerbo: ``release_bus`` on a live connection exits
+    # (1) before the next main-loop iteration, and the same probe runs
+    # to completion once this call is in front of the close.
+    try:
+        bus.set_exit_on_disconnect(False)
+    except Exception:
+        # Never let this be the reason a connection stays open — leaking
+        # one is the failure this module exists to prevent.
+        _logger.debug("disarming exit-on-disconnect for %r failed",
+                      cache_key, exc_info=True)
     try:
         bus.close()
     except Exception:

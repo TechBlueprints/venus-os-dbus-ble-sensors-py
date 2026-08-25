@@ -25,16 +25,26 @@ import dbus_bus
 
 
 class _Bus:
-    """Stands in for a BusConnection; records whether it was closed."""
+    """Stands in for a BusConnection; records whether it was closed.
+
+    ``calls`` keeps the order, because for the exit-on-disconnect
+    handling below it is the ordering that carries the meaning: opting
+    out *after* the close is the same as never opting out at all.
+    """
 
     def __init__(self, connected: bool = True):
         self.closed = False
         self._connected = connected
+        self.calls: list = []
 
     def get_is_connected(self) -> bool:
         return self._connected
 
+    def set_exit_on_disconnect(self, value: bool) -> None:
+        self.calls.append(("set_exit_on_disconnect", value))
+
     def close(self) -> None:
+        self.calls.append(("close",))
         self.closed = True
 
 
@@ -150,3 +160,84 @@ def test_an_unrelated_dbus_error_is_not_relabelled(monkeypatch) -> None:
         pass
     else:
         raise AssertionError("must propagate unchanged")
+
+
+# ── Closing a connection must not take the process with it ────────────
+#
+# libdbus arms exit_on_disconnect by default, and dbus-python does not
+# disarm it: on these mainloop-integrated connections the Disconnected
+# message reaches the process as exit(1).  For a daemon-side disconnect
+# that is the behaviour we want — the service dies, runit restarts it,
+# and it comes back with live connections.  But dbus_connection_close()
+# queues that same Disconnected locally, so OUR OWN cleanup trips it.
+#
+# release_bus() runs whenever a device ages out of the store or an
+# Orion-TR swaps roles.  Unguarded, one departed tank sensor takes down
+# every other device on the gateway.
+#
+# Verified on dev-cerbo against the real module: release_bus() on a live
+# connection exits(1) before the next main-loop iteration, and the same
+# probe survives once exit_on_disconnect is cleared first.
+
+def test_closing_disarms_exit_on_disconnect_first(monkeypatch) -> None:
+    bus = _Bus()
+    _seed(monkeypatch, bus, _Bus())
+    dbus_bus.get_bus("com.victronenergy.tank.departed")
+
+    dbus_bus.release_bus("com.victronenergy.tank.departed")
+
+    assert bus.closed is True
+    assert bus.calls == [("set_exit_on_disconnect", False), ("close",)], (
+        "close() queues a local Disconnected; if exit_on_disconnect is "
+        "still armed when it dispatches, releasing one device's "
+        "connection kills the whole service")
+
+
+def test_replacing_a_stale_connection_also_disarms(monkeypatch) -> None:
+    # A connection already reported dead should not be able to deliver a
+    # second, fatal Disconnected when we close it out of the cache.
+    dead, fresh = _Bus(connected=False), _Bus()
+    _seed(monkeypatch, fresh)
+    dbus_bus._bus_instances["k"] = dead
+
+    assert dbus_bus.get_bus("k") is fresh
+    assert dead.calls == [("set_exit_on_disconnect", False), ("close",)]
+
+
+def test_a_bus_without_the_setter_is_still_closed(monkeypatch) -> None:
+    # Defensive: the disarm must never be the reason a connection is
+    # left open, since leaking one is the failure this module exists to
+    # prevent.
+    class _Raises(_Bus):
+        def set_exit_on_disconnect(self, value: bool) -> None:
+            raise RuntimeError("older dbus-python")
+
+    _seed(monkeypatch)
+    stubborn = _Raises()
+    dbus_bus._bus_instances["k"] = stubborn
+    dbus_bus.release_bus("k")
+    assert stubborn.closed is True
+    assert "k" not in dbus_bus._bus_instances
+
+
+def test_a_live_connection_is_handed_out_still_armed(monkeypatch) -> None:
+    # The other half of the contract, and the one that is easy to break
+    # by "tidying" the opt-out up into the constructor.
+    #
+    # DbusRoleService caches its registration state in a plain bool and
+    # short-circuits connect() on it (~140 NameHasOwner RPCs/s otherwise).
+    # That cache is only safe because we do not outlive our connection:
+    # armed, a daemon-side disconnect exits the process and runit brings
+    # it back on a live bus.  Disarm at construction and the cache would
+    # sit at True over a dead bus, connect() would keep short-circuiting,
+    # and the service would be absent from D-Bus while believing it was
+    # published — the failure that looks exactly like never-there.
+    bus = _Bus()
+    _seed(monkeypatch, bus, _Bus())
+
+    handed_out = dbus_bus.get_bus("com.victronenergy.tank.live")
+
+    assert handed_out is bus
+    assert bus.calls == [], (
+        "exit_on_disconnect must stay armed on connections still in use; "
+        "clear it only in the statement before close()")
