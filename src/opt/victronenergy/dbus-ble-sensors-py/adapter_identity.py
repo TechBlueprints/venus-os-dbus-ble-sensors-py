@@ -109,7 +109,24 @@ def index_for(adapter) -> int | None:
 
     Resolve immediately before the socket call.  A stale index is how a
     scan-enable lands on the card another service is using.
+
+    "Immediately" has to be enforced, not merely intended.  The backend
+    serves adapter MACs from a 30s TTL cache, so a MAC-named adapter
+    would otherwise resolve through a mapping up to a TTL old — and
+    naming a card by its MAC is precisely a statement that its number
+    may change.  For up to that TTL we could open a raw socket on
+    whatever card has since inherited the number, which is the exact
+    isolation failure MAC-naming exists to prevent, arriving through
+    the mechanism chosen to avoid it.
+
+    So drop the cache first when there is something to resolve.  An
+    adapter already written as ``hciN`` has nothing to look up and pays
+    nothing; a MAC costs one refill (~11ms on a Cerbo against ~19us
+    cached), which is affordable here because this sits on scan-enable
+    and accept-list operations, not on the advertisement path.
     """
+    if mac_key(adapter) is not None:
+        invalidate()
     name = hci_for(adapter)
     if name is None or not _HCI_RE.match(name):
         return None
