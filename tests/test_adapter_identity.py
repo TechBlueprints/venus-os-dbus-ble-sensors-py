@@ -86,17 +86,69 @@ def _plain_mac_key(value):
         c in "0123456789ABCDEF" for c in text) else None
 
 
-def test_a_mac_named_adapter_is_resolved_against_current_numbering(
-        monkeypatch) -> None:
-    """Freshness has to be enforced here, not assumed of the backend.
+def test_a_modern_backend_is_trusted_to_resolve_fresh(monkeypatch) -> None:
+    """The guarantee belongs in the backend, so do not duplicate it.
 
-    The backend serves adapter MACs from a 30s TTL cache.  Naming a card
-    by its MAC is a statement that its number may change, so resolving
-    one through a cached mapping can hand us whatever card has since
-    inherited the number — and index_for feeds raw HCI socket calls, so
-    that is a scan-enable landing on another service's card.
+    hci_for resolves against live numbering unless a caller opts out, so
+    invalidating here as well would buy nothing and cost a second
+    hciconfig call on the scan-enable path.
     """
     calls = []
+
+    class _Backend:
+        def mac_key(self, value):
+            return _plain_mac_key(value)
+
+        def hci_for(self, adapter, fresh=True):
+            calls.append(("hci_for", fresh))
+            return "hci3"
+
+        def invalidate_adapter_mac(self, adapter=None):
+            calls.append(("invalidate", adapter))
+
+    monkeypatch.setattr(ai, "_backend", lambda: _Backend())
+    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
+
+    assert ai.index_for("00:01:95:40:C3:33") == 3
+    assert calls == [("hci_for", True)], (
+        f"should ask once, freshly, and not invalidate as well: {calls}")
+
+
+def test_an_older_backend_is_compensated_for(monkeypatch) -> None:
+    """Falling back to a cached answer here is the failure, not a
+    degradation.
+
+    An installer whose /data/bcm convergence failed runs the vendored
+    copy, which may predate the fresh-by-default contract.  index_for
+    feeds raw HCI socket calls, so a stale number means programming a
+    scan onto whatever card inherited it.
+    """
+    calls = []
+
+    class _OldBackend:
+        def mac_key(self, value):
+            return _plain_mac_key(value)
+
+        def hci_for(self, adapter):          # no `fresh` parameter
+            calls.append(("hci_for", None))
+            return "hci3"
+
+        def invalidate_adapter_mac(self, adapter=None):
+            calls.append(("invalidate", adapter))
+
+    monkeypatch.setattr(ai, "_backend", lambda: _OldBackend())
+    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
+
+    assert ai.index_for("00:01:95:40:C3:33") == 3
+    assert calls[0] == ("invalidate", None), (
+        f"must force the refill the backend will not: {calls}")
+    assert calls[0][1] is None, "a partial invalidate cannot force a refill"
+
+
+def test_a_log_label_does_not_pay_for_a_refill(monkeypatch) -> None:
+    # These run per adapter per scan cycle.  A name a few seconds stale
+    # is a cosmetic wrong; an hciconfig call per log line is a real cost.
+    seen = []
 
     class _Backend:
         def mac_key(self, value):
@@ -105,19 +157,15 @@ def test_a_mac_named_adapter_is_resolved_against_current_numbering(
         def adapter_key(self, adapter):
             return str(adapter)
 
-        def hci_for(self, adapter):
-            calls.append(("hci_for", str(adapter)))
+        def hci_for(self, adapter, fresh=True):
+            seen.append(fresh)
             return "hci3"
 
-        def invalidate_adapter_mac(self, adapter=None):
-            calls.append(("invalidate", adapter))
-
     monkeypatch.setattr(ai, "_backend", lambda: _Backend())
+    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
 
-    assert ai.index_for("00:01:95:40:C3:33") == 3
-    assert calls[0][0] == "invalidate", (
-        f"must drop the cache before resolving, got {calls}")
-    assert calls[0][1] is None, "a partial invalidate cannot force a refill"
+    ai.label("00019540C333")
+    assert seen == [False], f"a label must not force a refill: {seen}"
 
 
 def test_an_hci_named_adapter_pays_nothing(monkeypatch) -> None:
@@ -129,13 +177,14 @@ def test_an_hci_named_adapter_pays_nothing(monkeypatch) -> None:
         def mac_key(self, value):
             return _plain_mac_key(value)
 
-        def hci_for(self, adapter):
+        def hci_for(self, adapter, fresh=True):
             return str(adapter)
 
         def invalidate_adapter_mac(self, adapter=None):
             calls.append(adapter)
 
     monkeypatch.setattr(ai, "_backend", lambda: _Backend())
+    monkeypatch.setattr(ai, "_FRESH_CAPABLE", None)
 
     assert ai.index_for("hci7") == 7
     assert calls == [], "an hciN entry has no cached mapping to be stale"

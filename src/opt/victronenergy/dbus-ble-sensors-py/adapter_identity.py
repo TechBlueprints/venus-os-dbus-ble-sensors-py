@@ -34,12 +34,17 @@ MAC binding, better than refusing to scan.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 
 import ble_ext_path
 
 logger = logging.getLogger(__name__)
+
+# Whether the loaded backend honours hci_for(fresh=): probed once,
+# because it is a property of the module, not of the call.
+_FRESH_CAPABLE = None
 
 _HCI_RE = re.compile(r"^hci\d+$")
 _HEX12_RE = re.compile(r"^[0-9A-F]{12}$")
@@ -95,11 +100,44 @@ def canonical(adapter) -> str:
     return key if key is not None else str(adapter).strip()
 
 
-def hci_for(adapter) -> str | None:
-    """The ``hciN`` an adapter answers to *right now*, or None if gone."""
+def _backend_resolves_fresh() -> bool:
+    """Whether the backend's ``hci_for`` honours ``fresh``.
+
+    Cached per process: it is a property of the loaded module, and this
+    is asked on the scan-enable path.
+    """
+    global _FRESH_CAPABLE
+    if _FRESH_CAPABLE is None:
+        backend = _backend()
+        try:
+            _FRESH_CAPABLE = "fresh" in inspect.signature(
+                backend.hci_for).parameters
+        except Exception:
+            _FRESH_CAPABLE = False
+    return _FRESH_CAPABLE
+
+
+def hci_for(adapter, fresh: bool = True) -> str | None:
+    """The ``hciN`` an adapter answers to *right now*, or None if gone.
+
+    Fresh by default, matching the backend: a MAC-named card is one whose
+    number may change, so a stale answer is not a cheaper version of the
+    right answer, it is the wrong one.
+
+    ``fresh=False`` is for callers that only want a readable name — the
+    refill costs an ``hciconfig`` call (~11ms on a Cerbo against ~19us
+    cached), which is the wrong price to pay per log line.  Never pass it
+    on a path that opens a socket.
+    """
     backend = _backend()
     if backend is not None:
-        return backend.hci_for(adapter)
+        try:
+            return backend.hci_for(adapter, fresh=fresh)
+        except TypeError:
+            # A backend from before freshness was a parameter.  It
+            # resolves from a 30s cache; index_for compensates rather
+            # than silently accepting the staleness.
+            return backend.hci_for(adapter)
     text = str(adapter).strip()
     return text if _HCI_RE.match(text) else None
 
@@ -119,13 +157,15 @@ def index_for(adapter) -> int | None:
     isolation failure MAC-naming exists to prevent, arriving through
     the mechanism chosen to avoid it.
 
-    So drop the cache first when there is something to resolve.  An
-    adapter already written as ``hciN`` has nothing to look up and pays
-    nothing; a MAC costs one refill (~11ms on a Cerbo against ~19us
-    cached), which is affordable here because this sits on scan-enable
-    and accept-list operations, not on the advertisement path.
+    The backend now guarantees this itself — ``hci_for`` resolves against
+    live numbering unless a caller opts out — so the ordinary path is
+    simply to ask for it.  We still invalidate when the backend predates
+    that guarantee, because degrading to a silently cached answer here is
+    exactly the outcome the whole MAC-identity change exists to avoid,
+    and an installer that fell back to an older vendored copy is the case
+    where that would happen.
     """
-    if mac_key(adapter) is not None:
+    if mac_key(adapter) is not None and not _backend_resolves_fresh():
         invalidate()
     name = hci_for(adapter)
     if name is None or not _HCI_RE.match(name):
@@ -148,7 +188,10 @@ def label(key: str, name: str | None = None) -> str:
     actually keyed by, and printing both is what makes a renumbering
     visible in the log rather than merely confusing.
     """
-    name = name or hci_for(key)
+    # fresh=False deliberately: this is a log label.  A name that is a
+    # few seconds out of date is a cosmetic wrong; an hciconfig call per
+    # log line is a real cost, and these run per adapter per scan cycle.
+    name = name or hci_for(key, fresh=False)
     if name and name != key:
         return f"{name} ({key})"
     return str(name or key)
