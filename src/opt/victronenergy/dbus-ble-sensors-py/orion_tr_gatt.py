@@ -151,6 +151,27 @@ async def _stop_notify_all(client, acquired) -> None:
     entirely.  That window is now the only one that leaves an acquire
     outstanding, where before every session did.
     """
+    if not acquired:
+        return
+    # Do NOT release on a link BlueZ has already torn down.  That is the
+    # "notify client already freed" precondition for the 5.72 UAF, and
+    # it buys nothing: a dead link has no notify left to stop.
+    #
+    # This is not theoretical.  Releasing unconditionally converted a
+    # rare landmine into a deliberate detonation on every FAILING
+    # session — measured on prod, six of six bluetoothd SIGSEGVs landed
+    # within 0-1 s of a session drop, and the crash-per-failed-session
+    # rate went from ~0.01 to ~0.15.  Volume did not change; the yield
+    # did.  On a box where most sessions fail, the failing path is the
+    # volume and the clean path is the rare case, so guarding here is
+    # what keeps the hygiene where it was aimed.
+    try:
+        alive = bool(client.is_connected)
+    except Exception:
+        alive = False
+    if not alive:
+        acquired.clear()
+        return
     while acquired:
         char = acquired.pop()
         try:

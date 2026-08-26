@@ -50,10 +50,11 @@ class _Services:
 
 
 class _Client:
-    def __init__(self, fail_on=()):
+    def __init__(self, fail_on=(), connected=True):
         self.started = []
         self.stopped = []
         self.services = _Services()
+        self.is_connected = connected
         self._fail_on = set(fail_on)
 
     async def start_notify(self, char, callback, **kw):
@@ -119,3 +120,60 @@ def test_releasing_nothing_is_harmless(mod) -> None:
     asyncio.get_event_loop().run_until_complete(
         mod._stop_notify_all(client, []))
     assert client.stopped == []
+
+
+def test_a_dead_link_is_not_released(mod) -> None:
+    """The guard that stopped prod crashing every ~60 s.
+
+    Releasing a notify on a link BlueZ has already torn down is the
+    "notify client already freed" precondition for the 5.72 UAF, and it
+    buys nothing — a dead link has no notify to stop.  Without this,
+    every FAILING session walked notify_io_destroy deliberately: six of
+    six bluetoothd SIGSEGVs on prod landed within 0-1 s of a session
+    drop, and crashes-per-failed-session went from ~0.01 to ~0.15 while
+    session volume actually fell.
+    """
+    client = _Client(connected=False)
+    acquired = ["a", "b"]
+
+    asyncio.get_event_loop().run_until_complete(
+        mod._stop_notify_all(client, acquired))
+
+    assert client.stopped == [], "must not touch a torn-down link"
+    assert acquired == [], "but must still forget them"
+
+
+def test_a_live_link_is_still_released(mod) -> None:
+    # The hygiene case this was always aimed at: a clean session end,
+    # where the acquire is real and BlueZ is still holding it.
+    client = _Client(connected=True)
+    acquired = ["a", "b"]
+
+    asyncio.get_event_loop().run_until_complete(
+        mod._stop_notify_all(client, acquired))
+
+    assert sorted(client.stopped) == ["a", "b"]
+    assert acquired == []
+
+
+def test_an_unreadable_connection_state_is_treated_as_dead(mod) -> None:
+    # A client whose is_connected raises is not one to walk the buggy
+    # path on; degrade toward not-releasing, which is the safe side.
+    class _Broken:
+        def __init__(self):
+            self.stopped = []
+            self.services = _Services()
+
+        @property
+        def is_connected(self):
+            raise RuntimeError("backend gone")
+
+        async def stop_notify(self, char):
+            self.stopped.append(char)
+
+    client = _Broken()
+    acquired = ["a"]
+    asyncio.get_event_loop().run_until_complete(
+        mod._stop_notify_all(client, acquired))
+    assert client.stopped == []
+    assert acquired == []
