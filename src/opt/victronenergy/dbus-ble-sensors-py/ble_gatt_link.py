@@ -59,8 +59,8 @@ DISCOVERY_TIMEOUT_S = 12.0
 #
 # Which bucket a failure lands in is a substring match against brc's
 # TRANSIENT_ERRORS.  "Operation already in progress" is not in that set,
-# so a cross-process collision (see orion_tr_gatt.external_session)
-# counts as a connect_error; the surplus attempts around one come from
+# so a same-device collision counts as a connect_error; the surplus
+# attempts around one come from
 # transient errors mixed into the same call, typically
 # le-connection-abort-by-local — which is itself the signature of a link
 # being torn down by somebody else.

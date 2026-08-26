@@ -17,18 +17,15 @@ lives in :mod:`dbus_ble_sensors` next to the Orion-TR / IP22 matchers.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
 import struct
-import subprocess
-import threading
 import time
 from typing import Any, Dict, Optional
 
-from gi.repository import GLib
 
+import hex_key_session
 from ble_charger_common import (
+    ChargerCommonMixin,
     bluez_device_name as _bluez_device_name,
     format_mac_colons as _format_mac_colons,
     serial_from_advertised_name as _serial_from_advertised_name,
@@ -108,10 +105,6 @@ _ALARM_PATHS = (
     (512, "/Alarms/Ripple"),
 )
 
-_KEY_CLI_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "orion_tr_key_cli.py")
-
-_provision_lock = threading.Lock()
 _provision_busy = False
 
 
@@ -163,59 +156,6 @@ def _format_firmware_version(raw_hex: Optional[str]) -> Optional[str]:
         suffix = {0x40: "", 0x50: "~beta", 0xF0: "~dev"}.get(kind, "")
         return base + suffix
     return raw_hex
-
-
-def _run_key_cli(mac: str, passkey: int,
-                 timeout_s: float = 60.0,
-                 preferred_adapter: Optional[str] = None,
-                 ) -> Optional[Dict[str, Any]]:
-    cmd = [
-        "python3", _KEY_CLI_PATH,
-        mac,
-        "--passkey", str(passkey),
-        "--timeout", str(int(timeout_s)),
-    ]
-    if preferred_adapter:
-        cmd.extend(["--preferred-adapter", preferred_adapter])
-    logger.info("Spawning SmartShunt key-provisioner: %s", " ".join(cmd))
-    try:
-        # Tell the in-process GATT writer to wait: BlueZ refuses a
-        # second concurrent connect to one device, and the refusal
-        # lands on whichever side asked second.
-        with orion_tr_gatt.external_session(mac):
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s + 20.0,
-                check=False,
-            )
-    except subprocess.TimeoutExpired:
-        logger.warning("smartshunt key-provisioner timed out for %s", mac)
-        return None
-    except Exception:
-        logger.exception("failed to spawn smartshunt key-provisioner")
-        return None
-
-    if result.returncode != 0:
-        logger.warning("smartshunt key-provisioner exited %d: %s",
-                       result.returncode, (result.stderr or "").strip())
-        return None
-
-    raw = (result.stdout or "").strip()
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        logger.warning("smartshunt key-provisioner non-JSON output: %r", raw)
-        return None
-
-    key = str(payload.get("key", "")).strip().lower()
-    if len(key) != 32 or any(c not in "0123456789abcdef" for c in key):
-        logger.warning("smartshunt key-provisioner returned invalid key: %r",
-                       key)
-        return None
-    payload["key"] = key
-    return payload
 
 
 def _alarm_value(parsed) -> int:
@@ -484,8 +424,8 @@ class BleDeviceSmartShunt(BleDevice):
         self._last_provision_attempt = now
         mac_colon = _format_mac_colons(self.info["dev_mac"])
         logger.info(
-            "%s: no advertisement key cached — spawning subprocess to "
-            "read VREG 0xEC65",
+            "%s: no advertisement key cached — provisioning in-process "
+            "(VREG 0xEC65)",
             self._plog,
         )
 
@@ -493,31 +433,20 @@ class BleDeviceSmartShunt(BleDevice):
         pref_adapter = get_preferred_adapter(self._dbus_settings,
                                              self.info["dev_mac"])
 
-        def worker():
+        def done(payload):
             global _provision_busy
-            try:
-                with _provision_lock:
-                    payload = _run_key_cli(mac_colon,
-                                           self._pairing_passkey,
-                                           preferred_adapter=pref_adapter)
-                if not payload:
-                    logger.warning(
-                        "%s: key provisioning did not produce a 16-byte "
-                        "key; will retry after backoff", self._plog)
-                    return
-                # Settings writes and role-service publishes are
-                # dbus-python on a connection owned by the GLib main
-                # context.  This is a worker thread, so marshal the whole
-                # persist onto the mainloop rather than calling across
-                # threads — the cross-thread case is what corrupted the
-                # heap (see dbus_bus.get_private_unattached_bus).
-                GLib.idle_add(self._persist_provisioning_result, payload)
-            finally:
-                _provision_busy = False
+            _provision_busy = False
+            payload = hex_key_session.valid_key_payload(payload)
+            if not payload:
+                logger.warning(
+                    "%s: key provisioning did not produce a 16-byte "
+                    "key; will retry after backoff", self._plog)
+                return
+            self._persist_provisioning_result(payload)
 
-        threading.Thread(
-            target=worker, name=f"smartshunt-keyprov-{mac_colon}",
-            daemon=True).start()
+        ChargerCommonMixin._gatt_writer().provision_key(
+            mac_colon, self._pairing_passkey,
+            on_done=done, prefer_adapter=pref_adapter)
 
     def _persist_provisioning_result(self, payload: Dict[str, Any]) -> None:
         key_hex = payload.get("key")

@@ -21,7 +21,15 @@ Usage::
 
 On success prints a JSON object to stdout and exits 0; on failure prints
 diagnostics to stderr and exits non-zero.  Callers depend on that
-contract (see ``_run_key_cli`` in both charger drivers).
+contract the drivers used before provisioning moved in-process
+(AsyncGATTWriter.provision_key); the CLI remains for provisioning and
+diagnosis by hand.
+
+Run by hand while the service is running, nothing referees a collision
+on the same device except BlueZ itself — the service serialises its own
+GATT work through its writer slot, but it cannot see this process.  If
+a session fails with "Operation already in progress", that is you
+racing the service; stop it or wait out its poll.
 
 The connection runs through bcmv2 like every other link this project
 opens, so a provisioning attempt is visible to — and placed around — the
@@ -72,22 +80,14 @@ import ble_gatt_link  # noqa: E402
 import victron_vreg as vreg  # noqa: E402
 
 from hex_key_session import (  # noqa: E402
-    _GET_KEY,
-    VREG_FIRMWARE,
-    VREG_PRODUCT_ID,
-    VREG_TEMPERATURE,
     _Collector,
     _credits,
     _fetch_vreg,
     _handshake,
-    _official_key_preamble,
     _prime,
-    _puk_pin_auth,
-    _read_hardware_version,
-    _read_key,
-    _refused_encryption,
     _start_notify,
     _stop_notify_all,
+    provision_session,
 )
 
 
@@ -145,47 +145,12 @@ async def provision(mac: str, passkey: int, timeout_s: float,
     client = None
     try:
         client = await ble_gatt_link.connect(device, mac)
-        if agent is not None:
-            _err(f"Pairing with {mac} (passkey {passkey:06d})")
-            await client.pair()
-            _err("Paired")
-
-        collector = _Collector()
-        acquired: list = []
-        # CTRL first: the device wants its CCCD set before it will push
-        # the session header.
-        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl, acquired)
-        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last, acquired)
-        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk, acquired)
-        await _start_notify(client, vreg.CHAR_PUK, collector.on_puk, acquired)
-        await asyncio.sleep(0.5)
-
-        await _handshake(client)
-        await _prime(client, collector)
-
-        key = await _read_key(client, collector, passkey, acquired,
-                              timeout_s)
-
-        firmware = await _fetch_vreg(client, collector, VREG_FIRMWARE,
-                                     "firmware")
-        product_id = await _fetch_vreg(client, collector, VREG_PRODUCT_ID,
-                                       "product id")
-        temperature = await _fetch_vreg(client, collector, VREG_TEMPERATURE,
-                                        "temperature")
-        hardware_version = await _read_hardware_version(client)
-
-        return {
-            "key": key.hex(),
-            "firmware": firmware,
-            "product_id": product_id,
-            "temperature": temperature,
-            "hardware_version": hardware_version,
-            "adapter": adapter,
-        }
+        payload = await provision_session(client, passkey, timeout_s,
+                                          pair=agent is not None)
+        payload["adapter"] = adapter
+        return payload
     finally:
         if client is not None:
-            # Before the link drops, not after — see _stop_notify_all.
-            await _stop_notify_all(client, acquired)
             try:
                 await ble_gatt_link.disconnect(client)
             finally:

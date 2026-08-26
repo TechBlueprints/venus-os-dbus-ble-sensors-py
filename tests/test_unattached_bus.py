@@ -59,10 +59,16 @@ def test_follower_closes_when_its_thread_stops() -> None:
     assert "finally" in src and "close()" in src
 
 
-def test_provisioning_persists_are_marshalled_to_the_mainloop() -> None:
-    # Every provisioning worker is a thread; the persist does settings
-    # writes and role publishes, so it must not run there.  Read the
-    # sources from disk — importing these drags in the whole service.
+def test_provisioning_persists_run_on_the_mainloop() -> None:
+    """The persist does settings writes and role publishes — GLib-thread
+    work.  It used to be marshalled there with GLib.idle_add from a
+    provisioning worker THREAD; provisioning now runs in-process through
+    AsyncGATTWriter.provision_key, whose completion callback already
+    arrives on the GLib thread (ble_async_loop.submit marshals it), so
+    the correct shape is a direct call from the done callback and NO
+    worker thread left to be wrong on.  What this pins is the absence of
+    the thread machinery: no provisioning Thread, no idle_add wrapper.
+    """
     import os
     here = os.path.dirname(os.path.abspath(__file__))
     driver = os.path.normpath(os.path.join(
@@ -71,6 +77,8 @@ def test_provisioning_persists_are_marshalled_to_the_mainloop() -> None:
                  "ble_device_ip22_charger.py"):
         with open(os.path.join(driver, name)) as fh:
             src = fh.read()
-        assert "GLib.idle_add(self._persist_provisioning_result" in src, name
-        assert "\n                self._persist_provisioning_result(payload)" \
-            not in src, f"{name} still calls it directly on the worker thread"
+        assert "provision_key(" in src, f"{name} should use the writer"
+        assert "GLib.idle_add(self._persist_provisioning_result" not in src, \
+            f"{name}: the idle_add marshal implies a worker thread came back"
+        assert "keyprov" not in src, \
+            f"{name}: provisioning worker thread still present"

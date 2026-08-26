@@ -34,8 +34,6 @@ the same contract ``ble_charger_common``'s write queue has always used.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import threading
 import logging
 import time
 from typing import Callable, Optional
@@ -61,10 +59,6 @@ async def _perform_write(address: str, path: Optional[str],
                          props: Optional[dict], register_id: int,
                          value_bytes: bytes, pair: bool) -> None:
     """Resolve → connect → (pair) → write → disconnect, on the BLE loop."""
-    # Serialise against provisioning/telemetry subprocesses on this
-    # device: BlueZ refuses a second concurrent connect, and the
-    # refusal surfaces as a failed write the user is watching.
-    await _await_external_clear(address)
     device = await ble_gatt_link.resolve(address, path, props)
     client = await ble_gatt_link.connect(device, address)
     try:
@@ -187,15 +181,37 @@ async def _credits(client, n: int = 0x80) -> None:
         pass
 
 
+async def _perform_provision(address: str, path, props,
+                             passkey: int, pair: bool,
+                             timeout_s: float) -> dict:
+    """Resolve -> connect -> hex_key_session.provision_session -> teardown.
+
+    The dbus-python half (device lookup, pairing agent) happened on the
+    GLib thread in :meth:`AsyncGATTWriter.provision_key` before this was
+    scheduled; from here down it is pure bleak on the BLE loop.
+    """
+    import hex_key_session
+
+    device = await ble_gatt_link.resolve(address, path, props)
+    client = await ble_gatt_link.connect(device, address)
+    try:
+        return await hex_key_session.provision_session(
+            client, passkey, timeout_s, pair=pair)
+    finally:
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            # Synchronous, so it still runs if the await above is
+            # cut short by cancellation — that is when the socket
+            # is most likely to be stranded.
+            ble_gatt_link.force_close(client)
+
+
 async def _perform_read(address: str, path: Optional[str],
                         props: Optional[dict], register_ids: list[int],
                         extra_writes: list[tuple[int, bytes]],
                         pair: bool) -> dict[int, bytes]:
     """Resolve → connect → GetValue (and optional SetValue) → disconnect."""
-    # Serialise against provisioning/telemetry subprocesses on this
-    # device: BlueZ refuses a second concurrent connect, and the
-    # refusal surfaces as a failed write the user is watching.
-    await _await_external_clear(address)
     device = await ble_gatt_link.resolve(address, path, props)
     client = await ble_gatt_link.connect(device, address)
     values: dict[int, bytes] = {}
@@ -276,124 +292,6 @@ async def _perform_read(address: str, path: Optional[str],
             # cut short by cancellation — that is when the socket
             # is most likely to be stranded.
             ble_gatt_link.force_close(client)
-
-
-# ---------------------------------------------------------------------
-# Cross-process GATT serialisation
-# ---------------------------------------------------------------------
-#
-# Key provisioning and telemetry run in SUBPROCESSES (orion_tr_key_cli),
-# because they need their own asyncio loop and pairing agent.  Those
-# subprocesses connect to the same device this writer connects to, and
-# BlueZ will not have two connect attempts in flight for one device: the
-# second gets ``org.bluez.Error.Failed: Operation already in progress``,
-# which surfaces here as "Failed to connect after N attempt(s)".
-#
-# The charger already declines to spawn telemetry while the writer is
-# busy.  The reverse gate was missing, so a mode write arriving just
-# after a telemetry poll started would collide — observed on dev-cerbo,
-# where both failures began within 3 s of a spawn while every write that
-# began 5 s or more after one succeeded.
-#
-# Confirmed at source in BlueZ 5.72 (traced by the BCM session).  The
-# message is ``strerror(EALREADY)`` leaking through the LE connect path:
-# ``device_connect_le`` returns -EALREADY when ``dev->att_io || dev->att``
-# is set, and ``dev_connect`` wraps that as
-# ``btd_error_failed(msg, strerror(-err))``.  Two things follow that are
-# worth knowing before anyone tries to detect this:
-#
-# * The precondition is **per device, not per client** — those are
-#   ``btd_device`` fields and nothing on that path compares senders.  It
-#   fires when ANY originator has an LE connect in flight, including
-#   bluetoothd's own auto-connect.  That is the source-level confirmation
-#   of what the timings said.
-# * Do not match on the D-Bus error NAME.  ``.Failed`` is the catch-all
-#   for every ``device_connect_le`` failure; the ``.InProgress`` variant
-#   of the same logical condition belongs to the BR/EDR bearer, so the
-#   split carries no meaning here.  And do not match loosely on
-#   "in progress" either: ``strerror(EINPROGRESS)`` is "Operation NOW in
-#   progress", one word away and a genuinely different condition.
-#
-# We are clear of that trap by construction — ``ble_gatt_link.unreachable``
-# classifies on exception TYPE names, never on message text.
-#
-# Why this registry and not ``/run/bt-claims``, which is cross-process by
-# construction and already qualifies soft claims by device MAC: a claim
-# cannot exist before the code knows which device it wants, and the
-# collision window opens earlier than that.  A subprocess spends its
-# first seconds in DISCOVERY, with no target MAC to qualify anything by,
-# and measured on dev-cerbo a CLI run can spend its entire life there —
-# 120 samples at 0.5 s, hard ``.scan`` claim present throughout, no
-# device-scoped claim at any point.  That is phase ordering, not a gap in
-# the claim design (BCM takes the soft claim before the connect attempt,
-# not on success, so it does cover *attempting*).  Nothing per-device can
-# cover a phase that precedes device selection.
-#
-# The registry covers the whole subprocess lifetime because it is keyed
-# at spawn, before the subprocess has done anything.  What neither covers
-# is a CLI run started by hand outside this process; that hole is known
-# and deliberately left open rather than closed with a check that is
-# silent during discovery.
-#
-# A registry rather than a lock: the writer must not block the GLib
-# thread, so the wait happens inside the coroutine, and a stuck entry
-# must not deadlock the writer forever.  Subprocess lifetimes are
-# bounded by their own --timeout, and the wait here is bounded above
-# that, so the worst case is a late write rather than a lost one.
-
-_external_sessions: dict[str, int] = {}
-_external_lock = threading.Lock()
-
-# Longer than any subprocess's own timeout (35-40 s), so a write waits
-# out a live session rather than racing it, and gives up only if
-# something is genuinely stuck.
-EXTERNAL_SESSION_WAIT_S = 50.0
-
-
-@contextlib.contextmanager
-def external_session(mac: str):
-    """Mark *mac* as having an out-of-process GATT session in flight."""
-    key = mac.upper()
-    with _external_lock:
-        _external_sessions[key] = _external_sessions.get(key, 0) + 1
-    try:
-        yield
-    finally:
-        with _external_lock:
-            remaining = _external_sessions.get(key, 1) - 1
-            if remaining > 0:
-                _external_sessions[key] = remaining
-            else:
-                _external_sessions.pop(key, None)
-
-
-def external_session_active(mac: str) -> bool:
-    with _external_lock:
-        return _external_sessions.get(mac.upper(), 0) > 0
-
-
-async def _await_external_clear(mac: str) -> None:
-    """Wait for any subprocess session on *mac* to finish.
-
-    Deliberately not an error when it does not clear: proceeding and
-    letting BlueZ refuse is no worse than refusing here ourselves, and
-    the log line distinguishes the two cases for whoever reads it.
-    """
-    if not external_session_active(mac):
-        return
-    logger.info("%s: waiting for an out-of-process GATT session to finish",
-                mac)
-    waited = 0.0
-    while waited < EXTERNAL_SESSION_WAIT_S:
-        await asyncio.sleep(0.5)
-        waited += 0.5
-        if not external_session_active(mac):
-            logger.info("%s: out-of-process session finished after %.1fs",
-                        mac, waited)
-            return
-    logger.warning(
-        "%s: out-of-process GATT session still active after %.0fs; "
-        "proceeding anyway", mac, EXTERNAL_SESSION_WAIT_S)
 
 
 class AsyncGATTWriter:
@@ -541,6 +439,82 @@ class AsyncGATTWriter:
         if not ble_async_loop.submit(make_coro, settled):
             logger.error("%s: could not schedule HEX read", mac)
             self._finish_read(on_done, False, {})
+
+
+    def provision_key(self, mac: str, passkey: int,
+                      on_done: Callable,
+                      prefer_adapter: Optional[str] = None,
+                      timeout_s: float = 60.0):
+        """Read the Instant Readout advertisement key (VREG 0xEC65).
+
+        ``on_done(payload_or_None)``, on the GLib thread.  The payload is
+        what the drivers persist: key/firmware/product_id/temperature/
+        hardware_version, plus ``adapter``.
+
+        This used to be a subprocess (orion_tr_key_cli), which meant two
+        of our own processes connecting to one device — the collision
+        BlueZ refuses (dev->att_io).  In-process it shares this writer's
+        single slot with every mode write and telemetry poll, so the
+        serialisation is the slot itself and there is no second process
+        left to referee.
+
+        Provisioning can legitimately hold the slot for up to
+        ``timeout_s``: it runs once per device, and a mode write arriving
+        meanwhile is rejected-with-callback exactly as during any other
+        busy window.  The overall bound mirrors the old subprocess bound
+        (timeout_s + 20) so a wedged session frees the slot rather than
+        holding it forever.
+        """
+        if self._busy:
+            logger.warning("GATT writer busy, rejecting provisioning for %s",
+                           mac)
+            on_done(None)
+            return
+
+        mac = mac.upper()
+        self._busy = True
+
+        if not ble_async_loop.start():
+            logger.error("%s: BLE connection stack unavailable — cannot "
+                         "provision", mac)
+            self._finish(lambda ok: on_done(None), False)
+            return
+
+        # dbus-python work, on this (GLib) thread only.
+        path, props = ble_gatt_dbus.lookup_device(
+            self._bus, mac, prefer_adapter=prefer_adapter)
+        needs_pair = not (props or {}).get("Paired")
+        if needs_pair:
+            self._agent = ble_gatt_dbus.PairingAgent(self._bus, passkey, mac)
+            self._agent.register()
+
+        logger.info("Key provisioning starting for %s%s", mac,
+                    "" if path else " (device unknown to BlueZ)")
+
+        adapter = ble_gatt_dbus.adapter_from_path(path)
+
+        def make_coro():
+            return asyncio.wait_for(
+                _perform_provision(mac, path, props, passkey, needs_pair,
+                                   timeout_s),
+                timeout=timeout_s + 20.0)
+
+        def settled(result, error):
+            if error is not None:
+                if isinstance(error, asyncio.TimeoutError):
+                    logger.error("%s: provisioning timed out after %.0fs",
+                                 mac, timeout_s + 20.0)
+                else:
+                    logger.error("%s: provisioning failed: %s", mac, error)
+                self._finish(lambda ok: on_done(None), False)
+                return
+            payload = dict(result or {})
+            payload.setdefault("adapter", adapter)
+            self._finish(lambda ok: on_done(payload), True)
+
+        if not ble_async_loop.submit(make_coro, settled):
+            logger.error("%s: could not schedule provisioning", mac)
+            self._finish(lambda ok: on_done(None), False)
 
     def _finish_read(self, on_done: Optional[Callable], success: bool,
                      values: dict) -> None:

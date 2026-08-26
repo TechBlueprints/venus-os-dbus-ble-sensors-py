@@ -458,3 +458,78 @@ async def _read_hardware_version(client) -> str | None:
         _err(f"DeviceInfo read failed (non-fatal): {exc}")
     return None
 
+
+async def provision_session(client, passkey: int, timeout_s: float,
+                            pair: bool) -> dict:
+    """Key provisioning against an already-connected client.
+
+    The caller owns the connection (and the pairing agent, which is
+    dbus-python and thread-bound); this owns everything between connect
+    and disconnect.  Shared verbatim-in-spirit with the CLI's
+    ``provision`` so a standalone CLI run keeps exercising exactly the
+    session the service runs in-process.
+
+    Returns the payload the drivers persist: key (hex), firmware,
+    product id, temperature, hardware version.  ``adapter`` is the
+    caller's to add — it is D-Bus-path knowledge this module deliberately
+    does not have.
+    """
+    if pair:
+        _err(f"Pairing (passkey {passkey:06d})")
+        await client.pair()
+        _err("Paired")
+
+    collector = _Collector()
+    acquired: list = []
+    try:
+        # CTRL first: the device wants its CCCD set before it will push
+        # the session header.
+        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk, acquired)
+        await _start_notify(client, vreg.CHAR_PUK, collector.on_puk, acquired)
+        await asyncio.sleep(0.5)
+
+        await _handshake(client)
+        await _prime(client, collector)
+
+        key = await _read_key(client, collector, passkey, acquired,
+                              timeout_s)
+
+        firmware = await _fetch_vreg(client, collector, VREG_FIRMWARE,
+                                     "firmware")
+        product_id = await _fetch_vreg(client, collector, VREG_PRODUCT_ID,
+                                       "product id")
+        temperature = await _fetch_vreg(client, collector, VREG_TEMPERATURE,
+                                        "temperature")
+        hardware_version = await _read_hardware_version(client)
+
+        return {
+            "key": key.hex(),
+            "firmware": firmware,
+            "product_id": product_id,
+            "temperature": temperature,
+            "hardware_version": hardware_version,
+        }
+    finally:
+        # Before the link drops, not after — see _stop_notify_all.
+        await _stop_notify_all(client, acquired)
+
+
+def valid_key_payload(payload):
+    """The guard the subprocess-era JSON parse used to provide.
+
+    In-process the payload arrives as a dict with ``key`` already
+    hex-encoded, but the 16-byte check stays: persisting a short or
+    malformed key is how a device ends up permanently undecodable while
+    looking provisioned (the 4cbc0900... incident).
+    """
+    if not payload:
+        return None
+    key = str(payload.get("key", "")).strip().lower()
+    if len(key) != 32 or any(c not in "0123456789abcdef" for c in key):
+        logger.warning("provisioning returned an invalid key: %r", key)
+        return None
+    payload = dict(payload)
+    payload["key"] = key
+    return payload
