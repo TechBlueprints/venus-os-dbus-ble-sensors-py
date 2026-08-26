@@ -39,6 +39,7 @@ from victron_ble.exceptions import (  # type: ignore
     AdvertisementKeyMismatchError,
 )
 
+import orion_tr_gatt
 from orion_tr_gatt import AsyncGATTWriter
 from orion_tr_pin import resolve_pairing_passkey
 import victron_vreg as vreg
@@ -176,13 +177,17 @@ def _run_key_cli(mac: str, passkey: int,
         cmd.extend(["--preferred-adapter", preferred_adapter])
     logger.info("Spawning key-provisioner subprocess: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s + 20.0,
-            check=False,
-        )
+        # Tell the in-process GATT writer to wait: BlueZ refuses a
+        # second concurrent connect to one device, and the refusal
+        # lands on whichever side asked second.
+        with orion_tr_gatt.external_session(mac):
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s + 20.0,
+                check=False,
+            )
     except subprocess.TimeoutExpired:
         logger.warning("ip22 key-provisioner subprocess timed out for %s", mac)
         return None
@@ -222,13 +227,17 @@ def _run_telemetry_cli(mac: str, passkey: int,
     ]
     logger.info("Spawning IP22 telemetry subprocess: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s + 15.0,
-            check=False,
-        )
+        # Tell the in-process GATT writer to wait: BlueZ refuses a
+        # second concurrent connect to one device, and the refusal
+        # lands on whichever side asked second.
+        with orion_tr_gatt.external_session(mac):
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s + 15.0,
+                check=False,
+            )
     except subprocess.TimeoutExpired:
         logger.warning("ip22 telemetry subprocess timed out for %s", mac)
         return None

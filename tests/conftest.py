@@ -88,7 +88,23 @@ if "dbus" not in sys.modules:
     dbus_bus_mod.BusConnection = _StubBusConnection
     dbus.bus = dbus_bus_mod
 
+    # dbus.mainloop.glib, imported for its side effect (wiring the GLib
+    # main loop) by every module that talks to BlueZ.  A package, not a
+    # plain module, so `import dbus.mainloop.glib` resolves.
+    dbus_mainloop = types.ModuleType("dbus.mainloop")
+    dbus_mainloop.NULL_MAIN_LOOP = object()
+    dbus_mainloop_glib = types.ModuleType("dbus.mainloop.glib")
+
+    def _stub_dbus_gmainloop(*_a, **_kw):
+        return None
+
+    dbus_mainloop_glib.DBusGMainLoop = _stub_dbus_gmainloop
+    dbus_mainloop.glib = dbus_mainloop_glib
+    dbus.mainloop = dbus_mainloop
+
     sys.modules["dbus"] = dbus
+    sys.modules["dbus.mainloop"] = dbus_mainloop
+    sys.modules["dbus.mainloop.glib"] = dbus_mainloop_glib
     sys.modules["dbus.service"] = dbus_service
     sys.modules["dbus.bus"] = dbus_bus_mod
 

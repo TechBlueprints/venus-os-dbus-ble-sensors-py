@@ -55,6 +55,7 @@ from victron_ble.exceptions import (  # type: ignore
     AdvertisementKeyMismatchError,
 )
 
+import orion_tr_gatt
 from orion_tr_gatt import AsyncGATTWriter
 from ble_charger_common import (
     ChargerCommonMixin,
@@ -222,13 +223,17 @@ def _run_key_cli(mac: str, passkey: int,
         cmd.extend(["--preferred-adapter", preferred_adapter])
     logger.info("Spawning key-provisioner subprocess: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s + 15.0,
-            check=False,
-        )
+        # Tell the in-process GATT writer to wait: BlueZ refuses a
+        # second concurrent connect to one device, and the refusal
+        # lands on whichever side asked second.
+        with orion_tr_gatt.external_session(mac):
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s + 15.0,
+                check=False,
+            )
     except subprocess.TimeoutExpired:
         logger.warning("orion key-provisioner subprocess timed out for %s",
                        mac)

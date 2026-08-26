@@ -179,13 +179,17 @@ def _run_key_cli(mac: str, passkey: int,
         cmd.extend(["--preferred-adapter", preferred_adapter])
     logger.info("Spawning SmartShunt key-provisioner: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s + 20.0,
-            check=False,
-        )
+        # Tell the in-process GATT writer to wait: BlueZ refuses a
+        # second concurrent connect to one device, and the refusal
+        # lands on whichever side asked second.
+        with orion_tr_gatt.external_session(mac):
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s + 20.0,
+                check=False,
+            )
     except subprocess.TimeoutExpired:
         logger.warning("smartshunt key-provisioner timed out for %s", mac)
         return None

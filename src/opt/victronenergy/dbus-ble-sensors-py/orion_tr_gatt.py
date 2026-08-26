@@ -34,6 +34,8 @@ the same contract ``ble_charger_common``'s write queue has always used.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
 import logging
 import time
 from typing import Callable, Optional
@@ -59,6 +61,10 @@ async def _perform_write(address: str, path: Optional[str],
                          props: Optional[dict], register_id: int,
                          value_bytes: bytes, pair: bool) -> None:
     """Resolve → connect → (pair) → write → disconnect, on the BLE loop."""
+    # Serialise against provisioning/telemetry subprocesses on this
+    # device: BlueZ refuses a second concurrent connect, and the
+    # refusal surfaces as a failed write the user is watching.
+    await _await_external_clear(address)
     device = await ble_gatt_link.resolve(address, path, props)
     client = await ble_gatt_link.connect(device, address)
     try:
@@ -68,7 +74,15 @@ async def _perform_write(address: str, path: Optional[str],
             # registered to answer for it.
             logger.info("%s: pairing", address)
             await client.pair()
+        started = time.monotonic()
         await victron_vreg.write_register(client, register_id, value_bytes)
+        # Success needs its own line.  Without one, the only evidence a
+        # write worked is the absence of a failure, which cannot
+        # distinguish "wrote" from "never ran" — and the latency is what
+        # tells you a write that succeeded was still fighting for the
+        # radio.
+        logger.info("%s: GATT write %#06x ok in %.1fs",
+                    address, register_id, time.monotonic() - started)
     finally:
         try:
             await ble_gatt_link.disconnect(client)
@@ -140,6 +154,10 @@ async def _perform_read(address: str, path: Optional[str],
                         extra_writes: list[tuple[int, bytes]],
                         pair: bool) -> dict[int, bytes]:
     """Resolve → connect → GetValue (and optional SetValue) → disconnect."""
+    # Serialise against provisioning/telemetry subprocesses on this
+    # device: BlueZ refuses a second concurrent connect, and the
+    # refusal surfaces as a failed write the user is watching.
+    await _await_external_clear(address)
     device = await ble_gatt_link.resolve(address, path, props)
     client = await ble_gatt_link.connect(device, address)
     values: dict[int, bytes] = {}
@@ -214,6 +232,84 @@ async def _perform_read(address: str, path: Optional[str],
             # cut short by cancellation — that is when the socket
             # is most likely to be stranded.
             ble_gatt_link.force_close(client)
+
+
+# ---------------------------------------------------------------------
+# Cross-process GATT serialisation
+# ---------------------------------------------------------------------
+#
+# Key provisioning and telemetry run in SUBPROCESSES (orion_tr_key_cli),
+# because they need their own asyncio loop and pairing agent.  Those
+# subprocesses connect to the same device this writer connects to, and
+# BlueZ will not have two connect attempts in flight for one device: the
+# second gets ``org.bluez.Error.Failed: Operation already in progress``,
+# which surfaces here as "Failed to connect after N attempt(s)".
+#
+# The charger already declines to spawn telemetry while the writer is
+# busy.  The reverse gate was missing, so a mode write arriving just
+# after a telemetry poll started would collide — observed on dev-cerbo,
+# where both failures began within 3 s of a spawn while every write that
+# began 5 s or more after one succeeded.
+#
+# A registry rather than a lock: the writer must not block the GLib
+# thread, so the wait happens inside the coroutine, and a stuck entry
+# must not deadlock the writer forever.  Subprocess lifetimes are
+# bounded by their own --timeout, and the wait here is bounded above
+# that, so the worst case is a late write rather than a lost one.
+
+_external_sessions: dict[str, int] = {}
+_external_lock = threading.Lock()
+
+# Longer than any subprocess's own timeout (35-40 s), so a write waits
+# out a live session rather than racing it, and gives up only if
+# something is genuinely stuck.
+EXTERNAL_SESSION_WAIT_S = 50.0
+
+
+@contextlib.contextmanager
+def external_session(mac: str):
+    """Mark *mac* as having an out-of-process GATT session in flight."""
+    key = mac.upper()
+    with _external_lock:
+        _external_sessions[key] = _external_sessions.get(key, 0) + 1
+    try:
+        yield
+    finally:
+        with _external_lock:
+            remaining = _external_sessions.get(key, 1) - 1
+            if remaining > 0:
+                _external_sessions[key] = remaining
+            else:
+                _external_sessions.pop(key, None)
+
+
+def external_session_active(mac: str) -> bool:
+    with _external_lock:
+        return _external_sessions.get(mac.upper(), 0) > 0
+
+
+async def _await_external_clear(mac: str) -> None:
+    """Wait for any subprocess session on *mac* to finish.
+
+    Deliberately not an error when it does not clear: proceeding and
+    letting BlueZ refuse is no worse than refusing here ourselves, and
+    the log line distinguishes the two cases for whoever reads it.
+    """
+    if not external_session_active(mac):
+        return
+    logger.info("%s: waiting for an out-of-process GATT session to finish",
+                mac)
+    waited = 0.0
+    while waited < EXTERNAL_SESSION_WAIT_S:
+        await asyncio.sleep(0.5)
+        waited += 0.5
+        if not external_session_active(mac):
+            logger.info("%s: out-of-process session finished after %.1fs",
+                        mac, waited)
+            return
+    logger.warning(
+        "%s: out-of-process GATT session still active after %.0fs; "
+        "proceeding anyway", mac, EXTERNAL_SESSION_WAIT_S)
 
 
 class AsyncGATTWriter:
