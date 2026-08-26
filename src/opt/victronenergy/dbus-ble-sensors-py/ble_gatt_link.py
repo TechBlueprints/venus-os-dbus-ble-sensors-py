@@ -48,6 +48,27 @@ DISCOVERY_TIMEOUT_S = 12.0
 # Attempts bleak-retry-connector makes per connection.  Kept modest: a
 # charger that is out of range should fail the write and let the caller's
 # queue retry later, not tie up the writer for a minute.
+#
+# Read its failure message carefully: "Failed to connect after N
+# attempt(s)" reports a DIFFERENT counter than the one this bounds.  In
+# brc 4.6.0, `max_attempts` gates `timeouts + connect_errors`, while
+# transient errors are gated separately at MAX_TRANSIENT_ERRORS = 9 —
+# but every error of either kind increments the `attempt` number that
+# gets printed.  So N can legitimately exceed this value by up to 9, and
+# an N larger than CONNECT_ATTEMPTS is not evidence of misconfiguration.
+#
+# Which bucket a failure lands in is a substring match against brc's
+# TRANSIENT_ERRORS.  "Operation already in progress" is not in that set,
+# so a cross-process collision (see orion_tr_gatt.external_session)
+# counts as a connect_error; the surplus attempts around one come from
+# transient errors mixed into the same call, typically
+# le-connection-abort-by-local — which is itself the signature of a link
+# being torn down by somebody else.
+#
+# brc keeps no memory across calls: every counter is a local, so each
+# write gets a fresh budget against a device another process may be
+# holding.  Nothing at that layer can learn the contention, which is why
+# the serialisation lives in ours.
 CONNECT_ATTEMPTS = 3
 CONNECT_TIMEOUT_S = 20.0
 
