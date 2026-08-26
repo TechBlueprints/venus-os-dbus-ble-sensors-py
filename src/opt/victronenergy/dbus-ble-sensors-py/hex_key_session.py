@@ -143,7 +143,7 @@ async def _start_notify(client, char, callback, acquired=None) -> bool:
         _err(f"StartNotify {char} failed: {exc}")
         return False
 
-async def _stop_notify_all(client, acquired) -> None:
+async def _stop_notify_all(client, acquired, ok: bool) -> None:
     """Release every notify we hold, before the link goes away.
 
     BlueZ 5.72 stores the notify client into ``chrc->notify_io->data``
@@ -158,23 +158,22 @@ async def _stop_notify_all(client, acquired) -> None:
     """
     if not acquired:
         return
-    # Do NOT release on a link BlueZ has already torn down.  That is the
-    # "notify client already freed" precondition for the 5.72 UAF, and
-    # it buys nothing: a dead link has no notify left to stop.
+    # Release ONLY on a session that completed normally.  Callers pass
+    # ok=False when unwinding from an exception.
     #
-    # This is not theoretical.  Releasing unconditionally converted a
-    # rare landmine into a deliberate detonation on every FAILING
-    # session — measured on prod, six of six bluetoothd SIGSEGVs landed
-    # within 0-1 s of a session drop, and the crash-per-failed-session
-    # rate went from ~0.01 to ~0.15.  Volume did not change; the yield
-    # did.  On a box where most sessions fail, the failing path is the
-    # volume and the clean path is the rare case, so guarding here is
-    # what keeps the hygiene where it was aimed.
-    try:
-        alive = bool(client.is_connected)
-    except Exception:
-        alive = False
-    if not alive:
+    # This deliberately does NOT test client.is_connected.  That reads
+    # BlueZ's cached Connected property, which is exactly the signal
+    # that lies on a phantom connection — the first version of this
+    # guard used it and prod kept crashing at the same rate, because a
+    # failing session often still reports itself connected.
+    #
+    # Why it matters: releasing a notify on a link BlueZ has already
+    # torn down is the "notify client already freed" precondition for
+    # the 5.72 UAF, and the release walks notify_io_destroy, the crash
+    # site, deliberately.  Measured on prod, six of six SIGSEGVs landed
+    # within 0-1 s of a session drop.  A failed session has nothing
+    # worth releasing anyway.
+    if not ok:
         acquired.clear()
         return
     while acquired:
@@ -502,6 +501,7 @@ async def provision_session(client, passkey: int, timeout_s: float,
 
     collector = _Collector()
     acquired: list = []
+    ok = False
     try:
         # CTRL first: the device wants its CCCD set before it will push
         # the session header.
@@ -525,6 +525,7 @@ async def provision_session(client, passkey: int, timeout_s: float,
                                         "temperature")
         hardware_version = await _read_hardware_version(client)
 
+        ok = True
         return {
             "key": key.hex(),
             "firmware": firmware,
@@ -534,7 +535,7 @@ async def provision_session(client, passkey: int, timeout_s: float,
         }
     finally:
         # Before the link drops, not after — see _stop_notify_all.
-        await _stop_notify_all(client, acquired)
+        await _stop_notify_all(client, acquired, ok)
 
 
 def valid_key_payload(payload):

@@ -95,7 +95,7 @@ def test_releasing_empties_the_list(mod) -> None:
     acquired = ["a", "b", "c"]
 
     asyncio.get_event_loop().run_until_complete(
-        mod._stop_notify_all(client, acquired))
+        mod._stop_notify_all(client, acquired, True))
 
     assert sorted(client.stopped) == ["a", "b", "c"]
     assert acquired == [], "a leftover entry would be released twice"
@@ -109,7 +109,7 @@ def test_a_dead_link_does_not_stop_the_rest(mod) -> None:
     acquired = ["a", "b", "c"]
 
     asyncio.get_event_loop().run_until_complete(
-        mod._stop_notify_all(client, acquired))
+        mod._stop_notify_all(client, acquired, True))
 
     assert acquired == []
     assert sorted(client.stopped) == ["a", "c"]
@@ -118,11 +118,11 @@ def test_a_dead_link_does_not_stop_the_rest(mod) -> None:
 def test_releasing_nothing_is_harmless(mod) -> None:
     client = _Client()
     asyncio.get_event_loop().run_until_complete(
-        mod._stop_notify_all(client, []))
+        mod._stop_notify_all(client, [], True))
     assert client.stopped == []
 
 
-def test_a_dead_link_is_not_released(mod) -> None:
+def test_a_failed_session_is_not_released(mod) -> None:
     """The guard that stopped prod crashing every ~60 s.
 
     Releasing a notify on a link BlueZ has already torn down is the
@@ -133,11 +133,11 @@ def test_a_dead_link_is_not_released(mod) -> None:
     drop, and crashes-per-failed-session went from ~0.01 to ~0.15 while
     session volume actually fell.
     """
-    client = _Client(connected=False)
+    client = _Client()
     acquired = ["a", "b"]
 
     asyncio.get_event_loop().run_until_complete(
-        mod._stop_notify_all(client, acquired))
+        mod._stop_notify_all(client, acquired, False))
 
     assert client.stopped == [], "must not touch a torn-down link"
     assert acquired == [], "but must still forget them"
@@ -150,30 +150,41 @@ def test_a_live_link_is_still_released(mod) -> None:
     acquired = ["a", "b"]
 
     asyncio.get_event_loop().run_until_complete(
-        mod._stop_notify_all(client, acquired))
+        mod._stop_notify_all(client, acquired, True))
 
     assert sorted(client.stopped) == ["a", "b"]
     assert acquired == []
 
 
-def test_an_unreadable_connection_state_is_treated_as_dead(mod) -> None:
-    # A client whose is_connected raises is not one to walk the buggy
-    # path on; degrade toward not-releasing, which is the safe side.
-    class _Broken:
+def test_the_guard_does_not_consult_is_connected(mod) -> None:
+    """It must not, and this pins it.
+
+    The first version of this guard skipped the release when
+    client.is_connected was False.  Prod kept crashing at the same rate,
+    because is_connected reads BlueZ's CACHED Connected property — the
+    signal that lies on a phantom connection, which is precisely the
+    kind of session that fails.  A client reporting itself connected
+    while the link is gone would sail straight through that check.
+
+    The condition is now whether the session completed, which the
+    caller knows for certain.
+    """
+    class _Trap:
         def __init__(self):
             self.stopped = []
             self.services = _Services()
 
         @property
         def is_connected(self):
-            raise RuntimeError("backend gone")
+            raise AssertionError(
+                "the guard must not depend on a property that can lie")
 
         async def stop_notify(self, char):
             self.stopped.append(char)
 
-    client = _Broken()
+    client = _Trap()
     acquired = ["a"]
     asyncio.get_event_loop().run_until_complete(
-        mod._stop_notify_all(client, acquired))
+        mod._stop_notify_all(client, acquired, False))
     assert client.stopped == []
     assert acquired == []

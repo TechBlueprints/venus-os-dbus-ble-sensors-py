@@ -184,6 +184,7 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
         client = await ble_gatt_link.connect(device, mac)
         collector = _Collector()
         acquired: list = []
+        ok = False
         await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl, acquired)
         await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last, acquired)
         await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk, acquired)
@@ -204,6 +205,7 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
             await _credits(client)
         except Exception as exc:
             _err(f"0xEC7D write failed (non-fatal): {exc}")
+        ok = True
         return {
             "voltage": voltage,
             "current": current,
@@ -213,7 +215,7 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
     finally:
         if client is not None:
             # Before the link drops, not after — see _stop_notify_all.
-            await _stop_notify_all(client, acquired)
+            await _stop_notify_all(client, acquired, ok)
             try:
                 await ble_gatt_link.disconnect(client)
             finally:
