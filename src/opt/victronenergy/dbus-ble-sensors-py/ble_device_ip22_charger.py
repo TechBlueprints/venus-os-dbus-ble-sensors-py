@@ -215,50 +215,6 @@ def _run_key_cli(mac: str, passkey: int,
     return payload
 
 
-def _run_telemetry_cli(mac: str, passkey: int,
-                       timeout_s: float = 35.0) -> Optional[Dict[str, Any]]:
-    """Same HEX client as key provision, but only live VREGs + 0xEC7D."""
-    cmd = [
-        "python3", _KEY_CLI_PATH,
-        mac,
-        "--passkey", str(passkey),
-        "--timeout", str(int(timeout_s)),
-        "--telemetry",
-    ]
-    logger.info("Spawning IP22 telemetry subprocess: %s", " ".join(cmd))
-    try:
-        # Tell the in-process GATT writer to wait: BlueZ refuses a
-        # second concurrent connect to one device, and the refusal
-        # lands on whichever side asked second.
-        with orion_tr_gatt.external_session(mac):
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s + 15.0,
-                check=False,
-            )
-    except subprocess.TimeoutExpired:
-        logger.warning("ip22 telemetry subprocess timed out for %s", mac)
-        return None
-    except Exception:
-        logger.exception("failed to spawn ip22 telemetry subprocess")
-        return None
-    if result.returncode != 0:
-        logger.warning("ip22 telemetry exited %d: %s",
-                       result.returncode, (result.stderr or "").strip())
-        return None
-    raw = (result.stdout or "").strip()
-    if raw:
-        raw = raw.splitlines()[-1]
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        logger.warning("ip22 telemetry non-JSON output: %r", raw)
-        return None
-    return payload
-
-
 def _format_firmware_version(raw_hex: Optional[str]) -> Optional[str]:
     if not raw_hex:
         return None
@@ -565,49 +521,40 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         logger.info("%s: HEX telemetry poll (Instant Readout ads are short)",
                     self._plog)
 
-        def worker():
-            try:
-                with _provision_lock:
-                    payload = _run_telemetry_cli(mac, self._pairing_passkey)
-            except Exception:
-                logger.exception("%s: HEX telemetry subprocess failed",
-                                 self._plog)
-                payload = None
-
-            def deliver() -> bool:
-                self._hex_telemetry_busy = False
-                if payload:
-                    self._apply_telemetry_payload(payload)
-                else:
-                    logger.info("%s: HEX telemetry returned no live VREGs",
-                                self._plog)
-                return False
-
-            GLib.idle_add(deliver)
-
-        threading.Thread(
-            target=worker, name=f"ip22-hex-{mac}", daemon=True).start()
+        # In-process, through the same single-slot writer that does mode
+        # writes.  This used to spawn orion_tr_key_cli as a subprocess,
+        # which put two of OUR OWN processes on one device: BlueZ holds
+        # at most one connect attempt per device (dev->att_io), so a
+        # mode write landing during a telemetry poll got
+        # org.bluez.Error.Failed "Operation already in progress" and the
+        # user saw a switch that did nothing.
+        #
+        # The writer's slot is the serialisation — read_registers and
+        # write_register share it by design — so there is nothing to
+        # coordinate and no second process to coordinate with.
+        # extra_writes turns Instant Readout back on in the same
+        # session rather than paying for a second connect.
+        writer.read_registers(
+            mac, self._pairing_passkey,
+            register_ids=[VREG_OUTPUT_VOLTAGE, VREG_OUTPUT_CURRENT,
+                          VREG_DEVICE_STATE],
+            extra_writes=[(vreg.VREG_BLE_ADVERTISEMENT_MODE, b"\x01")],
+            on_done=self._on_hex_telemetry_done)
         return True
 
-    def _apply_telemetry_payload(self, payload: Dict[str, Any]) -> None:
-        values: dict[int, bytes] = {}
-        for key, register_id in (
-                ("voltage", VREG_OUTPUT_VOLTAGE),
-                ("current", VREG_OUTPUT_CURRENT),
-                ("device_state", VREG_DEVICE_STATE),
-        ):
-            raw = payload.get(key)
-            if not raw:
-                continue
-            try:
-                blob = bytes.fromhex(str(raw).strip())
-            except ValueError:
-                continue
-            if blob:
-                values[register_id] = blob
-        self._instant_readout_enabled = True
+    def _on_hex_telemetry_done(self, success: bool,
+                               values: Optional[dict] = None) -> None:
+        """Called on the GLib thread when the telemetry session ends."""
+        self._hex_telemetry_busy = False
         if values:
+            # read_registers already yields {register_id: bytes}, which
+            # is what _publish_hex_telemetry consumes — the subprocess
+            # needed a hex-string round trip through JSON, this does not.
+            self._instant_readout_enabled = True
             self._publish_hex_telemetry(values)
+        else:
+            logger.info("%s: HEX telemetry returned no live VREGs",
+                        self._plog)
 
     def _hex_retry_tick(self) -> bool:
         self._hex_retry_scheduled = False

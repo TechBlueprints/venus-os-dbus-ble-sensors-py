@@ -409,13 +409,20 @@ def test_short_beacon_keeps_voltage_when_dvcc_engaged(ip22_module):
     assert role.values["/Dc/0/Voltage"] == 14.4
 
 
-def test_apply_telemetry_payload_publishes_voltage(ip22_module):
+def test_telemetry_completion_publishes_voltage(ip22_module):
+    """The in-process reader hands back {register_id: bytes} directly.
+
+    This used to arrive as hex strings via JSON from a subprocess, which
+    is gone: two of our own processes on one device is what BlueZ
+    refuses (dev->att_io), and it cost user-visible mode writes.  The
+    single-slot writer now serialises telemetry against them instead.
+    """
     device = _make_device(ip22_module)
     device._dvcc_engaged = True
-    device._apply_telemetry_payload({
-        "voltage": "7905",
-        "current": "0000",
-        "device_state": "00",
+    device._on_hex_telemetry_done(True, {
+        0xED8D: bytes.fromhex("7905"),
+        0xED8F: bytes.fromhex("0000"),
+        0x0201: bytes.fromhex("00"),
     })
     role = device._role_services["charger"]
     assert role.values["/Dc/0/Voltage"] == 14.01
@@ -423,3 +430,20 @@ def test_apply_telemetry_payload_publishes_voltage(ip22_module):
     assert role.values["/Dc/0/Power"] == 0.0
     assert role.values["/State"] == 252
     assert device._instant_readout_enabled is True
+
+
+def test_a_failed_telemetry_session_clears_the_busy_flag(ip22_module):
+    # Without this the device would never poll again: _maybe_hex_telemetry
+    # returns early while _hex_telemetry_busy is set, and nothing else
+    # clears it.
+    device = _make_device(ip22_module)
+    device._hex_telemetry_busy = True
+    device._on_hex_telemetry_done(False, None)
+    assert device._hex_telemetry_busy is False
+
+
+def test_a_successful_session_also_clears_it(ip22_module):
+    device = _make_device(ip22_module)
+    device._hex_telemetry_busy = True
+    device._on_hex_telemetry_done(True, {0xED8D: bytes.fromhex("7905")})
+    assert device._hex_telemetry_busy is False
