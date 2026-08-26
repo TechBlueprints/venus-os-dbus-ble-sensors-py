@@ -675,7 +675,20 @@ class DbusBleSensors(object):
             del self._ignored_mac[dev_mac]
             logging.debug(f"{dev_mac}: recovered known device from ignored list")
 
-        adapter_name = f"hci{adapter_index}"
+        # Publish the CARD, not its number.  The tap hands us a kernel
+        # adapter index; formatting that as "hciN" and putting it on a
+        # D-Bus signal hands every subscriber a value that means a
+        # different radio after a replug — the identity problem we fixed
+        # everywhere else, exported.
+        #
+        # This is the cached direction on purpose: hciN -> MAC is a hot
+        # lookup whose answer rarely changes (30 s TTL in the backend,
+        # ~19us), unlike MAC -> hciN, where staleness is the hazard and
+        # index_for resolves fresh.  Same table, opposite needs.
+        #
+        # A card whose MAC cannot be read degrades to its hciN name
+        # rather than dropping the field.
+        adapter_name = adapter_identity.canonical(f"hci{adapter_index}")
 
         for man_id, man_data in manufacturer_data.items():
             routed = self._router.process_advertisement(

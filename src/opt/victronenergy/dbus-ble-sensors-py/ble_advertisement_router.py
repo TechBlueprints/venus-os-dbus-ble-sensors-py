@@ -163,7 +163,17 @@ class BleAdvertisementRouter:
         rssi : int
             RSSI value.
         interface : str
-            Adapter name (e.g. ``hci0``).
+            Identity of the card that heard it — its own MAC, twelve
+            uppercase hex digits with no separators (e.g.
+            ``684E054477B0``), matching the keys in
+            ``/run/bt-claims`` and in ``adapter-allowlist.conf``.
+
+            NOT an ``hciN`` name.  Numbering changes under a replug or a
+            USB reset, so a subscriber that remembered one would end up
+            naming a different radio; the MAC names the card for as long
+            as it exists.  A card whose MAC cannot be read (a failed
+            adapter reports all zeros) falls back to its ``hciN`` name,
+            so treat this as an opaque identifier rather than parsing it.
 
         Returns
         -------
