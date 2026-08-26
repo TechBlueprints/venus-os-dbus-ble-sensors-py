@@ -41,6 +41,15 @@ if "dbus" not in sys.modules:
     dbus.Interface = lambda *a, **kw: None
     dbus.DBusException = Exception
 
+    # The dbus-python scalar/array subclasses ble_gatt_dbus._plain
+    # converts away from.  Distinct classes so isinstance() discriminates
+    # exactly as it does against the real ones; nothing constructs them.
+    for _name in ("ByteArray", "Boolean", "Int16", "Int32", "Int64",
+                  "UInt16", "UInt32", "UInt64", "Byte", "Double",
+                  "String", "ObjectPath", "Signature", "Array",
+                  "Dictionary", "Struct"):
+        setattr(dbus, _name, type(_name, (), {}))
+
     # dbus.service, so modules that define a BlueZ agent (ble_gatt_dbus,
     # and anything importing it) can be imported under the stubs.  The
     # agent is never dispatched in tests; it only has to build.

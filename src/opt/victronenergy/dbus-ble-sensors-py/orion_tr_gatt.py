@@ -235,7 +235,8 @@ class AsyncGATTWriter:
 
     def write_register(self, mac: str, passkey: int, register_id: int,
                        value_bytes: bytes,
-                       on_done: Optional[Callable] = None):
+                       on_done: Optional[Callable] = None,
+                       prefer_adapter: Optional[str] = None):
         """Start an asynchronous register write.
 
         Args:
@@ -244,6 +245,14 @@ class AsyncGATTWriter:
             register_id: VREG register id
             value_bytes: Value bytes (little-endian)
             on_done: ``Callback(success: bool)``, called on the GLib thread
+            prefer_adapter: The card to resolve the device on when more
+                than one knows it, as a MAC (what
+                ``get_preferred_adapter`` stores) or a legacy ``hciN``.
+                Without it the lookup falls back to
+                connected-then-bonded order, which on a multi-card box
+                can hand back a path on the adapter that is busy
+                scanning; the connection then never completes and the
+                write dies on the operation timeout.
         """
         if self._busy:
             logger.warning("GATT writer busy, rejecting write for %s", mac)
@@ -261,7 +270,8 @@ class AsyncGATTWriter:
             return
 
         # dbus-python work, on this (GLib) thread only.
-        path, props = ble_gatt_dbus.lookup_device(self._bus, mac)
+        path, props = ble_gatt_dbus.lookup_device(
+            self._bus, mac, prefer_adapter=prefer_adapter)
         needs_pair = not (props or {}).get("Paired")
         if needs_pair:
             self._agent = ble_gatt_dbus.PairingAgent(self._bus, passkey, mac)

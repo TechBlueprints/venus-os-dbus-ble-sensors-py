@@ -1066,6 +1066,15 @@ class BleDeviceOrionTR(ChargerCommonMixin, BleDevice):
             VREG_DEVICE_MODE,
             bytes([mode_byte]),
             on_done=on_done,
+            # Same stored preference the key / telemetry CLI already
+            # honours.  A mode write is the one GATT op a user watches
+            # in real time, so letting it resolve to whichever adapter
+            # happens to be bonded is how "I switched it off and nothing
+            # happened" gets produced: on a box where the bonded card is
+            # the one running the passive scan, the connect never
+            # completes and the write dies on the 90 s timeout.
+            prefer_adapter=get_preferred_adapter(self._dbus_settings,
+                                                 self.info["dev_mac"]),
         )
         return True
 

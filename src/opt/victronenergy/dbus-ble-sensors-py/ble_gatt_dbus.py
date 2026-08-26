@@ -33,6 +33,8 @@ import dbus
 import dbus.service
 from gi.repository import GLib
 
+import adapter_identity
+
 logger = logging.getLogger(__name__)
 
 AGENT_INTERFACE = "org.bluez.Agent1"
@@ -81,6 +83,15 @@ def lookup_device(bus, mac: str,
     connected one, then the bonded one.  That is the adapter the link will
     actually use, and handing bcmv2 the wrong path would put the claims on
     the wrong card.
+
+    *prefer_adapter* is a card MAC (what ``get_preferred_adapter``
+    stores) or a legacy ``hciN``.  It is resolved to the number the card
+    answers to *now*, immediately before the path comparison, because a
+    stored preference outlives reboots and replugs while hciN numbering
+    does not.  A preference that cannot be resolved — the card is absent
+    — is dropped rather than matched literally: ranking is a preference,
+    not a filter, so the lookup falls through to connected-then-bonded
+    instead of returning nothing.
     """
     suffix = "/dev_" + mac.upper().replace(":", "_")
     try:
@@ -103,7 +114,13 @@ def lookup_device(bus, mac: str,
     if not candidates:
         return None, None
 
-    wanted = f"/org/bluez/{prefer_adapter}/" if prefer_adapter else None
+    # Resolve, do not interpolate.  BlueZ paths are /org/bluez/hciN/...,
+    # so dropping a stored MAC straight into the string produces a
+    # prefix that matches nothing and a preference that silently does
+    # nothing at all — the failure looks exactly like having no
+    # preference, which is why it would never be noticed.
+    name = adapter_identity.hci_for(prefer_adapter) if prefer_adapter else None
+    wanted = f"/org/bluez/{name}/" if name else None
 
     def rank(item):
         _path, props = item
