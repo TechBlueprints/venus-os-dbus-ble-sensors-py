@@ -130,19 +130,47 @@ class _Collector:
         self.pin.append(bytes(data))
 
 
-async def _start_notify(client, char, callback) -> bool:
+async def _start_notify(client, char, callback, acquired=None) -> bool:
     if client.services.get_characteristic(char) is None:
         return False
     try:
         await client.start_notify(char, callback,
                                   bluez={"use_start_notify": False})
+        if acquired is not None:
+            acquired.append(char)
         return True
     except Exception:
         try:
             await client.start_notify(char, callback)
+            if acquired is not None:
+                acquired.append(char)
             return True
         except Exception:
             return False
+
+async def _stop_notify_all(client, acquired) -> None:
+    """Release every notify we hold, before the link goes away.
+
+    BlueZ 5.72 stores the notify client into ``chrc->notify_io->data``
+    without a reference, so an acquire still outstanding at disconnect
+    leaves a dangling pointer that detonates 30-120 s later in
+    temporary-device cleanup — far from anything that names us.
+    Upstream fixed it in 5.84/5.86; Venus ships 5.72, so releasing is
+    our job.  We ask for the acquire path deliberately (StartNotify
+    plus PropertiesChanged delivers empty payloads on these
+    characteristics once SMP-paired), which is what makes us the only
+    consumer on this box that can plant one.
+
+    Best effort and never raising: a failure must not mask the caller's
+    exception, and an already-dead link fails every one of these
+    harmlessly.
+    """
+    while acquired:
+        char = acquired.pop()
+        try:
+            await client.stop_notify(char)
+        except Exception:
+            logger.debug("stop_notify failed on %s", char, exc_info=True)
 
 
 async def _credits(client, n: int = 8) -> None:
@@ -194,10 +222,11 @@ async def _handshake(client) -> None:
     await asyncio.sleep(0.3)
 
 
-async def _puk_pin(client, collector: _Collector, passkey: int) -> None:
+async def _puk_pin(client, collector: _Collector, passkey: int,
+                   acquired: list) -> None:
     if client.services.get_characteristic(vreg.CHAR_PUK) is None:
         return
-    await _start_notify(client, vreg.CHAR_PUK, collector.on_puk)
+    await _start_notify(client, vreg.CHAR_PUK, collector.on_puk, acquired)
     for _attempt in range(3):
         collector.puk.clear()
         nonce = bytes(await client.read_gatt_char(vreg.CHAR_PUK))
@@ -208,7 +237,7 @@ async def _puk_pin(client, collector: _Collector, passkey: int) -> None:
             break
     if client.services.get_characteristic(vreg.CHAR_PIN) is None:
         return
-    await _start_notify(client, vreg.CHAR_PIN, collector.on_pin)
+    await _start_notify(client, vreg.CHAR_PIN, collector.on_pin, acquired)
     collector.pin.clear()
     nonce = bytes(await client.read_gatt_char(vreg.CHAR_PUK))
     await client.write_gatt_char(
@@ -309,13 +338,14 @@ async def _session(mac: str, passkey: int,
     device = await ble_gatt_link.resolve(mac, path, props)
     client = await ble_gatt_link.connect(device, mac)
     collector = _Collector()
+    acquired: list = []
     try:
-        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl)
-        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last)
-        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk)
+        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk, acquired)
         await asyncio.sleep(0.4)
         await _handshake(client)
-        await _puk_pin(client, collector, passkey)
+        await _puk_pin(client, collector, passkey, acquired)
         await _handshake(client)
 
         await _write(client, vreg.encode_get_devices())
@@ -361,6 +391,8 @@ async def _session(mac: str, passkey: int,
                 next_key = time.monotonic() + 60.0
         return False
     finally:
+        # Before the link goes away, not after — see _stop_notify_all.
+        await _stop_notify_all(client, acquired)
         try:
             await ble_gatt_link.disconnect(client)
         finally:

@@ -114,17 +114,55 @@ class _ReadCollector:
             self.f7_n = int.from_bytes(raw[1:3], "little") or 0x80
 
 
-async def _start_notify(client, char, callback) -> None:
+async def _start_notify(client, char, callback, acquired=None) -> None:
+    """Subscribe, preferring AcquireNotify, recording it for teardown.
+
+    ``acquired`` is a list the caller passes so :func:`_stop_notify_all`
+    knows what to release.  That matters more than it looks: bluetoothd
+    5.72 stores the notify client into ``chrc->notify_io->data`` without
+    taking a reference, so an acquire still outstanding when the link
+    goes away leaves a dangling pointer that detonates when the
+    temporary device is cleaned up 30-120 s later.  Upstream fixed it in
+    5.84/5.86; Venus ships 5.72.
+
+    We ask for the fd-based path deliberately — StartNotify plus
+    PropertiesChanged delivers empty payloads for these characteristics
+    once the link is SMP-paired — so releasing it is our job.
+    """
     try:
         await client.start_notify(char, callback,
                                   bluez={"use_start_notify": False})
+        if acquired is not None:
+            acquired.append(char)
         return
     except Exception:
         pass
     try:
         await client.start_notify(char, callback)
+        if acquired is not None:
+            acquired.append(char)
     except Exception:
         logger.warning("HEX notify failed on %s", char)
+
+
+async def _stop_notify_all(client, acquired) -> None:
+    """Release every notify we hold, before the link goes away.
+
+    Best effort and never raising: a failure here must not mask the
+    caller's own exception, and an already-dead link makes every one of
+    these fail harmlessly.
+
+    Residual hazard worth naming rather than hiding: this is a coroutine,
+    so a cancellation between the last operation and here skips it
+    entirely.  That window is now the only one that leaves an acquire
+    outstanding, where before every session did.
+    """
+    while acquired:
+        char = acquired.pop()
+        try:
+            await client.stop_notify(char)
+        except Exception:
+            logger.debug("stop_notify failed on %s", char, exc_info=True)
 
 
 def _push_payload(frames: list[bytes], register_id: int) -> Optional[bytes]:
@@ -161,17 +199,18 @@ async def _perform_read(address: str, path: Optional[str],
     device = await ble_gatt_link.resolve(address, path, props)
     client = await ble_gatt_link.connect(device, address)
     values: dict[int, bytes] = {}
+    acquired: list = []
     try:
         if pair:
             logger.info("%s: pairing", address)
             await client.pair()
         collector = _ReadCollector()
         await _start_notify(client, victron_vreg.CHAR_CONTROL,
-                            collector.on_ctrl)
+                            collector.on_ctrl, acquired)
         await _start_notify(client, victron_vreg.CHAR_DATA_LAST,
-                            collector.on_last)
+                            collector.on_last, acquired)
         await _start_notify(client, victron_vreg.CHAR_DATA_BULK,
-                            collector.on_bulk)
+                            collector.on_bulk, acquired)
         # CTRL read switches the peripheral into CBOR mode.
         try:
             await client.read_gatt_char(victron_vreg.CHAR_CONTROL)
@@ -225,6 +264,11 @@ async def _perform_read(address: str, path: Optional[str],
                         address, len(collector.frames))
         return values
     finally:
+        # Release the notify acquires BEFORE the link goes away.  On
+        # BlueZ 5.72 an outstanding acquire at disconnect is a dangling
+        # chrc->notify_io->data, and the crash lands 30-120 s later in
+        # temporary-device cleanup, far from anything that names us.
+        await _stop_notify_all(client, acquired)
         try:
             await ble_gatt_link.disconnect(client)
         finally:

@@ -145,22 +145,51 @@ class _Collector:
         _err(f"[PIN] {len(data)}B: {bytes(data).hex()}")
 
 
-async def _start_notify(client, char, callback) -> bool:
-    """Subscribe, preferring AcquireNotify.  Returns False if absent."""
+async def _start_notify(client, char, callback, acquired=None) -> bool:
+    """Subscribe, preferring AcquireNotify.  Returns False if absent.
+
+    ``acquired`` records what was taken so :func:`_stop_notify_all` can
+    release it before the link drops — see that function for why an
+    outstanding acquire at disconnect is a landmine on BlueZ 5.72.
+    """
     if client.services.get_characteristic(char) is None:
         return False
     try:
         await client.start_notify(char, callback,
                                   bluez={"use_start_notify": False})
+        if acquired is not None:
+            acquired.append(char)
         return True
     except Exception as exc:
         _err(f"AcquireNotify {char} failed ({exc}); trying StartNotify")
     try:
         await client.start_notify(char, callback)
+        if acquired is not None:
+            acquired.append(char)
         return True
     except Exception as exc:
         _err(f"StartNotify {char} failed: {exc}")
         return False
+
+async def _stop_notify_all(client, acquired) -> None:
+    """Release every notify we hold, before the link goes away.
+
+    BlueZ 5.72 stores the notify client into ``chrc->notify_io->data``
+    without a reference, so an acquire outstanding at disconnect leaves
+    a dangling pointer that detonates 30-120 s later in temporary-device
+    cleanup — far from anything that names this process.  Fixed upstream
+    in 5.84/5.86; Venus ships 5.72.  We ask for the acquire path
+    deliberately, so releasing it is our job.
+
+    Best effort and never raising; an already-dead link fails every one
+    of these harmlessly.
+    """
+    while acquired:
+        char = acquired.pop()
+        try:
+            await client.stop_notify(char)
+        except Exception:
+            pass
 
 
 async def _credits(client) -> None:
@@ -208,7 +237,8 @@ def _refused_encryption(frames) -> bool:
             or b"\x19\xec\x65\x25\x02" in joined)
 
 
-async def _puk_pin_auth(client, collector: _Collector, passkey: int) -> None:
+async def _puk_pin_auth(client, collector: _Collector, passkey: int,
+                        acquired: list) -> None:
     """PUK CRC + PIN auth on the 9758 service.
 
     Required on the first provisioning of firmwares that gate the key
@@ -237,7 +267,8 @@ async def _puk_pin_auth(client, collector: _Collector, passkey: int) -> None:
     if client.services.get_characteristic(vreg.CHAR_PIN) is None:
         return
     collector.pin.clear()
-    if not await _start_notify(client, vreg.CHAR_PIN, collector.on_pin):
+    if not await _start_notify(client, vreg.CHAR_PIN, collector.on_pin,
+                               acquired):
         return
     try:
         await asyncio.sleep(0.2)
@@ -351,6 +382,7 @@ async def _official_key_preamble(client, collector: _Collector) -> None:
 
 
 async def _read_key(client, collector: _Collector, passkey: int,
+                    acquired: list,
                     timeout_s: float) -> bytes:
     """Fetch VREG 0xEC65 the way the official HEX client does, then fall back.
 
@@ -380,7 +412,7 @@ async def _read_key(client, collector: _Collector, passkey: int,
          + (" (encryption refused)" if refused else " (F7 / no EC65 push)")
          + " — trying PUK+PIN")
     try:
-        await _puk_pin_auth(client, collector, passkey)
+        await _puk_pin_auth(client, collector, passkey, acquired)
     except Exception as exc:
         _err(f"PUK+PIN failed (continuing): {exc}")
     await _handshake(client)
@@ -509,18 +541,20 @@ async def provision(mac: str, passkey: int, timeout_s: float,
             _err("Paired")
 
         collector = _Collector()
+        acquired: list = []
         # CTRL first: the device wants its CCCD set before it will push
         # the session header.
-        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl)
-        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last)
-        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk)
-        await _start_notify(client, vreg.CHAR_PUK, collector.on_puk)
+        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk, acquired)
+        await _start_notify(client, vreg.CHAR_PUK, collector.on_puk, acquired)
         await asyncio.sleep(0.5)
 
         await _handshake(client)
         await _prime(client, collector)
 
-        key = await _read_key(client, collector, passkey, timeout_s)
+        key = await _read_key(client, collector, passkey, acquired,
+                              timeout_s)
 
         firmware = await _fetch_vreg(client, collector, VREG_FIRMWARE,
                                      "firmware")
@@ -540,6 +574,8 @@ async def provision(mac: str, passkey: int, timeout_s: float,
         }
     finally:
         if client is not None:
+            # Before the link drops, not after — see _stop_notify_all.
+            await _stop_notify_all(client, acquired)
             try:
                 await ble_gatt_link.disconnect(client)
             finally:
@@ -572,9 +608,10 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
     try:
         client = await ble_gatt_link.connect(device, mac)
         collector = _Collector()
-        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl)
-        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last)
-        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk)
+        acquired: list = []
+        await _start_notify(client, vreg.CHAR_CONTROL, collector.on_ctrl, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_LAST, collector.on_last, acquired)
+        await _start_notify(client, vreg.CHAR_DATA_BULK, collector.on_bulk, acquired)
         await asyncio.sleep(0.4)
         await _handshake(client)
         await _prime(client, collector)
@@ -600,6 +637,8 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
         }
     finally:
         if client is not None:
+            # Before the link drops, not after — see _stop_notify_all.
+            await _stop_notify_all(client, acquired)
             try:
                 await ble_gatt_link.disconnect(client)
             finally:
