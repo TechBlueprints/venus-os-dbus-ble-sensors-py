@@ -273,6 +273,24 @@ async def _perform_read(address: str, path: Optional[str],
 # We are clear of that trap by construction — ``ble_gatt_link.unreachable``
 # classifies on exception TYPE names, never on message text.
 #
+# Why this registry and not ``/run/bt-claims``, which is cross-process by
+# construction and already qualifies soft claims by device MAC: a claim
+# cannot exist before the code knows which device it wants, and the
+# collision window opens earlier than that.  A subprocess spends its
+# first seconds in DISCOVERY, with no target MAC to qualify anything by,
+# and measured on dev-cerbo a CLI run can spend its entire life there —
+# 120 samples at 0.5 s, hard ``.scan`` claim present throughout, no
+# device-scoped claim at any point.  That is phase ordering, not a gap in
+# the claim design (BCM takes the soft claim before the connect attempt,
+# not on success, so it does cover *attempting*).  Nothing per-device can
+# cover a phase that precedes device selection.
+#
+# The registry covers the whole subprocess lifetime because it is keyed
+# at spawn, before the subprocess has done anything.  What neither covers
+# is a CLI run started by hand outside this process; that hole is known
+# and deliberately left open rather than closed with a check that is
+# silent during discovery.
+#
 # A registry rather than a lock: the writer must not block the GLib
 # thread, so the wait happens inside the coroutine, and a stuck entry
 # must not deadlock the writer forever.  Subprocess lifetimes are
