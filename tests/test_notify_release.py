@@ -72,9 +72,24 @@ def mod(request):
     return _load_real(request.param)
 
 
-def test_every_module_can_release(mod) -> None:
-    assert hasattr(mod, "_stop_notify_all"), (
-        f"{mod.__name__} acquires notifies and must be able to release them")
+def test_the_release_is_not_called_from_any_session(mod) -> None:
+    """The release is DISABLED pending diagnosis — see the call sites.
+
+    Releasing stranded acquires was meant to stop them planting the
+    BlueZ 5.72 UAF.  Prod's crash rate instead went 5-9/hr -> 30-50/hr,
+    every SIGSEGV within 0-1 s of one of our teardowns, and two
+    narrowing attempts (skip on dead link, skip on failed session) both
+    failed to move it.  Until the mechanism is understood the release
+    stays off, which is the behaviour prod ran at its lower rate.
+
+    The function is kept, and tested below, so re-enabling is a one-line
+    change at each call site rather than a rewrite.
+    """
+    import inspect
+    src = inspect.getsource(mod)
+    assert "await _stop_notify_all(" not in src, (
+        f"{mod.__name__} calls the release; it is disabled pending "
+        f"diagnosis of the prod crash-rate regression")
 
 
 def test_subscribing_records_the_acquire(mod) -> None:

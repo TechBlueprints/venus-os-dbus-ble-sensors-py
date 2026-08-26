@@ -215,7 +215,22 @@ async def telemetry(mac: str, passkey: int, timeout_s: float,
     finally:
         if client is not None:
             # Before the link drops, not after — see _stop_notify_all.
-            await _stop_notify_all(client, acquired, ok)
+            # DISABLED pending diagnosis.  Releasing notifies was added to
+            # stop stranded acquires planting the BlueZ 5.72 UAF; prod's
+            # crash rate then went from ~5-9/hr to 30-50/hr, with every
+            # SIGSEGV landing within 0-1 s of one of our session teardowns.
+            #
+            # Two narrowing attempts both failed to move the rate: skipping
+            # the release on a dead link (is_connected lies on a phantom
+            # connection, which is exactly the failing case) and skipping it
+            # on a failed session (rate got worse still).  So the mechanism
+            # is not understood, and the release is off entirely until it
+            # is — this restores the behaviour prod ran at its lower rate.
+            #
+            # Cost of being here: acquires are stranded again, which is the
+            # leak this was meant to fix.  That is the lesser harm at
+            # 50 crashes/hr.
+            acquired.clear()
             try:
                 await ble_gatt_link.disconnect(client)
             finally:
