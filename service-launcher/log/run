@@ -1,4 +1,8 @@
 #!/bin/sh
 exec 2>&1
 mkdir -p /var/log/dbus-ble-sensors-py-launcher
-exec multilog t s25000 n4 /var/log/dbus-ble-sensors-py-launcher
+# The launcher logs a handful of lines per service transition, so the
+# incident-rate sizing that applies to the main service (see its log/run)
+# is beside the point here — but n20 still beats n4, because launcher
+# history is exactly what reconstructs WHO stopped the service and when.
+exec multilog t s100000 n20 /var/log/dbus-ble-sensors-py-launcher

@@ -1,4 +1,15 @@
 #!/bin/sh
 exec 2>&1
 mkdir -p /var/log/dbus-ble-sensors-py
-exec multilog t s25000 n4 /var/log/dbus-ble-sensors-py
+# s/n control how much history is KEPT, not how much is WRITTEN — write
+# volume and flash wear are identical at any setting, and /var/log is on
+# /data (disk, not tmpfs), so retention costs only space.
+#
+# Size against the INCIDENT rate, not the idle rate.  The old s25000 n4
+# (100 kB) held many hours of a healthy service and only minutes during
+# an event, because the flood that accompanies an incident evicts the
+# record of the incident — retention collapses exactly when it becomes
+# valuable.  A phantom-connection birth window on prod was missed by 37
+# minutes for exactly this reason (night-watch archaeology, 2026-08-26).
+# 30 MB is ~1.2% of /data's free space.
+exec multilog t s1500000 n20 /var/log/dbus-ble-sensors-py
