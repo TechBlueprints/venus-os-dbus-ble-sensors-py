@@ -155,3 +155,93 @@ def test_partial_setpoint_write_retries_next_tick():
     follower.tick()
     assert (CHARGER, "/Link/ChargeVoltage", 13.8) in bus.writes
     assert (CHARGER, "/Link/ChargeCurrent", 50.0) in bus.writes
+
+
+class _Conn:
+    """Stands in for a private BusConnection; liveness is scriptable."""
+
+    def __init__(self, connected=True):
+        self.connected = connected
+        self.closed = False
+
+    def get_is_connected(self):
+        return self.connected
+
+    def close(self):
+        self.closed = True
+
+    def list_names(self):
+        return []
+
+
+def _ops_with(monkeypatch, first_conn):
+    """A real DbusBusOps whose bus constructor is scripted."""
+    import bms_link_follower as blf
+
+    made = [first_conn]
+
+    def _make():
+        return made.pop(0) if made else _Conn()
+
+    monkeypatch.setattr(blf.DbusBusOps, "_new_bus", staticmethod(_make))
+    return blf.DbusBusOps(), made
+
+
+def test_a_live_bus_is_left_alone(monkeypatch) -> None:
+    conn = _Conn()
+    ops, _ = _ops_with(monkeypatch, conn)
+    assert ops._live_bus() is conn
+    assert conn.closed is False
+
+
+def test_a_dead_bus_is_rebuilt_and_said_out_loud(monkeypatch, caplog) -> None:
+    """A dbus-daemon restart must not leave the follower silently inert.
+
+    With NULL_MAIN_LOOP nothing ever dispatches the Disconnected
+    message, so exit-on-disconnect never fires and get/set would just
+    swallow exceptions against a dead socket forever — the charger
+    keeping its last setpoints with nothing saying why.
+    """
+    dead = _Conn(connected=False)
+    ops, _ = _ops_with(monkeypatch, dead)
+
+    caplog.set_level("WARNING", logger="bms_link_follower")
+    fresh = ops._live_bus()
+    assert fresh is not dead
+    assert fresh.get_is_connected()
+    assert dead.closed is True, "the corpse must not keep counting"
+    assert "rebuilding" in caplog.text
+
+
+def test_rebuild_is_rate_limited(monkeypatch) -> None:
+    # A daemon that is genuinely gone costs one attempt per interval,
+    # not one per follower tick.
+    import bms_link_follower as blf
+
+    dead = _Conn(connected=False)
+    made = []
+
+    def _make():
+        conn = _Conn(connected=False)   # rebuilds also come up dead
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr(blf.DbusBusOps, "_new_bus",
+                        staticmethod(lambda: dead))
+    ops = blf.DbusBusOps()
+    monkeypatch.setattr(blf.DbusBusOps, "_new_bus", staticmethod(_make))
+
+    ops._live_bus()
+    ops._live_bus()
+    ops._live_bus()
+    assert len(made) == 1, "retries inside the window must not rebuild"
+
+
+def test_a_closed_follower_stays_closed(monkeypatch) -> None:
+    # close() means the owner stopped us; a rebuild here would resurrect
+    # a connection nothing will ever close again.
+    conn = _Conn()
+    ops, _ = _ops_with(monkeypatch, conn)
+    ops.close()
+    assert conn.closed is True
+    assert ops._live_bus() is None

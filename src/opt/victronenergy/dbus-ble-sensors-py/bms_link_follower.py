@@ -68,19 +68,30 @@ class DbusBusOps(object):
 
     BUS_ITEM = "com.victronenergy.BusItem"
 
-    def __init__(self):
-        from dbus_bus import get_private_unattached_bus
+    # A dead connection is retried at most this often, so a daemon that
+    # is genuinely gone costs one warning per interval, not one per tick.
+    REBUILD_RETRY_S = 30.0
 
+    def __init__(self):
         # NOT get_bus(): that returns a connection wired into the default
         # GLib context, i.e. the main thread's.  We run on our own thread
         # (see the module docstring for why that is required), and calling
         # synchronously on a connection the main thread dispatches is the
         # unsupported case that corrupted the heap.  This one has no main
         # loop at all and belongs to this thread alone.
-        self._bus = get_private_unattached_bus()
+        self._bus = self._new_bus()
+        self._closed = False
+        self._next_rebuild = 0.0
+
+    @staticmethod
+    def _new_bus():
+        from dbus_bus import get_private_unattached_bus
+
+        return get_private_unattached_bus()
 
     def close(self):
         """Release the connection.  Called when the follower stops."""
+        self._closed = True
         bus, self._bus = self._bus, None
         if bus is None:
             return
@@ -89,10 +100,65 @@ class DbusBusOps(object):
         except Exception:
             logger.exception("bms-link-follower: closing bus failed")
 
+    def _live_bus(self):
+        """The connection, rebuilt if it died under us.
+
+        Without this, a dbus-daemon restart leaves get/set swallowing
+        exceptions against a dead socket and the follower goes silently
+        inert — the charger keeps its last setpoints and nothing says
+        why.  Silent absence is this fleet's worst failure shape, so a
+        dead bus is rebuilt (and said out loud) rather than tolerated.
+
+        There is no exit-on-disconnect escape hatch here, unlike the
+        mainloop connections in dbus_bus: with NULL_MAIN_LOOP nothing
+        ever dispatches the Disconnected message, so the process would
+        not notice, let alone exit.  Detection has to be explicit.
+
+        Only the owning thread calls this (the same rule as every other
+        use of the private bus), so the swap cannot race.  A follower
+        that was close()d stays closed: rebuild is for a connection that
+        died, not one we released.
+        """
+        if self._closed:
+            return None
+        bus = self._bus
+        try:
+            alive = bus is not None and bus.get_is_connected()
+        except Exception:
+            alive = False
+        if alive:
+            return bus
+        import time
+
+        now = time.monotonic()
+        if now < self._next_rebuild:
+            return bus
+        self._next_rebuild = now + self.REBUILD_RETRY_S
+        logger.warning(
+            "bms-link-follower: D-Bus connection died; rebuilding "
+            "(a daemon restart is the usual cause)")
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception:
+                pass
+        try:
+            self._bus = self._new_bus()
+        except Exception:
+            logger.warning(
+                "bms-link-follower: rebuild failed; retrying in %ss",
+                self.REBUILD_RETRY_S)
+            self._bus = None
+            return None
+        return self._bus
+
     def _item(self, service, path):
         import dbus
 
-        obj = self._bus.get_object(service, path, introspect=False)
+        bus = self._live_bus()
+        if bus is None:
+            raise RuntimeError("no D-Bus connection")
+        obj = bus.get_object(service, path, introspect=False)
         return dbus.Interface(obj, self.BUS_ITEM)
 
     def get(self, service, path):
@@ -115,7 +181,7 @@ class DbusBusOps(object):
 
     def charger_services(self):
         try:
-            names = self._bus.list_names()
+            names = self._live_bus().list_names()
         except Exception:
             return []
         return sorted(str(name) for name in names if str(name).startswith(CHARGER_SERVICE_PREFIXES))

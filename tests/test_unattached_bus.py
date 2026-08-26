@@ -36,7 +36,10 @@ def test_it_is_not_cached() -> None:
 
 def test_follower_uses_the_unattached_bus_not_the_cached_one() -> None:
     import bms_link_follower
-    src = inspect.getsource(bms_link_follower.DbusBusOps.__init__)
+    # The construction lives in _new_bus so the liveness rebuild can
+    # re-use it; the pin is that ALL construction goes through the
+    # unattached constructor, wherever it moves within the class.
+    src = inspect.getsource(bms_link_follower.DbusBusOps)
     assert "get_private_unattached_bus" in src
     # The specific call, not the substring — the comment above it says
     # "NOT get_bus()", which a looser check would match.
