@@ -55,8 +55,31 @@ class DbusSettingsService(object):
         return self.get_item(path).get_value()
 
     def try_get_value(self, path: str):
-        """Return setting value, or None if the path does not exist."""
-        item = VeDbusItemImport(self._bus, self._SETTINGS_SERVICENAME, path, createsignal=False)
+        """Return setting value, or None if the path does not exist.
+
+        Routed through :meth:`get_item` so the import is cached.  A fresh
+        ``VeDbusItemImport`` per call leaks a D-Bus match rule every
+        time: ``bus.get_object`` on a well-known name installs a
+        ``NameOwnerChanged`` watch keyed to the resolved unique name, and
+        that rule belongs to the CONNECTION, not to the Python object —
+        so it outlives the import and counts against
+        ``max_match_rules_per_connection`` (1024).  ``createsignal=False``
+        suppresses the PropertiesChanged rule and does nothing about
+        this one, which is what made the leak invisible to the reasoning
+        already written above.
+
+        Measured on the prod Cerbo before this: 435 identical copies of
+        that rule on one connection in ~40 minutes, one every ~5.5s,
+        against a ceiling of 1024.
+
+        ``get_item`` with no default never creates a setting, so this
+        stays a read.  Its cached import is signal-bearing when the path
+        exists, which also fixes a staleness trap: a
+        ``createsignal=False`` import has no subscription, so its
+        ``get_value`` would return whatever was true at construction
+        forever.
+        """
+        item = self.get_item(path)
         if not item.exists:
             return None
         return item.get_value()
