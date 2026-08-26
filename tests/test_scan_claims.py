@@ -123,8 +123,11 @@ def test_release_of_unheld_adapter_is_harmless(monkeypatch) -> None:
     assert manager.released == []
 
 
-def test_passive_scanning_claims_softly(monkeypatch) -> None:
-    # A passive listen transmits nothing and genuinely shares the card.
+def test_a_soft_claim_is_still_available(monkeypatch) -> None:
+    # The kind is still a parameter, because the downgrade path uses it:
+    # when another live process already holds the hard claim we register
+    # softly rather than going silent.  What changed is that the service
+    # never *asks* for soft any more — see the policy test below.
     manager = _FakeManager()
     _with_manager(monkeypatch, manager)
     claims = ScanClaims()
@@ -134,9 +137,11 @@ def test_passive_scanning_claims_softly(monkeypatch) -> None:
     assert manager.held["hci0"][1] == "scan"
 
 
-def test_active_scanning_takes_the_exclusive_claim(monkeypatch) -> None:
-    # An active scanner transmits SCAN_REQs and holds the channel; that is
-    # exactly what the hard claim announces.
+def test_scanning_takes_the_exclusive_claim(monkeypatch) -> None:
+    # Scanning is exclusive use of a card, passive or active: the filter
+    # policy we program is applied to every user of that radio, and a
+    # card carrying a permanent scan is not one another service can
+    # reliably discover on.
     manager = _FakeManager()
     _with_manager(monkeypatch, manager)
     claims = ScanClaims()
@@ -145,8 +150,10 @@ def test_active_scanning_takes_the_exclusive_claim(monkeypatch) -> None:
     assert manager.kinds["hci0"] == "hard"
 
 
-def test_flipping_the_toggle_swaps_the_claim_kind(monkeypatch) -> None:
+def test_changing_kind_swaps_the_claim(monkeypatch) -> None:
     # The file on disk must say what we are doing now, not what we were.
+    # Reachable via the downgrade path rather than the ActiveScan toggle,
+    # which no longer selects a claim kind.
     manager = _FakeManager()
     _with_manager(monkeypatch, manager)
     claims = ScanClaims()
@@ -180,3 +187,29 @@ def test_contested_hard_claim_falls_back_to_soft(monkeypatch) -> None:
     assert claims.kind("hci0") == "soft"
     assert manager.kinds["hci0"] == "soft"
     assert claims.held() == ["hci0"]
+
+
+def test_the_service_always_asks_for_an_exclusive_claim() -> None:
+    """Policy pin: scanning is exclusive, whatever ActiveScan says.
+
+    This used to depend on the scan type, on the reasoning that a
+    passive listen "genuinely coexists".  It does not: our passive scan
+    reprograms the controller's filter policy to accept-list-only every
+    60 s, discarding advertisements for every user of that radio, not
+    just us — dbus-shyion-switch lost seven relays to exactly that.
+
+    Pinned as source rather than behaviour because the call sites are
+    inside the scan-enable path, which needs a live HCI socket to run.
+    """
+    import os
+    import re
+
+    src = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "src", "opt",
+        "victronenergy", "dbus-ble-sensors-py", "dbus_ble_sensors.py")).read()
+
+    calls = re.findall(r"_scan_claims\.hold\([^)]*\)", src)
+    assert calls, "expected the service to publish scan claims"
+    for call in calls:
+        assert "exclusive=True" in call, (
+            f"scanning must claim exclusively: {call}")

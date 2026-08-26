@@ -16,21 +16,35 @@ But "not routed through the connection manager" should not mean
 card whose links are measurably less stable — that is what
 ``adapter-allowlist.conf`` exists to work around by hand.
 
-**The claim kind follows what we are actually doing**, because that is the
-only thing that makes it true:
+**Scanning takes the hard claim** (``<MAC>.scan``, exclusive), passive or
+active.
 
-* **Passive scanning takes a soft claim** (``<MAC>.use.<owner>.scan``).
-  A passive scanner listens and transmits nothing; it genuinely coexists
-  with other traffic, so the claim is a fact to rank on, not a
-  reservation.  A hard claim here would push every bcmv2 consumer off
-  cards they can legitimately share — and ours is a permanent listen, not
-  a short scan activity, so it would push them off forever.
-* **Active scanning takes the hard claim** (``<MAC>.scan``, exclusive).
-  An active scanner transmits a SCAN_REQ at every advertiser it hears and
-  holds the channel for the response.  That is precisely what the hard
-  claim means — "I am actively scanning here, use another card" — and
-  announcing it as merely soft would let a second scanner land on the
-  same radio believing it was free.
+This used to distinguish the two, taking a soft claim for passive
+scanning on the reasoning that "a passive scanner listens and transmits
+nothing, so it genuinely coexists".  That was wrong, and the field
+disproved it.  Coexisting on the *air* is not the same as coexisting on
+the *controller*:
+
+* Our passive scan reprograms the controller's filter policy to
+  accept-list-only and re-applies it every 60 s.  Every advertisement
+  from a device not on our list is discarded — for **every** user of
+  that radio, not just us.  Co-tenants cannot see that state and cannot
+  defend against it.  ``dbus-shyion-switch`` lost all seven of its
+  relays to exactly this.
+* A connect needs its own discovery, and discovery needs the radio.  A
+  card carrying a permanent scan is not a card another service can
+  reliably link on — which is what ``adapter-allowlist.conf`` and
+  ``ble-connect.conf`` have been keeping apart by hand.
+
+So a scanning card is exclusively in use, and the hard claim is the true
+statement.  It also does the separation automatically: bcmv2 steers
+placement away from a hard-claimed card, so link work lands elsewhere
+without anyone maintaining two config files in agreement.
+
+The objection to this used to be that our scan is a permanent listen
+rather than a short activity, so a hard claim pushes others off
+forever.  That is exactly right, and it is the intent: for as long as we
+are scanning there, they should be elsewhere.
 
 If the hard claim cannot be taken (another live process is already
 scanning that card) we fall back to a soft one rather than going silent:
