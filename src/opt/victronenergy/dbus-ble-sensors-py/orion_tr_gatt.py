@@ -251,6 +251,28 @@ async def _perform_read(address: str, path: Optional[str],
 # where both failures began within 3 s of a spawn while every write that
 # began 5 s or more after one succeeded.
 #
+# Confirmed at source in BlueZ 5.72 (traced by the BCM session).  The
+# message is ``strerror(EALREADY)`` leaking through the LE connect path:
+# ``device_connect_le`` returns -EALREADY when ``dev->att_io || dev->att``
+# is set, and ``dev_connect`` wraps that as
+# ``btd_error_failed(msg, strerror(-err))``.  Two things follow that are
+# worth knowing before anyone tries to detect this:
+#
+# * The precondition is **per device, not per client** — those are
+#   ``btd_device`` fields and nothing on that path compares senders.  It
+#   fires when ANY originator has an LE connect in flight, including
+#   bluetoothd's own auto-connect.  That is the source-level confirmation
+#   of what the timings said.
+# * Do not match on the D-Bus error NAME.  ``.Failed`` is the catch-all
+#   for every ``device_connect_le`` failure; the ``.InProgress`` variant
+#   of the same logical condition belongs to the BR/EDR bearer, so the
+#   split carries no meaning here.  And do not match loosely on
+#   "in progress" either: ``strerror(EINPROGRESS)`` is "Operation NOW in
+#   progress", one word away and a genuinely different condition.
+#
+# We are clear of that trap by construction — ``ble_gatt_link.unreachable``
+# classifies on exception TYPE names, never on message text.
+#
 # A registry rather than a lock: the writer must not block the GLib
 # thread, so the wait happens inside the coroutine, and a stuck entry
 # must not deadlock the writer forever.  Subprocess lifetimes are
