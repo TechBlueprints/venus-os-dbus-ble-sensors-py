@@ -163,3 +163,42 @@ def test_configured_macs_finds_mac_in_indexed_dev_id() -> None:
 
     assert svc.configured_macs() == {
         "00a0508d9569", "c36eed421ff2", "f4a2a80c6534"}
+
+
+def test_refusal_is_logged_once_per_mac() -> None:
+    """A stranger's first refusal is the audit record; repeats are spam.
+
+    The gate refuses every neighbour's device that advertises, forever.
+    Throttled to one INFO line per MAC per 30 minutes, 23 refused MACs
+    on prod produced ~46 lines/hour in steady state with nothing new in
+    them.  Keeping the FIRST refusal at INFO preserves the only thing
+    the line is good for — proving the gate actually turns strangers
+    away — while repeats drop to DEBUG.
+
+    Source-level, because the defect is a logging-level choice around a
+    set membership test, which no runtime assertion on the gate observes.
+    """
+    import os
+    import re
+
+    src = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "src", "opt",
+        "victronenergy", "dbus-ble-sensors-py", "dbus_ble_sensors.py")).read()
+
+    # Exactly one empty-set init, and it must precede first use.
+    assigns = [m.start() for m in
+               re.finditer(r"self\._refusal_logged\s*(:\s*set\s*)?=\s*set\(\)", src)]
+    first_use = src.index("if dev_mac not in self._refusal_logged:")
+    assert len(assigns) == 1, (
+        f"expected one _refusal_logged initialisation, found {len(assigns)}")
+    assert assigns[0] < first_use, (
+        "_refusal_logged must be initialised before use, or it is wiped "
+        "like _configured_macs was")
+
+    # The refusal branch: INFO on first sight, DEBUG thereafter.
+    branch = src[first_use:first_use + 900]
+    assert "self._refusal_logged.add(dev_mac)" in branch
+    assert "logging.info(" in branch, "first refusal must stay at INFO"
+    assert "logging.debug(" in branch, "repeat refusals must drop to DEBUG"
+    assert branch.index("logging.info(") < branch.index("logging.debug("), (
+        "the INFO line must be the first-sight branch, not the repeat")

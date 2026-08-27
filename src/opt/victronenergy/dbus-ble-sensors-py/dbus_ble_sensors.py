@@ -141,6 +141,17 @@ class DbusBleSensors(object):
         # the non-toggle reasons we need to re-apply scan params
         # (shyion-switch's bleak resetting scan policy during active
         # discovery, etc.).
+        # Strangers we have already announced a refusal for.  The first
+        # refusal per MAC is the audit record — it is how we prove the
+        # gate actually turns strangers away.  Repeats carry no new
+        # information: a neighbour's charger advertises forever, so even
+        # throttled to one line per MAC per 30 minutes this grew ~46
+        # lines/hour on prod across 23 neighbours, indefinitely.
+        #
+        # Declared here and never re-initialised later — the same
+        # ordering mistake that silently emptied _configured_macs.
+        self._refusal_logged: set = set()
+
         # MACs with stored settings: our own configured gear.  Declared
         # here and filled immediately below — NOT re-initialised later,
         # which is what silently emptied it and made the gate reject
@@ -740,10 +751,15 @@ class DbusBleSensors(object):
                 if (dev_mac not in self._configured_macs
                         and not self._dbus_ble_service.get_continuous_scan()):
                     now = time.monotonic()
-                    if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+                    if dev_mac not in self._refusal_logged:
+                        self._refusal_logged.add(dev_mac)
                         logging.info(
                             f"{dev_mac}: not adopting — discovery is off "
                             f"and this device has no stored settings")
+                    elif now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+                        logging.debug(
+                            f"{dev_mac}: still not adopting — discovery "
+                            f"is off and this device has no stored settings")
                     self._last_adv_seen[dev_mac] = now
                     self._ignored_mac[dev_mac] = True
                     self._tap_ignored_macs.add(dev_mac)
