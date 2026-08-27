@@ -236,21 +236,6 @@ class DbusBleService(object):
                 macs.add(tail)
         return macs
 
-    def purge_device_settings(self, dev_id: str) -> None:
-        """Delete every persisted setting for *dev_id*.
-
-        ``_delete_proxy_setting`` only detaches our end of the item; the
-        stored entry survives, which is what let 59 disabled devices
-        accumulate on the prod gateway.  This removes them for real.
-        """
-        paths = ["/Settings/Devices/" + k
-                 for k in self._dbus_settings.list_device_settings()
-                 if str(k).split("/", 1)[0] == dev_id]
-        if paths:
-            logging.info("purging %d stored setting(s) for %r",
-                         len(paths), dev_id)
-            self._dbus_settings.remove_settings(paths)
-
     def is_device_role_enabled(self, device_info: dict, role_name: str) -> bool:
         """
         Check if the given role is enabled through settings

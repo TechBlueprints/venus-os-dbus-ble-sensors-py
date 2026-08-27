@@ -388,56 +388,6 @@ class DbusBleSensors(object):
         except Exception:
             logging.exception(f"Failed to persist {_KNOWN_MAC_TYPES_PATH!r}")
 
-    def _purge_unenabled_devices(self) -> None:
-        """Delete every adopted-but-not-enabled device, objects included.
-
-        Three things have to go, and only the first was ever happening:
-
-        * the BLE device object, via ``delete()`` — which disconnects
-          its role services, unregisters them (removing our
-          ``/Devices/<id>_<role>/*`` D-Bus items) and closes the D-Bus
-          connection each one held;
-        * the MAC's place in ``_known_mac`` and ``_configured_macs``, so
-          the discovery gate treats it as a stranger again rather than
-          as configured gear;
-        * the PERSISTED settings under ``/Settings/Devices/<dev_id>/``.
-          ``_delete_proxy_setting`` only detaches our end of the item;
-          the stored entry survives, and that is what left 59 disabled
-          devices on the prod gateway from neighbours' hardware.
-
-        Enabled devices are untouched — this is a sweep of things nobody
-        asked to keep, not a reset.
-        """
-        purged = 0
-        for mac in list(self._known_mac.keys()):
-            device = self._known_mac[mac]
-            info = getattr(device, "info", None)
-            if not info:
-                continue
-            try:
-                if self._dbus_ble_service.is_device_enabled(info):
-                    continue
-            except Exception:
-                logging.exception("%s: could not read enabled state; keeping",
-                                  mac)
-                continue
-            dev_id = info.get("dev_id")
-            logging.info("%s: purging — adopted but never enabled", mac)
-            try:
-                device.delete()
-            except Exception:
-                logging.exception("%s: delete failed", mac)
-            del self._known_mac[mac]
-            self._configured_macs.discard(mac)
-            if dev_id:
-                try:
-                    self._dbus_ble_service.purge_device_settings(dev_id)
-                except Exception:
-                    logging.exception("%s: settings purge failed", dev_id)
-            purged += 1
-        if purged:
-            logging.info("discovery off: purged %d unenabled device(s)", purged)
-
     def _on_continuous_scan_changed(self, new_value: bool) -> None:
         """Called by DbusBleService when ``/Settings/BleSensors/ContinuousScan``
         changes (GUI toggle, settings-restore, anywhere).
@@ -448,14 +398,6 @@ class DbusBleSensors(object):
         ``_throttled`` is True — the load throttle will re-apply
         whichever policy is current at release time.
         """
-        # Turning discovery OFF sweeps everything we adopted but nobody
-        # kept.  Leaving them costs more than clutter: a disabled device
-        # object is still a live object that re-registers on every
-        # advertisement, and its stored settings make it look configured
-        # forever after.
-        if not new_value:
-            self._purge_unenabled_devices()
-
         if self._throttled:
             logging.info(
                 "ContinuousScan changed to %r while throttled; will apply "

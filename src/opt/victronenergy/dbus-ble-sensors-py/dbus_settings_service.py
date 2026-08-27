@@ -103,25 +103,6 @@ class DbusSettingsService(object):
             return []
         return [str(k) for k in value.keys()]
 
-    def remove_settings(self, paths: list) -> bool:
-        """Delete settings permanently via localsettings' RemoveSettings.
-
-        Deleting the proxy item only detaches our end; the persisted
-        entry survives and is what accumulates.  Paths are absolute
-        (``/Settings/Devices/...``).
-        """
-        if not paths:
-            return True
-        try:
-            obj = self._bus.get_object(self._SETTINGS_SERVICENAME,
-                                       "/", introspect=False)
-            iface = dbus.Interface(obj, "com.victronenergy.Settings")
-            iface.RemoveSettings(dbus.Array(paths, signature="s"))
-            return True
-        except Exception:
-            logging.exception("RemoveSettings failed for %r", paths)
-            return False
-
     def set_item(self, path: str, def_value: object = None, min_value: int = 0, max_value: int = 0, silent=False, callback=None) -> VeDbusItemImport:
         # Probe existence and current attributes without subscribing — see
         # the ``get_item`` comment for why we cannot afford a throwaway

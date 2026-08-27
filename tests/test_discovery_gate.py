@@ -12,9 +12,13 @@ SmartShunt, and those sessions are what crashed bluetoothd.
 
 Intended semantics, now implemented:
   discovery ON   -> adopt new devices, create them DISABLED, do not connect
-  discovery OFF  -> adopt nothing new; sweep everything nobody enabled,
-                    including its D-Bus objects and stored settings
+  discovery OFF  -> adopt nothing new
 Configured devices keep working either way.
+
+Cleaning up what accumulated BEFORE this gate existed is a one-off
+operational job, not product behaviour: once nothing new is adopted,
+there is nothing for a permanent sweeper to do.  Prod's 63 stale
+entries were removed by hand.
 """
 from __future__ import annotations
 
@@ -41,11 +45,15 @@ if sys.version_info < (3, 10):
 class _Svc:
     """Stands in for DbusBleService."""
 
-    def __init__(self, enabled=(), settings=()):
+    def __init__(self, enabled=(), settings=(), stale=()):
         self._enabled = set(enabled)
         self.settings_keys = list(settings)
+        self._stale = list(stale)
         self.purged = []
         self.continuous = False
+
+    def unenabled_device_ids(self):
+        return list(self._stale)
 
     def get_continuous_scan(self):
         return self.continuous
@@ -79,75 +87,16 @@ def _sensors(svc, devices):
     return obj
 
 
-def test_enabled_devices_survive_the_sweep() -> None:
-    svc = _Svc(enabled={"orion_tr_aabb"}, settings=["orion_tr_aabb/charger/Enabled"])
-    dev = _Device("orion_tr_aabb", "aabb")
-    s = _sensors(svc, {"aabb": dev})
+def test_the_gate_uses_the_any_role_enabled_rule() -> None:
+    """A device counts as wanted if ANY of its roles is on.
 
-    s._purge_unenabled_devices()
-
-    assert dev.deleted is False
-    assert "aabb" in s._known_mac
-    assert svc.purged == [], "an enabled device must never be purged"
-
-
-def test_unenabled_devices_are_deleted_with_their_settings() -> None:
-    svc = _Svc(enabled=set(), settings=["smartshunt_c39b/battery/Enabled",
-                                        "smartshunt_c39b/battery/CustomName"])
-    dev = _Device("smartshunt_c39b", "c39b")
-    s = _sensors(svc, {"c39b": dev})
-
-    s._purge_unenabled_devices()
-
-    assert dev.deleted is True, "the device object must go"
-    assert "c39b" not in s._known_mac, "and its place in the store"
-    assert "c39b" not in s._configured_macs, (
-        "and it must look like a stranger again, or the discovery gate "
-        "would keep re-adopting it")
-    assert svc.purged == ["smartshunt_c39b"], (
-        "stored settings must go too — detaching the proxy leaves the "
-        "entry behind, which is what accumulated 59 of them")
-    assert svc.settings_keys == []
-
-
-def test_a_mixed_set_purges_only_the_unwanted() -> None:
-    svc = _Svc(enabled={"orion_tr_aabb"})
-    keep, drop = _Device("orion_tr_aabb", "aabb"), _Device("ip22_ccdd", "ccdd")
-    s = _sensors(svc, {"aabb": keep, "ccdd": drop})
-
-    s._purge_unenabled_devices()
-
-    assert keep.deleted is False and drop.deleted is True
-    assert set(s._known_mac) == {"aabb"}
-
-
-def test_a_device_whose_state_cannot_be_read_is_kept() -> None:
-    # Deleting on an error would throw away configured gear over a
-    # transient settings failure.  Keep, and say so.
-    class _Broken(_Svc):
-        def is_device_enabled(self, info):
-            raise RuntimeError("settings unavailable")
-
-    svc = _Broken()
-    dev = _Device("orion_tr_aabb", "aabb")
-    s = _sensors(svc, {"aabb": dev})
-
-    s._purge_unenabled_devices()
-    assert dev.deleted is False
-    assert "aabb" in s._known_mac
-
-
-def test_delete_failure_still_removes_it_from_the_store() -> None:
-    # Otherwise a device that raises on delete is purged forever after,
-    # once per toggle.
-    class _Stubborn(_Device):
-        def delete(self):
-            raise RuntimeError("teardown failed")
-
-    svc = _Svc()
-    dev = _Stubborn("ip22_ccdd", "ccdd")
-    s = _sensors(svc, {"ccdd": dev})
-
-    s._purge_unenabled_devices()
-    assert "ccdd" not in s._known_mac
-    assert svc.purged == ["ip22_ccdd"]
+    Reading only the first role's flag is what made an earlier census
+    call the Tech Cabinet Ruuvi disabled when its temperature role was
+    live and only movement was off — the same adjacent-predicate shape
+    that has cost this project repeatedly.
+    """
+    import dbus_ble_service
+    import inspect
+    src = inspect.getsource(dbus_ble_service.DbusBleService.is_device_enabled)
+    assert "for role_name in device_info['roles']" in src
+    assert "return True" in src, "any role enabled means the device is wanted"
