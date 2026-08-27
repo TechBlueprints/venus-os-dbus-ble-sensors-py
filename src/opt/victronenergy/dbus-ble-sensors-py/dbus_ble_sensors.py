@@ -141,6 +141,12 @@ class DbusBleSensors(object):
         # the non-toggle reasons we need to re-apply scan params
         # (shyion-switch's bleak resetting scan policy during active
         # discovery, etc.).
+        # MACs with stored settings: our own configured gear.  Declared
+        # here and filled immediately below — NOT re-initialised later,
+        # which is what silently emptied it and made the gate reject
+        # every configured device on prod.
+        self._configured_macs: set = set()
+
         # Devices we have kept before, read from stored settings.  This
         # is what lets discovery stay OFF as the normal state: our own
         # gear is already configured and keeps working, while anything
@@ -176,10 +182,6 @@ class DbusBleSensors(object):
         self._adapters: dict[str, dict] = {}
 
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
-        # MACs with stored settings: our own configured gear.
-        # Populated at startup so a discovery-off restart still
-        # adopts the devices we already had.
-        self._configured_macs: set = set()
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
         self._last_adv_seen: dict[str, float] = {}
 

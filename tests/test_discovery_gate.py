@@ -100,3 +100,32 @@ def test_the_gate_uses_the_any_role_enabled_rule() -> None:
     src = inspect.getsource(dbus_ble_service.DbusBleService.is_device_enabled)
     assert "for role_name in device_info['roles']" in src
     assert "return True" in src, "any role enabled means the device is wanted"
+
+
+def test_configured_macs_survives_construction() -> None:
+    """The loaded set must not be re-initialised after it is filled.
+
+    It was: __init__ loaded 20 MACs from stored settings and then, forty
+    lines later, assigned an empty set over them.  The gate then treated
+    every configured device as a stranger and prod adopted NOTHING —
+    four Orion-TRs, six Ruuvis and a Mopeka all logged "not adopting"
+    while their settings sat right there.
+
+    Pinned as source order because the failure is an ordering bug that
+    a mocked constructor cannot reproduce.
+    """
+    import os
+    import re
+
+    src = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "src", "opt",
+        "victronenergy", "dbus-ble-sensors-py", "dbus_ble_sensors.py")).read()
+
+    assigns = [m.start() for m in
+               re.finditer(r"self\._configured_macs\s*(:\s*set\s*)?=\s*set\(\)", src)]
+    load = src.index("self._configured_macs = self._dbus_ble_service.configured_macs()")
+    assert len(assigns) == 1, (
+        f"expected exactly one empty-set initialisation, found {len(assigns)}")
+    assert assigns[0] < load, (
+        "the empty-set initialisation must come BEFORE the load, or it "
+        "wipes the configured devices and the gate rejects everything")
