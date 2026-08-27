@@ -253,6 +253,15 @@ class BleDeviceSmartShunt(BleDevice):
     def _start_hex(self) -> None:
         if self._hex_started:
             return
+        # Never open a GATT session to a device nobody enabled.  This
+        # runs from init(), i.e. the moment an advertisement is first
+        # decoded — before anything asks whether we want this device.
+        # Without the check we connected to every SmartShunt in range,
+        # including neighbours' and wired units that need no BLE at all;
+        # on the prod gateway one unreachable shunt drove 139 discovery
+        # bursts, and those sessions are what crashed bluetoothd.
+        if not DbusBleService.get().is_device_enabled(self.info):
+            return
         if self._adv_key_hex or get_advertisement_key(
                 self._dbus_settings, self.info["dev_mac"]):
             return

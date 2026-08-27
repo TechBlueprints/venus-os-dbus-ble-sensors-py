@@ -125,6 +125,19 @@ if "vedbus" not in sys.modules:
     vedbus.VeDbusService = _StubVeDbusItem
     sys.modules["vedbus"] = vedbus
 
+# velib_python's logger helper, fetched onto the device by install.sh
+# rather than vendored — absent in a checkout, same as vedbus.
+
+if "logger" not in sys.modules:
+    _logger_mod = types.ModuleType("logger")
+
+    def _setup_logging(*_a, **_kw):
+        import logging
+        return logging.getLogger()
+
+    _logger_mod.setup_logging = _setup_logging
+    sys.modules["logger"] = _logger_mod
+
 if "gi" not in sys.modules:
     gi = types.ModuleType("gi")
     gi_repo = types.ModuleType("gi.repository")

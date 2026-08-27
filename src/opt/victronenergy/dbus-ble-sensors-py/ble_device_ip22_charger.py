@@ -445,6 +445,10 @@ class BleDeviceIP22Charger(ChargerCommonMixin, BleDevice):
         Returns True when a session was started (or is already in flight)
         so the caller can skip publishing off-state.
         """
+        # Same rule as the SmartShunt: no GATT to a device nobody
+        # enabled.  A charger we merely overhear is not ours to poll.
+        if not DbusBleService.get().is_device_enabled(self.info):
+            return False
         if self._hex_telemetry_busy:
             return True
         now = time.monotonic()

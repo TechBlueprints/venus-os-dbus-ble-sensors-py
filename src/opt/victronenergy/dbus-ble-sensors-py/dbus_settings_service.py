@@ -84,6 +84,44 @@ class DbusSettingsService(object):
             return None
         return item.get_value()
 
+    def list_device_settings(self) -> list:
+        """Every ``/Settings/Devices/<id>/...`` key currently stored.
+
+        Used to tell a device we have configured before from one we are
+        merely hearing.  Returns relative keys such as
+        ``orion_tr_c36eed421ff2/charger/Enabled``.
+        """
+        try:
+            item = VeDbusItemImport(
+                self._bus, self._SETTINGS_SERVICENAME, "/Settings/Devices",
+                createsignal=False)
+            value = item.get_value()
+        except Exception:
+            logging.exception("could not enumerate /Settings/Devices")
+            return []
+        if not isinstance(value, dict):
+            return []
+        return [str(k) for k in value.keys()]
+
+    def remove_settings(self, paths: list) -> bool:
+        """Delete settings permanently via localsettings' RemoveSettings.
+
+        Deleting the proxy item only detaches our end; the persisted
+        entry survives and is what accumulates.  Paths are absolute
+        (``/Settings/Devices/...``).
+        """
+        if not paths:
+            return True
+        try:
+            obj = self._bus.get_object(self._SETTINGS_SERVICENAME,
+                                       "/", introspect=False)
+            iface = dbus.Interface(obj, "com.victronenergy.Settings")
+            iface.RemoveSettings(dbus.Array(paths, signature="s"))
+            return True
+        except Exception:
+            logging.exception("RemoveSettings failed for %r", paths)
+            return False
+
     def set_item(self, path: str, def_value: object = None, min_value: int = 0, max_value: int = 0, silent=False, callback=None) -> VeDbusItemImport:
         # Probe existence and current attributes without subscribing — see
         # the ``get_item`` comment for why we cannot afford a throwaway

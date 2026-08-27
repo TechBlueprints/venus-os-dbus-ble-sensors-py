@@ -141,6 +141,18 @@ class DbusBleSensors(object):
         # the non-toggle reasons we need to re-apply scan params
         # (shyion-switch's bleak resetting scan policy during active
         # discovery, etc.).
+        # Devices we have kept before, read from stored settings.  This
+        # is what lets discovery stay OFF as the normal state: our own
+        # gear is already configured and keeps working, while anything
+        # new is ignored until someone turns discovery on to add it.
+        try:
+            self._configured_macs = self._dbus_ble_service.configured_macs()
+            logging.info("%d device(s) already configured in settings",
+                         len(self._configured_macs))
+        except Exception:
+            logging.exception("could not load configured devices; "
+                              "treating all as new")
+
         self._dbus_ble_service.register_continuous_scan_callback(
             self._on_continuous_scan_changed)
         # Passive vs active scanning re-applies through the same path:
@@ -164,6 +176,10 @@ class DbusBleSensors(object):
         self._adapters: dict[str, dict] = {}
 
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
+        # MACs with stored settings: our own configured gear.
+        # Populated at startup so a discovery-off restart still
+        # adopts the devices we already had.
+        self._configured_macs: set = set()
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
         self._last_adv_seen: dict[str, float] = {}
 
@@ -372,6 +388,56 @@ class DbusBleSensors(object):
         except Exception:
             logging.exception(f"Failed to persist {_KNOWN_MAC_TYPES_PATH!r}")
 
+    def _purge_unenabled_devices(self) -> None:
+        """Delete every adopted-but-not-enabled device, objects included.
+
+        Three things have to go, and only the first was ever happening:
+
+        * the BLE device object, via ``delete()`` — which disconnects
+          its role services, unregisters them (removing our
+          ``/Devices/<id>_<role>/*`` D-Bus items) and closes the D-Bus
+          connection each one held;
+        * the MAC's place in ``_known_mac`` and ``_configured_macs``, so
+          the discovery gate treats it as a stranger again rather than
+          as configured gear;
+        * the PERSISTED settings under ``/Settings/Devices/<dev_id>/``.
+          ``_delete_proxy_setting`` only detaches our end of the item;
+          the stored entry survives, and that is what left 59 disabled
+          devices on the prod gateway from neighbours' hardware.
+
+        Enabled devices are untouched — this is a sweep of things nobody
+        asked to keep, not a reset.
+        """
+        purged = 0
+        for mac in list(self._known_mac.keys()):
+            device = self._known_mac[mac]
+            info = getattr(device, "info", None)
+            if not info:
+                continue
+            try:
+                if self._dbus_ble_service.is_device_enabled(info):
+                    continue
+            except Exception:
+                logging.exception("%s: could not read enabled state; keeping",
+                                  mac)
+                continue
+            dev_id = info.get("dev_id")
+            logging.info("%s: purging — adopted but never enabled", mac)
+            try:
+                device.delete()
+            except Exception:
+                logging.exception("%s: delete failed", mac)
+            del self._known_mac[mac]
+            self._configured_macs.discard(mac)
+            if dev_id:
+                try:
+                    self._dbus_ble_service.purge_device_settings(dev_id)
+                except Exception:
+                    logging.exception("%s: settings purge failed", dev_id)
+            purged += 1
+        if purged:
+            logging.info("discovery off: purged %d unenabled device(s)", purged)
+
     def _on_continuous_scan_changed(self, new_value: bool) -> None:
         """Called by DbusBleService when ``/Settings/BleSensors/ContinuousScan``
         changes (GUI toggle, settings-restore, anywhere).
@@ -382,6 +448,14 @@ class DbusBleSensors(object):
         ``_throttled`` is True — the load throttle will re-apply
         whichever policy is current at release time.
         """
+        # Turning discovery OFF sweeps everything we adopted but nobody
+        # kept.  Leaving them costs more than clutter: a disabled device
+        # object is still a live object that re-registers on every
+        # advertisement, and its stored settings make it look configured
+        # forever after.
+        if not new_value:
+            self._purge_unenabled_devices()
+
         if self._throttled:
             logging.info(
                 "ContinuousScan changed to %r while throttled; will apply "
@@ -706,6 +780,31 @@ class DbusBleSensors(object):
                         self._tap_ignored_macs.add(dev_mac)
                     continue
 
+                # Discovery gate.  With Continuous scanning OFF we adopt
+                # nothing new: an unknown MAC is ignored rather than
+                # turned into a device object.  Devices we have
+                # configured before are unaffected — they are in
+                # ``_configured_macs`` from their stored settings, so
+                # turning discovery off never blinds us to our own gear.
+                #
+                # Without this, a neighbour's charger or shunt became a
+                # full device object on first sight, and (before the
+                # session gate below) that object immediately opened a
+                # GATT connection to hardware nobody had enabled.  On
+                # the prod gateway that produced 59 disabled entries and
+                # 139 discovery bursts for one unreachable shunt.
+                if (dev_mac not in self._configured_macs
+                        and not self._dbus_ble_service.get_continuous_scan()):
+                    now = time.monotonic()
+                    if now - self._last_adv_seen.get(dev_mac, 0) >= ADV_LOG_QUIET_PERIOD:
+                        logging.info(
+                            f"{dev_mac}: not adopting — discovery is off "
+                            f"and this device has no stored settings")
+                    self._last_adv_seen[dev_mac] = now
+                    self._ignored_mac[dev_mac] = True
+                    self._tap_ignored_macs.add(dev_mac)
+                    continue
+
                 logging.info(f"{dev_mac}: initializing device with class {device_class}")
                 try:
                     dev_instance = device_class(dev_mac)
@@ -720,6 +819,7 @@ class DbusBleSensors(object):
                     dev_instance.configure(man_data)
                     dev_instance.init()
                     self._known_mac[dev_mac] = dev_instance
+                    self._configured_macs.add(dev_mac)
                     # Newly-configured device — remember its BLE
                     # address type so we can put it in the controller's
                     # accept list when ``Continuous scanning`` is OFF.
