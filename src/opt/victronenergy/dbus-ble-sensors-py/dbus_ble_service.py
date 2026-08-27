@@ -225,15 +225,20 @@ class DbusBleService(object):
 
         Discovery being off must not blind us to our own configured
         gear; it must only stop us adopting strangers.  Keys look like
-        ``orion_tr_c36eed421ff2/charger/Enabled``, so the MAC is the
-        trailing 12 hex characters of the first segment.
+        ``orion_tr_c36eed421ff2/charger/Enabled`` — but indexed devices
+        append a slot to the dev_id, giving
+        ``seelevel_btp3_00a0508d9569_01/tank/Enabled``, where the MAC is
+        in the middle.  Take the last 12-hex segment wherever it sits;
+        keying on the trailing segment yielded "01" and silently locked
+        every multi-tank device out of its own settings.
         """
         macs = set()
         for key in self._dbus_settings.list_device_settings():
             dev_id = str(key).split("/", 1)[0]
-            tail = dev_id.rsplit("_", 1)[-1].lower()
-            if len(tail) == 12 and all(c in "0123456789abcdef" for c in tail):
-                macs.add(tail)
+            for seg in reversed(dev_id.lower().split("_")):
+                if len(seg) == 12 and all(c in "0123456789abcdef" for c in seg):
+                    macs.add(seg)
+                    break
         return macs
 
     def is_device_role_enabled(self, device_info: dict, role_name: str) -> bool:

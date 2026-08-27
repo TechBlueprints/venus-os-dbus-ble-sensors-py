@@ -129,3 +129,37 @@ def test_configured_macs_survives_construction() -> None:
     assert assigns[0] < load, (
         "the empty-set initialisation must come BEFORE the load, or it "
         "wipes the configured devices and the gate rejects everything")
+
+
+def test_configured_macs_finds_mac_in_indexed_dev_id() -> None:
+    """Indexed devices carry the MAC in the MIDDLE of the dev_id.
+
+    ble_device.py builds ``dev_id = prefix_mac`` and then appends a slot
+    for each indexed role service, so a multi-tank SeeLevel stores
+    ``seelevel_btp3_00a0508d9569_01/tank/Enabled``.  Keying on the
+    trailing underscore segment returned "01", the MAC never entered the
+    configured set, and the discovery gate refused Clint's own BTP3 as a
+    stranger — tank.seelevel went to 0 of 3 while four enabled slots sat
+    in settings.  The unindexed forms kept passing throughout, which is
+    why the parser looked correct.
+    """
+    import dbus_ble_service
+
+    class _Settings:
+        def list_device_settings(self):
+            return [
+                "seelevel_btp3_00a0508d9569_00/tank/Enabled",
+                "seelevel_btp3_00a0508d9569_13/tank/Enabled",
+                # slot + role suffix: MAC three segments from the end
+                "seelevel_btp3_00a0508d9569_13_battery/Enabled",
+                "orion_tr_c36eed421ff2/charger/Enabled",
+                "ruuvi_f4a2a80c6534/temperature/Enabled",
+                "vebus_ttyO1/Enabled",
+            ]
+
+    svc = dbus_ble_service.DbusBleService.__new__(
+        dbus_ble_service.DbusBleService)
+    svc._dbus_settings = _Settings()
+
+    assert svc.configured_macs() == {
+        "00a0508d9569", "c36eed421ff2", "f4a2a80c6534"}
