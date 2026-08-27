@@ -66,6 +66,10 @@ if "dbus" not in sys.modules:
 
     dbus_service.Object = _StubServiceObject
     dbus_service.method = _stub_method
+    # ble_advertisement_router declares D-Bus SIGNALS as well as methods
+    # (the Advertisement signal consumers subscribe to).  Same decorator
+    # shape: it is never emitted in tests, it only has to build.
+    dbus_service.signal = _stub_method
     dbus.service = dbus_service
 
     # dbus.bus, so dbus_bus.py can be imported: it subclasses

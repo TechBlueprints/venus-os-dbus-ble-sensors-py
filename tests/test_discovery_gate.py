@@ -31,8 +31,11 @@ import sys
 # and say why, so a green local run is never mistaken for coverage of
 # this module.
 if sys.version_info < (3, 10):
-    pytest.skip("dbus_ble_sensors needs Python 3.10+ (dataclass slots); "
-                "device runs 3.12", allow_module_level=True)
+    raise RuntimeError(
+        "dbus_ble_sensors needs Python 3.10+ (dataclass slots) and the "
+        "device runs 3.12 — run ./tests/run.sh, which picks a matching "
+        "interpreter.  This used to skip, which meant a green suite "
+        "covered none of this module.")
 
 
 class _Svc:

@@ -31,3 +31,4 @@ src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/**/*.pyc
 .idea/
 *.code-workspace
 sample-driver/
+.venv-test/

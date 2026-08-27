@@ -1,0 +1,13 @@
+# Test dependencies, chosen to match the Cerbo rather than the newest.
+#
+# pytest      — runner
+# cryptography — the AES backend Venus ships (python3-cryptography).
+#                Without it every victron_ble test fails on import, which
+#                is what a 3.9 host was hiding.
+#
+# Deliberately NOT pycryptodome: the device does not have it either, and
+# tests/test_vendored_victron_ble.py cross-checks the two backends only
+# when both exist.  Installing it here would exercise a configuration no
+# Cerbo runs.
+pytest
+cryptography
