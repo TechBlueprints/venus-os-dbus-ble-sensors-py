@@ -32,12 +32,18 @@ from __future__ import annotations
 import asyncio
 import binascii
 import logging
+import os
 import struct
 import time
 
 import victron_vreg as vreg
 
 logger = logging.getLogger(__name__)
+
+# Escape hatch for the AcquireNotify-vs-StartNotify question; see
+# _start_notify.  Env var so it can be flipped for one CLI run
+# without touching the service.
+_PREFER_START_NOTIFY = os.environ.get("HEX_START_NOTIFY") == "1"
 
 
 def _err(*a) -> None:
@@ -118,14 +124,40 @@ class _Collector:
 
 
 async def _start_notify(client, char, callback, acquired=None) -> bool:
-    """Subscribe, preferring AcquireNotify.  Returns False if absent.
+    """Subscribe.  Returns False if the characteristic is absent.
 
-    ``acquired`` records what was taken so :func:`_stop_notify_all` can
-    release it before the link drops — see that function for why an
-    outstanding acquire at disconnect is a landmine on BlueZ 5.72.
+    Which BlueZ path we take is the single highest-stakes choice in this
+    module, so it is a switch rather than a constant.
+
+    ``AcquireNotify`` (``use_start_notify: False``) hands back a file
+    descriptor.  It was chosen because on Venus, StartNotify plus
+    PropertiesChanged delivered EMPTY payloads for these characteristics
+    once the link was SMP-paired.  Its cost only became clear later: it
+    is what creates ``chrc->notify_io`` in bluetoothd, and BlueZ 5.72
+    stores the notify client there without a reference — the
+    use-after-free behind ~240 SIGSEGVs on the prod Cerbo in one day.
+
+    ``StartNotify`` (bleak's default) never creates ``notify_io`` at
+    all, so ``notify_io_destroy`` is never reached and the UAF is
+    unreachable — however a session ends, clean or failed or killed.
+    That removes the crash site instead of tiptoeing around it, which
+    three separate teardown guards failed to do.
+
+    The empty-payload finding predates the current bleak/BCM stack, so
+    it is worth re-testing rather than inheriting.  Set
+    ``HEX_START_NOTIFY=1`` to take the StartNotify path and compare.
     """
     if client.services.get_characteristic(char) is None:
         return False
+    if _PREFER_START_NOTIFY:
+        try:
+            await client.start_notify(char, callback)
+            if acquired is not None:
+                acquired.append(char)
+            return True
+        except Exception:
+            logger.warning("StartNotify failed on %s", char)
+            return False
     try:
         await client.start_notify(char, callback,
                                   bluez={"use_start_notify": False})
