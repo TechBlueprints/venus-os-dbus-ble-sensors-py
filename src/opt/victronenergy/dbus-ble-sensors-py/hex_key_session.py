@@ -52,6 +52,22 @@ def _err(*a) -> None:
     logger.info(" ".join(str(x) for x in a))
 
 
+def _dbg(*a) -> None:
+    """Raw payload tracing.
+
+    These were INFO because this code began life as a one-shot CLI, where
+    the operator was watching a terminal.  In a long-running service they
+    were 58% of every line the service wrote — 254 of 437 lines in one
+    quiet 7.5-minute window, single lines carrying ~470 characters of hex
+    — which is how a real fault ends up scrolled off the end of a log.
+    One of them printed nonce+passkey material on every PIN auth, which
+    has no business at INFO on a box that ships its logs.
+
+    Progress and outcomes stay at INFO; the bytes go to DEBUG.
+    """
+    logger.debug(" ".join(str(x) for x in a))
+
+
 # Flow-control values this flow uses.  Deliberately not the writer's:
 # the provisioning session asks for the large chunk size and a full
 # credit window, because it is pulling register pushes rather than
@@ -101,26 +117,26 @@ class _Collector:
         full = bytes(self._bulk) + bytes(data)
         self._bulk.clear()
         self.frames.append(full)
-        _err(f"[LAST] {len(full)}B: {full.hex()}")
+        _dbg(f"[LAST] {len(full)}B: {full.hex()}")
 
     def on_bulk(self, _char, data: bytearray) -> None:
         self._bulk.extend(data)
-        _err(f"[BULK] +{len(data)}B: {data.hex()}")
+        _dbg(f"[BULK] +{len(data)}B: {data.hex()}")
 
     def on_ctrl(self, _char, data: bytearray) -> None:
         # Device-side control traffic (F7 error, F9 credits, F8 buffer
         # clear).  Logged only — the handshake is driven explicitly below,
         # and reacting here would race our own writes.
         if data:
-            _err(f"[CTRL-RX] {len(data)}B: {bytes(data).hex()}")
+            _dbg(f"[CTRL-RX] {len(data)}B: {bytes(data).hex()}")
 
     def on_puk(self, _char, data: bytearray) -> None:
         self.puk.append(bytes(data))
-        _err(f"[PUK] {len(data)}B: {bytes(data).hex()}")
+        _dbg(f"[PUK] {len(data)}B: {bytes(data).hex()}")
 
     def on_pin(self, _char, data: bytearray) -> None:
         self.pin.append(bytes(data))
-        _err(f"[PIN] {len(data)}B: {bytes(data).hex()}")
+        _dbg(f"[PIN] {len(data)}B: {bytes(data).hex()}")
 
 
 async def _start_notify(client, char, callback, acquired=None) -> bool:
@@ -229,7 +245,7 @@ async def _handshake(client) -> None:
     """CTRL read (puts the device in CBOR mode) plus the credit writes."""
     try:
         header = await client.read_gatt_char(vreg.CHAR_CONTROL)
-        _err(f"CTRL header: {bytes(header).hex()}")
+        _dbg(f"CTRL header: {bytes(header).hex()}")
     except Exception as exc:
         _err(f"CTRL read: {exc} — proceeding anyway")
     await client.write_gatt_char(vreg.CHAR_CONTROL, _CTRL_CHUNK,
@@ -242,7 +258,7 @@ async def _handshake(client) -> None:
 
 async def _prime(client, collector: _Collector) -> None:
     """Subscribe to a chatty register so the outgoing stream starts."""
-    _err(f"Subscribe 0x{VREG_TEMPERATURE:04X} (prime): {_PRIME.hex()}")
+    _dbg(f"Subscribe 0x{VREG_TEMPERATURE:04X} (prime): {_PRIME.hex()}")
     await client.write_gatt_char(vreg.CHAR_DATA_LAST, _PRIME, response=False)
     deadline = time.monotonic() + _PRIME_WINDOW_S
     while time.monotonic() < deadline and not collector.frames:
@@ -273,7 +289,7 @@ async def _puk_pin_auth(client, collector: _Collector, passkey: int,
         collector.puk.clear()
         nonce = bytes(await client.read_gatt_char(vreg.CHAR_PUK))
         crc = struct.pack("<I", binascii.crc32(nonce) & 0xFFFFFFFF)
-        _err(f"PUK auth attempt {attempt}: nonce={nonce.hex()} crc={crc.hex()}")
+        _dbg(f"PUK auth attempt {attempt}: nonce={nonce.hex()} crc={crc.hex()}")
         await client.write_gatt_char(vreg.CHAR_PUK, crc, response=False)
         await asyncio.sleep(1.5)
         if any(r == b"\x00" for r in collector.puk):
@@ -298,7 +314,7 @@ async def _puk_pin_auth(client, collector: _Collector, passkey: int,
         await asyncio.sleep(0.2)
         nonce = bytes(await client.read_gatt_char(vreg.CHAR_PUK))
         payload = nonce + struct.pack("<I", passkey)
-        _err(f"PIN auth: nonce+PIN = {payload.hex()}")
+        _dbg(f"PIN auth: nonce+PIN = {payload.hex()}")
         await client.write_gatt_char(vreg.CHAR_PIN, payload, response=False)
         await asyncio.sleep(2.0)
         if any(r == b"\x00" for r in collector.pin):
@@ -345,7 +361,7 @@ def _scan_hex_key(frames) -> bytes | None:
 async def _ask_key(client, collector: _Collector, request: bytes,
                    label: str, window: float) -> bytes | None:
     collector.reset()
-    _err(f"Get 0xEC65 ({label}): {request.hex() if request[:1] != b':' else request!r}")
+    _dbg(f"Get 0xEC65 ({label}): {request.hex() if request[:1] != b':' else request!r}")
     await client.write_gatt_char(vreg.CHAR_DATA_LAST, request, response=False)
     deadline = time.monotonic() + window
     while time.monotonic() < deadline:
@@ -381,7 +397,7 @@ def _parse_device_list_instances(frames) -> list[int]:
         else:
             break
     instances = vals[0::2] or [0]
-    _err(f"GetDevices instances: {instances} (raw {data.hex()})")
+    _dbg(f"GetDevices instances: {instances} (raw {data.hex()})")
     return instances
 
 
@@ -389,7 +405,7 @@ async def _official_key_preamble(client, collector: _Collector) -> None:
     """GetDevices, then subscribe every instance the list returned."""
     collector.reset()
     devices = vreg.encode_get_devices()
-    _err(f"GetDevices: {devices.hex()}")
+    _dbg(f"GetDevices: {devices.hex()}")
     await client.write_gatt_char(vreg.CHAR_DATA_LAST, devices, response=False)
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
@@ -398,7 +414,7 @@ async def _official_key_preamble(client, collector: _Collector) -> None:
     instances = _parse_device_list_instances(collector.frames)
     for inst in instances:
         req = vreg.encode_subscribe_instance(inst)
-        _err(f"Subscribe instance {inst}: {req.hex()}")
+        _dbg(f"Subscribe instance {inst}: {req.hex()}")
         await client.write_gatt_char(vreg.CHAR_DATA_LAST, req, response=False)
         await asyncio.sleep(0.5)
         await _credits(client)
@@ -479,7 +495,7 @@ async def _fetch_vreg(client, collector: _Collector, register: int,
     try:
         request = vreg.encode_read_command(register)
         collector.reset()
-        _err(f"GetValue 0x{register:04X} ({label}): {request.hex()}")
+        _dbg(f"GetValue 0x{register:04X} ({label}): {request.hex()}")
         await client.write_gatt_char(vreg.CHAR_DATA_LAST, request,
                                      response=True)
         deadline = time.monotonic() + timeout
@@ -487,7 +503,7 @@ async def _fetch_vreg(client, collector: _Collector, register: int,
             await asyncio.sleep(0.4)
             value = vreg.scan_for_vreg(collector.frames, register)
             if value is not None:
-                _err(f"Recovered {label} bytes: {value.hex()}")
+                _dbg(f"Recovered {label} bytes: {value.hex()}")
                 return value.hex()
             await _credits(client)
     except Exception as exc:
@@ -501,7 +517,7 @@ async def _read_hardware_version(client) -> str | None:
         if client.services.get_characteristic(CHAR_DEVICE_INFO) is None:
             return None
         value = bytes(await client.read_gatt_char(CHAR_DEVICE_INFO))
-        _err(f"DeviceInfo: {len(value)}B: {value.hex()}")
+        _dbg(f"DeviceInfo: {len(value)}B: {value.hex()}")
         if len(value) >= 4:
             revision = str(int.from_bytes(value[2:4], "little"))
             _err(f"Hardware revision: {revision}")
@@ -527,7 +543,8 @@ async def provision_session(client, passkey: int, timeout_s: float,
     does not have.
     """
     if pair:
-        _err(f"Pairing (passkey {passkey:06d})")
+        _err("Pairing")
+        _dbg(f"Pairing passkey {passkey:06d}")
         await client.pair()
         _err("Paired")
 
