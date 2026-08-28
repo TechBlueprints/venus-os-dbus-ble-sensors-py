@@ -179,9 +179,32 @@ def test_only_out_of_pool_candidate_is_still_used(_pool, caplog) -> None:
     bus = _bus_with({
         f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}": {"Paired": True, "Connected": True},
     })
+    ble_gatt_dbus._warned_out_of_pool.discard(MAC)
     with caplog.at_level("WARNING"):
         path, _ = ble_gatt_dbus.lookup_device(bus, MAC)
     assert path == f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}"
     assert any("outside the configured GATT pool" in r.message
                for r in caplog.records), (
         "falling outside the pool must be visible, not silent")
+
+
+def test_the_out_of_pool_warning_is_logged_once_per_device(_pool, caplog) -> None:
+    """It is a standing condition, not an event.
+
+    It holds for every connect until the config changes or the device
+    bonds on a pooled card.  Unthrottled it fired on every telemetry
+    cycle -- observed three times in one minute on dev -- which is the
+    same steady-state accumulation that made the discovery gate's
+    refusal line worth fixing.
+    """
+    ble_gatt_dbus._warned_out_of_pool.discard(MAC)
+    bus = _bus_with({
+        f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}": {"Paired": True, "Connected": True},
+    })
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            ble_gatt_dbus.lookup_device(bus, MAC)
+    hits = [r for r in caplog.records
+            if "outside the configured GATT pool" in r.message]
+    assert len(hits) == 1, (
+        f"expected one warning across five lookups, got {len(hits)}")

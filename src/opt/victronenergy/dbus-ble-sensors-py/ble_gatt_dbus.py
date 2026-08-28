@@ -70,6 +70,13 @@ def _plain(value):
     return value
 
 
+# Devices already reported as linking outside the configured pool.
+# Module scope so it survives per-call and per-writer lifetimes; the
+# condition is standing, so one line per device per process is the whole
+# of its information content.
+_warned_out_of_pool: set[str] = set()
+
+
 def lookup_device(bus, mac: str,
                   prefer_adapter: str | None = None,
                   ) -> tuple[str | None, dict | None]:
@@ -169,9 +176,18 @@ def lookup_device(bus, mac: str,
     # the bus to honour a preference about which radio it uses — the
     # wrong trade.  But it must not pass silently: the operator asked for
     # links on specific cards and this one is not on them.
-    if pool and not in_pool(path):
+    if pool and not in_pool(path) and mac not in _warned_out_of_pool:
+        # Once per device per process.  This is a standing condition, not
+        # an event: it holds for every connect until someone changes the
+        # config or bonds the device on a pooled card.  Logged unthrottled
+        # it fired on every telemetry cycle — roughly every 30s per
+        # device — which is the same steady-state accumulation that made
+        # the gate's refusal line worth fixing.
+        _warned_out_of_pool.add(mac)
         logger.warning("%s: no pooled adapter knows this device; linking on "
-                       "%s, outside the configured GATT pool (%s)",
+                       "%s, outside the configured GATT pool (%s). "
+                       "Bond it on a pooled card or widen ble-connect.conf; "
+                       "further occurrences are not logged.",
                        mac, path.rsplit("/", 1)[0], ", ".join(sorted(pool)))
     return path, props
 
