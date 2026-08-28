@@ -89,23 +89,41 @@ def test_an_hci_name_is_stored_as_the_cards_mac(mod) -> None:
         "a number outlives the numbering that gave it meaning")
 
 
-def test_a_legacy_stored_number_is_upgraded_on_read(mod) -> None:
-    # Written before this was MAC-keyed.  Upgrading in flight avoids a
-    # settings migration for a value that is cheap to re-derive.
+def test_a_legacy_stored_number_is_rejected_not_upgraded(mod) -> None:
+    """This reverses an earlier decision, deliberately.
+
+    The old behaviour upgraded a stored "hci0" to the MAC of whatever
+    card answered to hci0 at read time, to avoid a settings migration.
+    That resolution is unsound: the number was written at an unknown past
+    moment, so resolving it now can name a card that was never the one
+    meant — and the result is then MAC-shaped, so nothing downstream can
+    tell a laundered guess from a real preference.
+
+    This file's own docstring named that hazard while the test below
+    enshrined it.  Observed on dev: hci0 named three different physical
+    cards within one hour (00:01:95:24:24:CC, 00:01:95:0C:31:BA,
+    8A:88:4B:E3:48:F7).
+
+    No preference is the honest answer.  Placement falls through to the
+    configured pool and connected-then-bonded ranking, and the next
+    successful connect rewrites the setting as a MAC — self-healing,
+    which is what the migration was being avoided for in the first place.
+    """
     path = mod.preferred_adapter_setting_path(MAC)
     settings = _Settings({path: "hci0"})
 
-    assert mod.get_preferred_adapter(settings, MAC) == CARD_KEY
+    assert mod.get_preferred_adapter(settings, MAC) is None
 
 
-def test_an_unresolvable_legacy_name_survives(mod) -> None:
-    # The card may be absent right now and back later, and this is a
-    # preference rather than a restriction — so passing it through beats
-    # discarding it.
+def test_an_unresolvable_legacy_name_is_also_rejected(mod) -> None:
+    # Previously passed through unchanged, on the reasoning that the card
+    # might return.  But "hci9" does not name a card that can return — it
+    # names a slot, and whatever lands in that slot later is unrelated to
+    # whatever was there when this was written.
     path = mod.preferred_adapter_setting_path(MAC)
     settings = _Settings({path: "hci9"})
 
-    assert mod.get_preferred_adapter(settings, MAC) == "hci9"
+    assert mod.get_preferred_adapter(settings, MAC) is None
 
 
 def test_nothing_stored_stays_nothing(mod) -> None:
@@ -116,3 +134,28 @@ def test_an_empty_adapter_is_not_stored(mod) -> None:
     settings = _Settings()
     mod.set_preferred_adapter(settings, MAC, "  ")
     assert settings.stored == {}
+
+
+@pytest.mark.parametrize("stored", ["hci0", "HCI0", "hci1", "hci12"])
+def test_every_hci_spelling_is_rejected(mod, stored) -> None:
+    """Case and number are incidental; the form is the problem.
+
+    Found by the night watch: of three stored hints on dev, two were
+    hciN-form. hciN is assigned by probe order, so the value does not
+    identify hardware at all — resolving it now yields whichever card
+    enumerated first this boot.
+    """
+    path = mod.preferred_adapter_setting_path(MAC)
+    assert mod.get_preferred_adapter(_Settings({path: stored}), MAC) is None
+
+
+def test_a_mac_preference_is_untouched(mod) -> None:
+    """The rejection must not cost us the case the setting exists for."""
+    path = mod.preferred_adapter_setting_path(MAC)
+    got = mod.get_preferred_adapter(_Settings({path: CARD_KEY}), MAC)
+    assert got == CARD_KEY
+
+
+def test_a_blank_preference_is_no_preference(mod) -> None:
+    path = mod.preferred_adapter_setting_path(MAC)
+    assert mod.get_preferred_adapter(_Settings({path: "   "}), MAC) is None

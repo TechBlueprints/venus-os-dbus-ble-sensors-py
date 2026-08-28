@@ -17,6 +17,10 @@ from dbus_settings_service import DbusSettingsService
 
 logger = logging.getLogger(__name__)
 
+# A stored preference in hciN form is a legacy value from before this
+# setting was MAC-keyed.  It is never written this way now.
+_HCI_NAME = re.compile(r"^hci\d+$", re.IGNORECASE)
+
 
 def _mac_key(dev_mac: str) -> str:
     s = dev_mac.lower().replace(":", "")
@@ -94,7 +98,19 @@ def get_preferred_adapter(settings: DbusSettingsService,
     # migration.  An unresolvable legacy name passes through unchanged:
     # it may still be correct, and this is a preference, not a pin.
     s = str(raw).strip()
-    return adapter_identity.canonical(s) if s else None
+    if not s:
+        return None
+
+    # An hciN-form value cannot be upgraded, only laundered.  See the
+    # long note in ip22_key_settings.get_preferred_adapter.
+    if _HCI_NAME.match(s):
+        logger.info("%s: ignoring legacy hciN preference %r — the number "
+                    "names whichever card enumerated first, not the card "
+                    "it meant; it will be rewritten as a MAC on the next "
+                    "successful connect", dev_mac, s)
+        return None
+
+    return adapter_identity.canonical(s)
 
 
 def set_preferred_adapter(settings: DbusSettingsService,
