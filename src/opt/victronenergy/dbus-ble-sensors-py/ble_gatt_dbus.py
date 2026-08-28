@@ -34,6 +34,7 @@ import dbus.service
 from gi.repository import GLib
 
 import adapter_identity
+import ble_catcher
 
 logger = logging.getLogger(__name__)
 
@@ -120,16 +121,58 @@ def lookup_device(bus, mac: str,
     # nothing at all — the failure looks exactly like having no
     # preference, which is why it would never be noticed.
     name = adapter_identity.hci_for(prefer_adapter) if prefer_adapter else None
+
+    # The configured GATT pool is a constraint; a stored preference is a
+    # learned hint.  A hint must never defeat a constraint — that is how
+    # the IP22 kept linking on the pack's radio: its PreferredAdapter had
+    # recorded that card back when it was the one that worked, and the
+    # ble-connect.conf pool naming a different card was never consulted,
+    # because the preference picked the BlueZ path outright and the path
+    # decides the adapter.
+    try:
+        pool = ble_catcher.link_adapter_names()
+    except Exception:
+        logger.exception("%s: could not read the GATT adapter pool; "
+                         "placing without it", mac)
+        pool = set()
+
+    if pool and name and name not in pool:
+        logger.info("%s: ignoring preferred adapter %s — not in the "
+                    "configured GATT pool (%s)",
+                    mac, prefer_adapter, ", ".join(sorted(pool)))
+        name = None
+
     wanted = f"/org/bluez/{name}/" if name else None
+
+    def in_pool(path: str) -> bool:
+        # No pool configured means every adapter is permitted.
+        if not pool:
+            return True
+        return any(path.startswith(f"/org/bluez/{n}/") for n in pool)
 
     def rank(item):
         _path, props = item
-        return (0 if wanted and _path.startswith(wanted) else 1,
+        # Pool membership outranks everything: dropping the out-of-pool
+        # preference alone was not enough, because the connected/bonded
+        # fallback lands on whichever card the device last bonded to,
+        # which is the very card the operator excluded.
+        return (0 if in_pool(_path) else 1,
+                0 if wanted and _path.startswith(wanted) else 1,
                 0 if props.get("Connected") else 1,
                 0 if props.get("Paired") else 1,
                 _path)
 
     path, props = sorted(candidates, key=rank)[0]
+
+    # Ranking, not filtering.  If BlueZ knows this device only on an
+    # adapter outside the pool, refusing would take a working device off
+    # the bus to honour a preference about which radio it uses — the
+    # wrong trade.  But it must not pass silently: the operator asked for
+    # links on specific cards and this one is not on them.
+    if pool and not in_pool(path):
+        logger.warning("%s: no pooled adapter knows this device; linking on "
+                       "%s, outside the configured GATT pool (%s)",
+                       mac, path.rsplit("/", 1)[0], ", ".join(sorted(pool)))
     return path, props
 
 

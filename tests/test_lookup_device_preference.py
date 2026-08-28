@@ -101,3 +101,87 @@ def test_no_preference_prefers_connected_then_bonded(monkeypatch) -> None:
     })
     path, _ = ble_gatt_dbus.lookup_device(bus, MAC)
     assert path == f"/org/bluez/{OTHER_HCI}{SUFFIX}"
+
+
+# --- The configured GATT pool is a constraint, not a preference -------
+#
+# ble-connect.conf bounds which adapters GATT links may be placed on.
+# bcmv2 ranks its own placement against that list, but a device BlueZ
+# already knows is resolved to an object path first, and the path names
+# the adapter the link will use -- so the pool was only half-enforced.
+#
+# Observed on dev: the IP22's stored PreferredAdapter was 00019540C333,
+# the pack's link radio, learned back when it was the card that worked.
+# ble-connect.conf named 00:01:95:24:24:CC.  The hint won, and every
+# IP22 link landed on the radio the config exists to keep clear -- the
+# exact sharing that file's comments exist to prevent.
+
+POOL_HCI = CARD_HCI        # the one card ble-connect.conf permits
+EXCLUDED_HCI = OTHER_HCI   # e.g. the pack's link radio
+
+
+@pytest.fixture
+def _pool(monkeypatch):
+    import ble_catcher
+    monkeypatch.setattr(ble_catcher, "link_adapter_names",
+                        lambda: {POOL_HCI})
+
+
+def test_a_preference_outside_the_pool_is_ignored(_pool) -> None:
+    """A learned hint must not defeat an operator constraint."""
+    bus = _bus_with({
+        f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}": {"Paired": True, "Connected": True},
+        f"/org/bluez/{POOL_HCI}{SUFFIX}": {"Paired": True},
+    })
+    path, _ = ble_gatt_dbus.lookup_device(
+        bus, MAC, prefer_adapter=EXCLUDED_HCI)
+    assert path == f"/org/bluez/{POOL_HCI}{SUFFIX}", (
+        "PreferredAdapter named a card outside ble-connect.conf's pool; "
+        "the pooled candidate must win anyway")
+
+
+def test_pool_outranks_connected_and_bonded(_pool) -> None:
+    """Dropping the bad preference alone is not enough.
+
+    With no preference at all, the old ranking fell through to
+    connected-then-bonded -- which is precisely the excluded card, since
+    that is where the device bonded.
+    """
+    bus = _bus_with({
+        f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}": {"Paired": True, "Connected": True},
+        f"/org/bluez/{POOL_HCI}{SUFFIX}": {},
+    })
+    path, _ = ble_gatt_dbus.lookup_device(bus, MAC)
+    assert path == f"/org/bluez/{POOL_HCI}{SUFFIX}", (
+        "a Connected+Paired candidate on an excluded card must not beat "
+        "an unbonded candidate on a permitted one")
+
+
+def test_an_unconfigured_pool_changes_nothing(monkeypatch) -> None:
+    """No ble-connect.conf means every adapter is a candidate."""
+    import ble_catcher
+    monkeypatch.setattr(ble_catcher, "link_adapter_names", lambda: set())
+    bus = _bus_with({
+        f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}": {"Paired": True, "Connected": True},
+        f"/org/bluez/{CARD_HCI}{SUFFIX}": {"Paired": True},
+    })
+    path, _ = ble_gatt_dbus.lookup_device(bus, MAC, prefer_adapter=CARD)
+    assert path == f"/org/bluez/{CARD_HCI}{SUFFIX}"
+
+
+def test_only_out_of_pool_candidate_is_still_used(_pool, caplog) -> None:
+    """Rank, do not filter.
+
+    If BlueZ knows the device only on an excluded adapter, refusing
+    would take a working device off the bus to honour a preference about
+    which radio it uses.  It must still be reported.
+    """
+    bus = _bus_with({
+        f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}": {"Paired": True, "Connected": True},
+    })
+    with caplog.at_level("WARNING"):
+        path, _ = ble_gatt_dbus.lookup_device(bus, MAC)
+    assert path == f"/org/bluez/{EXCLUDED_HCI}{SUFFIX}"
+    assert any("outside the configured GATT pool" in r.message
+               for r in caplog.records), (
+        "falling outside the pool must be visible, not silent")

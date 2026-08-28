@@ -63,6 +63,7 @@ from __future__ import annotations
 import logging
 import os
 
+import adapter_identity
 import ble_ext_path
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,43 @@ def catcher_options(path: str = CONFIG_PATH) -> tuple[list[str], dict[str, int]]
         if adapter and cap.isdigit():
             link_caps[adapter] = int(cap)
     return adapters, link_caps
+
+
+def link_adapter_names() -> set[str]:
+    """Current ``hciN`` names of the adapters GATT links may be placed on.
+
+    An empty set means unconfigured — every adapter is a candidate, which
+    is bcmv2's own default and must stay the behaviour when no operator
+    constraint exists.
+
+    This exists because the pool was only ever half-enforced.  bcmv2 ranks
+    *its* placement against these entries, but a device already known to
+    BlueZ is resolved to an object path first, and that path names the
+    adapter the link will use.  On dev the IP22's stored
+    ``PreferredAdapter`` was ``00019540C333`` — the pack's link radio,
+    learned back when it was the card that worked — while
+    ble-connect.conf named ``00:01:95:24:24:CC``.  The stored hint won,
+    and every IP22 link landed on the radio the config exists to keep
+    clear.
+
+    Resolved fresh: a MAC-named card is one whose number changes.
+    """
+    entries, _ = catcher_options()
+    names: set[str] = set()
+    for entry in entries:
+        # "MAC@hciX" pins a device to an adapter; the adapter half is
+        # still a legitimate link target.  A bare entry is a pool adapter.
+        _, sep, adapter = entry.rpartition("@")
+        adapter = adapter if sep else entry
+        if not adapter:
+            continue
+        try:
+            name = adapter_identity.hci_for(adapter)
+        except Exception:
+            continue
+        if name:
+            names.add(name)
+    return names
 
 
 def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
