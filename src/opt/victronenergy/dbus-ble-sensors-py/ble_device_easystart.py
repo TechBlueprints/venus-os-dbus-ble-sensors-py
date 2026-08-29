@@ -173,7 +173,9 @@ class BleDeviceEasyStart(BleDevice):
         # Register the D-Bus service on first sighting (mirrors what
         # handle_manufacturer_data does for advertisement sensors).
         role_service.connect()
-        self._publish_value(role_service, '/Rssi', rssi)
+        # RSSI wobbles a couple of dBm on every advertisement; deadband
+        # it so presence updates don't become the service's noisiest path.
+        self._publish_value(role_service, '/Rssi', rssi, deadband=4)
 
         if self._session_active:
             return
@@ -386,13 +388,18 @@ class BleDeviceEasyStart(BleDevice):
         power = current * voltage
         with role_service:
             pub = self._publish_value
-            pub(role_service, '/Ac/L1/Current', current,
-                sensor_type='current')
-            pub(role_service, '/Ac/Current', current, sensor_type='current')
+            # The device reports current in 0.1 A steps and a running
+            # compressor wanders one step either way on most polls, so
+            # rounded-equality dedup passes nearly every write.  A
+            # deadband above one device step (and its 120 V multiple on
+            # the derived power) keeps the steady state silent while a
+            # real load change still publishes within one poll.
+            pub(role_service, '/Ac/L1/Current', current, deadband=0.3)
+            pub(role_service, '/Ac/Current', current, deadband=0.3)
             # Derived, no power factor — the voltage path says which
             # nominal value produced it.
-            pub(role_service, '/Ac/L1/Power', power, override=0)
-            pub(role_service, '/Ac/Power', power, override=0)
+            pub(role_service, '/Ac/L1/Power', power, deadband=30.0)
+            pub(role_service, '/Ac/Power', power, deadband=30.0)
             pub(role_service, '/Ac/L1/Voltage', voltage, override=0)
             if live['frequency'] is not None:
                 pub(role_service, '/Ac/L1/Frequency', live['frequency'],
@@ -448,10 +455,12 @@ class BleDeviceEasyStart(BleDevice):
             return
         with role_service:
             pub = self._publish_value
-            pub(role_service, '/Ac/L1/Current', 0.0, sensor_type='current')
-            pub(role_service, '/Ac/Current', 0.0, sensor_type='current')
-            pub(role_service, '/Ac/L1/Power', 0.0, override=0)
-            pub(role_service, '/Ac/Power', 0.0, override=0)
+            # Same deadbands as the live path so each path's dedup cache
+            # compares like with like across on/off transitions.
+            pub(role_service, '/Ac/L1/Current', 0.0, deadband=0.3)
+            pub(role_service, '/Ac/Current', 0.0, deadband=0.3)
+            pub(role_service, '/Ac/L1/Power', 0.0, deadband=30.0)
+            pub(role_service, '/Ac/Power', 0.0, deadband=30.0)
             pub(role_service, '/EasyStart/Reachable', 0)
         if self._reachable is not False:
             self._reachable = False
