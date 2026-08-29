@@ -35,6 +35,15 @@ useful data appears in advertisement payloads.
 No pairing, bonding, or authentication. Subscribe to the notify characteristic
 (standard CCCD, `ENABLE_NOTIFICATION_VALUE`) before issuing any command.
 
+These UUIDs are not Micro-Air's. The `d973f2e0/e1/e2` family is the stock
+example service shipped in STMicroelectronics' BLE firmware templates — the
+same three UUIDs appear verbatim in ST's STM32WB middleware (`template_stm.c`)
+and BlueNRG sample services, and therefore in any unrelated product built from
+those templates without changing them. Two consequences: the service UUID must
+never be used as a discovery filter or identity (an unrelated ST-template
+device would match), and the absence of pairing is inherited template
+behaviour, not a vendor decision that might be revisited per model.
+
 ## Discovery (confirmed)
 
 Match on the advertised device name, which begins `EasyStart_`. Two lengths

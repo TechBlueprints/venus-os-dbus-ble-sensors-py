@@ -25,6 +25,53 @@ converging on the same UUIDs and the same command bytes:
 Vendor Bluetooth manual (end-user only, no protocol):
 <https://www.micro-air.com/support-documents/installation_resources/EasyStart_Bluetooth_Manual.pdf>
 
+A fresh sweep (August 2026) found no protocol material beyond the above. The
+Home Assistant community thread on the Flex integration and RV Whisper's
+EasyStart page both point back to these same sources without adding protocol
+detail. Derek Seaman's repository has continued to receive commits (latest
+July 2026, a daily-runtime sensor) but none change the protocol.
+
+## Where the UUIDs come from
+
+The `d973f2e0/e1/e2-b19e-11e2-9e96-0800200c9a66` service family is the stock
+example service from STMicroelectronics' BLE firmware templates. A GitHub code
+search for the write-characteristic UUID returns ~30 repositories, and apart
+from the EasyStart integrations every one is an ST template or sample
+(`Middlewares/ST/STM32_WPAN/ble/svc/Src/template_stm.c` in STM32WB projects,
+`sample_service.c` in BlueNRG projects). Micro-Air built the EasyStart's BLE
+firmware from ST's example and kept the sample UUIDs.
+
+This independently confirms the discovery rule: the service UUID identifies
+the firmware template, not the product, so discovery must key on the
+`EasyStart_` name — never the UUID, and never the (rotating) address.
+
+## A source that looks like a reference but is not
+
+- <https://github.com/cbird527/ha-easystart-flex> — a HACS-style Home
+  Assistant integration for the Flex (Python/bleak, pushed July 2025). **Do
+  not use it as a reference.** Its `const.py` defines only a generic
+  `0000fff0` service UUID and a comment "Add more UUIDs from the project",
+  while `__init__.py` imports six characteristic UUID names that are never
+  defined — the component cannot even be imported, so it has never run. The
+  protocol it sketches (per-value GATT characteristics read directly, a
+  single `0x01` write command, status codes 16/17/18) contradicts every
+  verified source and matches no observed behaviour. It reads as generated
+  speculation, and it also caches the MAC as identity, which the rotating
+  address breaks. Recorded here so a later search does not rediscover it and
+  take it at face value.
+
+## Adjacent, not related: EasyTouch RV thermostat
+
+<https://github.com/k3vmcd/ha-micro-air-easytouch> integrates Micro-Air's
+EasyTouch RV thermostat over BLE (Python/bleak). It is **not** the EasyStart
+protocol: a different service (`000000FF-…`), a password characteristic
+(`0000DD01-…`), JSON command/return characteristics (`0000EE01-…`/
+`0000FF01-…`), properly quoted JSON, and account-password authentication.
+Useful only as contrast — Micro-Air's newer firmware generation uses real
+JSON with auth, while the EasyStart remains the legacy ST-template design
+with unauthenticated pseudo-JSON. Nothing about EasyTouch transfers to
+EasyStart.
+
 ## GATT
 
     Service          d973f2e0-b19e-11e2-9e96-0800200c9a66
