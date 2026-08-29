@@ -44,8 +44,11 @@ CMD_READ_EEP = b'{"Cmd": ReadEEP}'
 # observed form: {"Sts": Success}).
 _TERMINATOR_SUCCESS = b'Success'
 
-# Live block is 20 bytes; the configuration block reassembles to ~1100.
-LIVE_BLOCK_MIN_LEN = 20
+# The documented live block is 20 bytes, but every identified field ends
+# at offset 17 (bytes 18-19 are unidentified), and the community
+# implementations accept any frame of at least 18 — so 18 is the real
+# floor a firmware may send.
+LIVE_BLOCK_MIN_LEN = 18
 # Settings live at offsets 906-908; anything shorter is a truncated read
 # and indexing it yields garbage that looks plausible.
 CONFIG_BLOCK_MIN_LEN = 909
@@ -89,13 +92,16 @@ FMASK_BITS = {
 def is_terminator(payload: bytes) -> bool:
     """Whether a notification payload is the transfer terminator.
 
-    Per the protocol: data chunks are binary, the terminator is a
-    non-empty ASCII text string.  Decodable-and-printable is the
-    discriminator; the live block's binary content (counts, currents)
-    routinely contains bytes that are valid ASCII, so printability of
-    the WHOLE payload is what separates the two.
+    Per the protocol the terminator is an ASCII status line of the form
+    ``{"Sts": ...}``.  Printability alone is NOT a safe discriminator:
+    the configuration block embeds printable factory data (model
+    strings), so a fully-ASCII data chunk occurs mid-stream — observed
+    on hardware, where an 1100-byte EEP transfer died at 88 bytes when
+    a printable chunk was misread as a failed terminator.  Require the
+    status-line shape; an unknown terminator form then surfaces as a
+    logged read timeout rather than silent data corruption.
     """
-    if not payload:
+    if not payload.startswith(b'{"'):
         return False
     try:
         text = payload.decode('ascii')

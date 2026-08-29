@@ -95,11 +95,15 @@ notification chunks, which the client must concatenate in arrival order into a
 reassembly buffer, followed by a terminating **ASCII text** notification that
 marks the end of the transfer.
 
-Distinguish the two by content: if the payload decodes as a non-empty text
-string, it is a terminator; otherwise it is a data chunk. A successful terminator
-contains the substring `Success` (the full form observed is `{"Sts": Success}`).
-Any other terminator, or a timeout, means the transfer failed and the partial
-buffer must be discarded.
+Distinguish the two by **shape, not printability**: a terminator is an ASCII
+status line beginning `{"` (the full form observed is `{"Sts": Success}`); a
+successful one contains the substring `Success`. Any other terminator, or a
+timeout, means the transfer failed and the partial buffer must be discarded.
+
+Printability alone is not a safe discriminator — **confirmed on hardware**:
+the configuration block embeds fully-printable data chunks, and a reader that
+classified "decodes as text" as a terminator died 88 bytes into every 1100-byte
+configuration transfer.
 
 Reset the reassembly buffer and its length to zero **before** writing the
 command, not after receiving the reply.
@@ -114,7 +118,11 @@ silently truncate if chunks are not accumulated.
 
 ## Live block (confirmed)
 
-20 bytes, little-endian. Offsets are into the reassembled buffer.
+20 bytes nominal, little-endian; offsets are into the reassembled buffer.
+**Accept 18 bytes as the floor** — every identified field ends at offset 17,
+and units in the field answer with frames a single-notification reader sees
+as 18 bytes (the community implementations all validate `>= 18`; a reader
+requiring 20 rejected every live frame on hardware).
 
 | Offset | Type | Field | Scaling |
 |---|---|---|---|
@@ -158,7 +166,9 @@ offsets are identified:
 | 908 | u8 | SCPT delay setting |
 
 Firmware version is a single byte, not a dotted string; values in the 26–29
-range are current. Feature availability varies by version and by model — at
+range were reported current by the community sources, but a live unit in the
+field reports 10, so treat the range as descriptive rather than a validity
+check. Feature availability varies by version and by model — at
 least one model identifier (`399BT`) behaves differently at the same firmware
 version, so version alone is not a sufficient capability test.
 
@@ -231,7 +241,10 @@ These dominate the design of any always-on integration:
 
 - **The unit accepts a connection only while the A/C is running.** There is no
   idle telemetry. Absence of a link is the normal off-state, not an error, and
-  must not be logged or retried as a fault.
+  must not be logged or retried as a fault. **It does advertise while idle**
+  (confirmed on hardware) — the connect is refused instantly — so presence of
+  the advertisement is not evidence the unit is reachable, and connect
+  attempts against an idle unit need a backoff.
 - **One connection at a time.** Holding a persistent link locks every other
   client out for as long as the compressor runs. This is a product decision, not
   a technical one — an integration should be able to release the link on

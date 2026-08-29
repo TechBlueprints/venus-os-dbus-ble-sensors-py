@@ -860,14 +860,16 @@ class DbusBleSensors(object):
         """GLib idle callback for name-identified advertisements."""
         try:
             self._process_name_advertisement(adv.mac, adv.local_name,
-                                             adv.rssi)
+                                             adv.rssi, adv.address_type,
+                                             adv.adapter_index)
         except Exception:
             logging.exception(
                 f"Error processing name advertisement from {adv.mac}")
         return False
 
     def _process_name_advertisement(self, tap_mac: str, adv_name: str,
-                                    rssi: int):
+                                    rssi: int, address_type: int = 1,
+                                    adapter_index: int = 0):
         """Route a name-identified advertisement (GLib main thread).
 
         These devices (Micro-Air EasyStart) rotate their advertised MAC,
@@ -932,7 +934,9 @@ class DbusBleSensors(object):
                 f"scanning ON to keep it.")
 
         try:
-            dev_instance.handle_name_advertisement(mac, adv_name, rssi)
+            dev_instance.handle_name_advertisement(mac, adv_name, rssi,
+                                                   address_type,
+                                                   adapter_index)
         except Exception:
             logging.exception(f"{identity}: error handling advertisement")
 

@@ -81,6 +81,18 @@ def test_ascii_looking_binary_with_control_bytes_is_data():
     assert not proto.is_terminator(b'Success\x00')
 
 
+def test_fully_printable_data_chunk_is_not_terminator():
+    # The config block embeds printable factory data (model strings);
+    # a fully-ASCII chunk mid-stream must remain data.  Observed on
+    # hardware: an EEP transfer died at 88 bytes when such a chunk was
+    # misread as a terminator.
+    assert not proto.is_terminator(b'399BT FLEX rev C 2024 assembly')
+    r = proto.Reassembler()
+    assert r.feed(b'399BT FLEX rev C 2024 assembly') is None
+    assert r.feed(b'{"Sts": Success}') is True
+    assert r.buffer == b'399BT FLEX rev C 2024 assembly'
+
+
 # ── Reassembly ─────────────────────────────────────────────────────────
 
 def test_reassembles_chunks_in_order_until_success():
@@ -168,8 +180,15 @@ def test_live_decode_unknown_state_surfaced_not_clamped():
 
 
 def test_live_decode_short_buffer_rejected():
-    assert proto.decode_live(make_live()[:19]) is None
+    # 18 is the floor (fields end at offset 17; community accepts >= 18).
+    assert proto.decode_live(make_live()[:17]) is None
     assert proto.decode_live(b'') is None
+
+
+def test_live_decode_18_byte_frame_accepted():
+    live = proto.decode_live(make_live()[:18])
+    assert live is not None
+    assert live['total_starts'] == 1234
 
 
 def test_live_decode_large_start_count():

@@ -63,10 +63,13 @@ READ_TIMEOUT_S = 15.0
 MAX_POLL_FAILURES = 3
 
 # Wait between sessions.  A session usually ends because the A/C shut
-# off; the next advertisement is what says it is back, but if the unit
-# keeps advertising while refusing connections this stops us hammering
-# it — and monopolising the radio — with back-to-back attempts.
+# off; the next advertisement is what says it is back, but the unit
+# also advertises while refusing connections (observed on prod: the
+# idle unit adopts fine, then fails the connect instantly), so failures
+# back off exponentially up to the cap — otherwise an idle A/C draws a
+# connect attempt every 30 s all night.
 SESSION_COOLDOWN_S = 30.0
+SESSION_COOLDOWN_MAX_S = 600.0
 
 # Overall bound on one session-establishment attempt (resolve, which may
 # include a bounded discovery, plus connect with retries).
@@ -95,10 +98,13 @@ class BleDeviceEasyStart(BleDevice):
         super().__init__(identity)
         self._adv_name: str = ''
         self._current_mac: 'str | None' = None
+        self._address_type: int = 1
+        self._adapter_index: int = 0
         self._session_active = False
         self._stop_session = False
         self._deleted = False
         self._cooldown_until = 0.0
+        self._failure_streak = 0
         self._config_published = False
         self._reachable: 'bool | None' = None
 
@@ -138,14 +144,23 @@ class BleDeviceEasyStart(BleDevice):
     # Advertisement handling (GLib thread)
     # ------------------------------------------------------------------
 
-    def handle_name_advertisement(self, mac: str, adv_name: str, rssi: int):
+    def handle_name_advertisement(self, mac: str, adv_name: str, rssi: int,
+                                  address_type: int = 1,
+                                  adapter_index: int = 0):
         """Called on the GLib thread for each (rate-limited) name match.
 
         *mac* is colon-separated uppercase — the address to connect to
         right now, valid only until the device rotates it.
+        *address_type* and *adapter_index* come from the same HCI report:
+        the connection is opened by handing BlueZ exactly these, on the
+        adapter that provably hears the device (its range is 1-2 m, so
+        the card that heard the advertisement is the card that can reach
+        it), with no discovery scan involved.
         """
         self._adv_name = adv_name
         self._current_mac = mac
+        self._address_type = address_type
+        self._adapter_index = adapter_index
 
         if not DbusBleService.get().is_device_enabled(self.info):
             logging.debug(f"{self._plog} seen but not enabled, skipping")
@@ -185,7 +200,15 @@ class BleDeviceEasyStart(BleDevice):
     def _on_session_done(self, result, error):
         """Session ended (GLib thread) — normal for the A/C shutting off."""
         self._session_active = False
-        self._cooldown_until = time.monotonic() + SESSION_COOLDOWN_S
+        if error is None:
+            self._failure_streak = 0
+            cooldown = SESSION_COOLDOWN_S
+        else:
+            self._failure_streak += 1
+            cooldown = min(
+                SESSION_COOLDOWN_S * (2 ** min(self._failure_streak - 1, 5)),
+                SESSION_COOLDOWN_MAX_S)
+        self._cooldown_until = time.monotonic() + cooldown
         if error is None:
             logging.info(f"{self._plog} session ended")
         elif ble_gatt_link.unreachable(error):
@@ -202,9 +225,53 @@ class BleDeviceEasyStart(BleDevice):
     # GATT session (BLE loop thread — no dbus from here)
     # ------------------------------------------------------------------
 
+    async def _resolve_without_scanning(self, address: str):
+        """Build a connectable ``BLEDevice`` with zero discovery.
+
+        The stock fallback (``ble_gatt_link.resolve`` →
+        ``find_device_by_address``) needs an active scan, and this very
+        process holds the scan claim on every adapter for its passive
+        tap — the wrapped scanner queues behind our own claim and times
+        out (observed on prod: ScanSlotWaitTimeout after 30 s, every
+        session).  We do not need a scan: the advertisement that
+        triggered this session carried the address, its type, and the
+        adapter that heard it.  ``Adapter1.ConnectDevice`` (experimental
+        BlueZ API; bluetoothd runs with -E on this platform, the service
+        run script enforces it) creates the ``Device1`` object from
+        exactly those and opens the link on that adapter.
+        """
+        from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+        from dbus_fast import Message, Variant
+        from dbus_fast.constants import MessageType
+
+        manager = await get_global_bluez_manager()
+        bus = manager._bus
+        adapter_path = f"/org/bluez/hci{self._adapter_index}"
+        dev_path = f"{adapter_path}/dev_{address.upper().replace(':', '_')}"
+        type_str = 'public' if self._address_type == 0 else 'random'
+
+        reply = await bus.call(Message(
+            destination='org.bluez', path=adapter_path,
+            interface='org.bluez.Adapter1', member='ConnectDevice',
+            signature='a{sv}',
+            body=[{'Address': Variant('s', address),
+                   'AddressType': Variant('s', type_str)}]))
+        if reply.message_type == MessageType.ERROR:
+            # AlreadyExists: the object survived a previous session on
+            # this adapter — connect to it below like any known device.
+            if reply.error_name != 'org.bluez.Error.AlreadyExists':
+                raise ble_gatt_link.DeviceNotFound(
+                    f"{address}: ConnectDevice on hci{self._adapter_index} "
+                    f"failed: {reply.error_name} {reply.body!r}")
+        elif reply.body:
+            dev_path = str(reply.body[0])
+
+        return ble_gatt_link.make_ble_device(
+            address, dev_path, {'Alias': self._adv_name or address})
+
     async def _run_session(self, address: str):
         device = await asyncio.wait_for(
-            ble_gatt_link.resolve(address),
+            self._resolve_without_scanning(address),
             timeout=CONNECT_OVERALL_TIMEOUT_S)
         client = await ble_gatt_link.connect(device, self._adv_name or address)
         try:
@@ -233,8 +300,14 @@ class BleDeviceEasyStart(BleDevice):
                 try:
                     await asyncio.wait_for(done.wait(), timeout=READ_TIMEOUT_S)
                 except asyncio.TimeoutError:
+                    logger.info("%s: read %r timed out after %.0fs "
+                                "(%d bytes buffered)", self._adv_name,
+                                command, READ_TIMEOUT_S, reassembler.length)
                     return None
                 if outcome[0] is not True:
+                    logger.info("%s: read %r transfer failed "
+                                "(%d bytes buffered)", self._adv_name,
+                                command, reassembler.length)
                     return None
                 return reassembler.buffer
 
@@ -255,6 +328,10 @@ class BleDeviceEasyStart(BleDevice):
                 raw = await read_block(proto.CMD_READ_LIVE)
                 live = proto.decode_live(raw) if raw is not None else None
                 if live is None:
+                    if raw is not None:
+                        logger.info("%s: live block undecodable: %d bytes, "
+                                    "%s", self._adv_name, len(raw),
+                                    raw[:24].hex())
                     failures += 1
                     if failures >= MAX_POLL_FAILURES:
                         logger.info("%s: %d consecutive failed polls — "
