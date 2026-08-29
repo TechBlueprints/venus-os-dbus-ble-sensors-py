@@ -369,12 +369,30 @@ class BleDeviceEasyStart(BleDevice):
                     failures = 0
                     GLib.idle_add(self._publish_live_glib, live)
                 await asyncio.sleep(proto.POLL_INTERVAL_S)
-        except BaseException as exc:
+        except Exception as exc:
             # Classified here, not in _on_session_done, because the
             # discriminator is the client's own GATT database and the
             # callback never sees the client.
-            self._dropped_before_discovery = (
-                ble_gatt_link.dropped_before_discovery(exc, client))
+            #
+            # This handler sits on the path of EVERY session, while the
+            # condition it detects is rare (1 in 41 on prod).  So it must
+            # not be able to make things worse than the error it is
+            # describing: if the classifier throws, that exception would
+            # replace the real one and every session would fail in a new
+            # way.  Swallow it and stay loud instead — the caller's
+            # WARNING is the correct fallback when we cannot tell.
+            #
+            # Exception, not BaseException: a cancelled session is a
+            # shutdown, not a diagnosis, and has no business running
+            # classification on its way out.
+            try:
+                self._dropped_before_discovery = (
+                    ble_gatt_link.dropped_before_discovery(exc, client))
+            except Exception:
+                logging.exception(
+                    f"{self._plog} could not classify session error; "
+                    f"reporting it unclassified")
+                self._dropped_before_discovery = False
             raise
         finally:
             await ble_gatt_link.disconnect(client)

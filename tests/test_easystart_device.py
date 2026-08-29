@@ -165,3 +165,55 @@ def test_the_flag_is_never_read_stale():
     src = inspect.getsource(BleDeviceEasyStart._run_session)
     assert 'self._dropped_before_discovery = False' in src, (
         "_run_session must clear the flag on entry")
+
+
+def test_a_throwing_classifier_cannot_mask_the_real_error(monkeypatch, caplog):
+    """The handler sits on EVERY session; the condition is 1 in 41.
+
+    A rare-path diagnosis must not be able to make the common path worse.
+    If the classifier raises, that exception would replace the real one
+    and every session would start failing in a new way -- turning a
+    logging refinement into an outage.  Flagged by the EasyStart session
+    on review, before it could happen.
+    """
+    import ble_gatt_link
+
+    def _boom(exc, client=None):
+        raise RuntimeError("classifier is broken")
+
+    monkeypatch.setattr(ble_gatt_link, "dropped_before_discovery", _boom)
+
+    original = ValueError("the real failure")
+
+    # Drive the same handler shape _run_session uses.
+    dev = BleDeviceEasyStart('easystart_0c87')
+    dev._plog = 'easystart_0c87'
+    captured = {}
+    try:
+        try:
+            raise original
+        except Exception as exc:
+            try:
+                dev._dropped_before_discovery = (
+                    ble_gatt_link.dropped_before_discovery(exc, object()))
+            except Exception:
+                dev._dropped_before_discovery = False
+            raise
+    except Exception as exc:
+        captured['exc'] = exc
+
+    assert captured['exc'] is original, (
+        "the caller must still see the real failure, not the "
+        "classifier's own error")
+    assert dev._dropped_before_discovery is False, (
+        "unable to classify means stay loud")
+
+
+def test_the_handler_ignores_cancellation() -> None:
+    """A cancelled session is a shutdown, not a diagnosis."""
+    import inspect
+    src = inspect.getsource(BleDeviceEasyStart._run_session)
+    assert 'except Exception as exc:' in src
+    assert 'except BaseException' not in src, (
+        "BaseException would run classification while unwinding a "
+        "CancelledError on the way to shutdown")

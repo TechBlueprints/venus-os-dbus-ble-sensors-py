@@ -183,6 +183,19 @@ def dropped_before_discovery(exc: BaseException, client=None) -> bool:
 
     Without *client* there is nothing to inspect, so the answer is False
     and the caller keeps its warning: staying loud is the safe default.
+
+    One caveat if you reuse this from another driver.  The empty-database
+    test is only a per-session signal for a client that does NOT cache
+    its GATT database — which is what :func:`connect` gives you, since it
+    passes plain ``bleak.BleakClient`` and the catcher routes that to a
+    non-caching connection.  A caller passing
+    ``BleakClientWithServiceCache`` (bcmv2 rebinds it to
+    ``BLEConnectionWithServiceCache``, and bleak-retry-connector treats
+    that as the usual form) can carry a database cached from an EARLIER
+    connection while *this* link died before discovery — so the services
+    look resolved and this returns False.  That errs toward keeping the
+    warning, which is the safe direction, but it means a caching client
+    gets no benefit from this check rather than a wrong answer from it.
     """
     chain = (exc, exc.__cause__, exc.__context__)
     names = {type(link).__name__ for link in chain if link is not None}
