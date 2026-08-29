@@ -241,6 +241,18 @@ class DbusBleService(object):
                     break
         return macs
 
+    def configured_dev_ids(self) -> set:
+        """Full dev_ids that already have settings.
+
+        The name-identified devices (EasyStart) have no MAC in their
+        dev_id, so :meth:`configured_macs`'s 12-hex extraction can never
+        see them; their discovery gate checks membership here instead.
+        """
+        ids = set()
+        for key in self._dbus_settings.list_device_settings():
+            ids.add(str(key).split("/", 1)[0])
+        return ids
+
     def is_device_role_enabled(self, device_info: dict, role_name: str) -> bool:
         """
         Check if the given role is enabled through settings

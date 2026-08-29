@@ -42,6 +42,11 @@ from scan_claims import ScanClaims
 
 ADV_LOG_QUIET_PERIOD = 1800
 SILENCE_WARNING_SECONDS = 300
+
+# Name-identified devices (EasyStart): their advertisement is a presence
+# signal, not a data payload, so forwarding every one to the GLib thread
+# buys nothing.  One per MAC per this interval is plenty.
+NAME_ADV_MIN_INTERVAL = 5.0
 # Byte-level identical-advertisement re-forward interval comes from the
 # SensorRoundingPolicy setting at /Settings/SensorRounding/HeartbeatSeconds
 # so this and the publish-level dedup in SensorPublisher share one knob.
@@ -201,6 +206,22 @@ class DbusBleSensors(object):
 
         self._internal_mfg_ids: frozenset[int] = frozenset(BleDevice.DEVICE_CLASSES.keys())
         self._known_mfg_ids: set[int] = set(self._internal_mfg_ids)
+
+        # Name-identified devices (no manufacturer data; e.g. EasyStart).
+        # The tap decodes and forwards local names only for these
+        # prefixes; everything else's name is never even parsed.
+        self._name_prefixes: tuple = tuple(BleDevice.NAME_CLASSES.keys())
+        self._last_name_adv: dict[str, float] = {}
+        self._acceptlist_name_warned: set = set()
+        # Full dev_ids with stored settings — the discovery gate for
+        # name-identified devices, whose dev_id contains no MAC for
+        # _configured_macs to find.
+        self._configured_dev_ids: set = set()
+        try:
+            self._configured_dev_ids = \
+                self._dbus_ble_service.configured_dev_ids()
+        except Exception:
+            logging.exception("could not load configured dev_ids")
         self._last_mfg_data: dict[str, tuple[bytes, float]] = {}
         self._tap_seen_macs: dict[str, float] = {}
         self._tap_ignored_macs: set[str] = set()
@@ -835,6 +856,86 @@ class DbusBleSensors(object):
             logging.exception(f"Error processing tap advertisement from {adv.mac}")
         return False
 
+    def _glib_process_name_tap(self, adv: TappedAdvertisement):
+        """GLib idle callback for name-identified advertisements."""
+        try:
+            self._process_name_advertisement(adv.mac, adv.local_name,
+                                             adv.rssi)
+        except Exception:
+            logging.exception(
+                f"Error processing name advertisement from {adv.mac}")
+        return False
+
+    def _process_name_advertisement(self, tap_mac: str, adv_name: str,
+                                    rssi: int):
+        """Route a name-identified advertisement (GLib main thread).
+
+        These devices (Micro-Air EasyStart) rotate their advertised MAC,
+        so the device store is keyed by an identity derived from the
+        advertised *name*; the MAC heard right now is handed to the
+        driver purely as the address for its next connection.  Nothing
+        here touches the accept-list MAC cache — persisting a rotating
+        MAC would fill it with dead entries.
+        """
+        device_class = None
+        for prefix, cls in BleDevice.NAME_CLASSES.items():
+            if adv_name.startswith(prefix):
+                device_class = cls
+                break
+        if device_class is None:
+            return
+
+        identity = device_class.identity_from_name(adv_name)
+        mac = ':'.join(tap_mac[i:i + 2] for i in range(0, 12, 2)).upper()
+
+        dev_instance = self._known_mac.get(identity)
+        if dev_instance is None:
+            # Same discovery gate as the manufacturer path: with
+            # Continuous scanning OFF we adopt nothing new.  Configured
+            # name devices have a stored dev_id ending in the identity.
+            configured = any(dev_id == identity or
+                             dev_id.endswith('_' + identity)
+                             for dev_id in self._configured_dev_ids)
+            if (not configured
+                    and not self._dbus_ble_service.get_continuous_scan()):
+                if identity not in self._refusal_logged:
+                    self._refusal_logged.add(identity)
+                    logging.info(
+                        f"{identity}: not adopting — discovery is off "
+                        f"and this device has no stored settings")
+                return
+
+            logging.info(f"{identity}: initializing name-identified device "
+                         f"with class {device_class} (currently at {mac})")
+            try:
+                dev_instance = device_class(identity)
+                dev_instance.configure(b'')
+                dev_instance.init()
+            except Exception:
+                logging.exception(
+                    f"{identity}: unexpected error during device "
+                    f"initialization")
+                return
+            self._known_mac[identity] = dev_instance
+
+        # A rotating-MAC device cannot live in a controller accept
+        # list: the next rotation happens while the unit is off, so the
+        # new MAC is never heard and the device silently disappears.
+        if (self._desired_filter_policy()
+                == hci_scan_control.FILTER_POLICY_ACCEPT_LIST_ONLY
+                and identity not in self._acceptlist_name_warned):
+            self._acceptlist_name_warned.add(identity)
+            logging.warning(
+                f"{identity}: this device rotates its MAC and Continuous "
+                f"scanning is OFF (accept-list mode) — it will stop being "
+                f"heard after its next address rotation.  Turn Continuous "
+                f"scanning ON to keep it.")
+
+        try:
+            dev_instance.handle_name_advertisement(mac, adv_name, rssi)
+        except Exception:
+            logging.exception(f"{identity}: error handling advertisement")
+
     def _start_tap(self):
         """Start the HCI monitor tap in a background thread.
 
@@ -853,13 +954,20 @@ class DbusBleSensors(object):
         tap_seen = self._tap_seen_macs
 
         def _on_advertisement(adv: TappedAdvertisement):
-            if not adv.manufacturer_data:
+            if not adv.manufacturer_data and not adv.local_name:
                 return
             now = time.monotonic()
             self._last_tap_rx = now
             self._silence_warned = False
             mac = adv.mac
             tap_seen[mac] = now
+            if adv.local_name is not None:
+                # Presence signal for a name-identified device — no
+                # payload to dedup, so rate-limit per MAC instead.
+                if now - self._last_name_adv.get(mac, 0.0) \
+                        >= NAME_ADV_MIN_INTERVAL:
+                    self._last_name_adv[mac] = now
+                    GLib.idle_add(self._glib_process_name_tap, adv)
             for mfg_id in adv.manufacturer_data:
                 raw = adv.manufacturer_data[mfg_id]
                 prev = last_mfg_data.get(mac)
@@ -876,7 +984,8 @@ class DbusBleSensors(object):
             try:
                 run_tap_loop(tap_sock, _on_advertisement, self._tap_stop,
                              mfg_filter=known_mfg_ids,
-                             ignored_macs=self._tap_ignored_macs)
+                             ignored_macs=self._tap_ignored_macs,
+                             name_prefixes=self._name_prefixes or None)
             except Exception:
                 logging.exception("HCI monitor tap thread died")
 
@@ -1035,6 +1144,16 @@ class DbusBleSensors(object):
             if mac in self._known_mac:
                 _ = self._known_mac[mac]  # __getitem__ refreshes TTL
 
+        # A device holding a live GATT session (EasyStart) stops
+        # advertising while connected, so the tap-driven refresh above
+        # never fires for it.  Peek without refreshing, then touch only
+        # the busy ones — a blanket items() walk would refresh every TTL
+        # and break expiry entirely.
+        for key, (value, _ts) in list(self._known_mac._store.items()):
+            busy = getattr(value, 'is_busy', None)
+            if busy is not None and busy():
+                _ = self._known_mac[key]
+
         self._known_mac.prune()
         self._ignored_mac.prune()
 
@@ -1057,6 +1176,13 @@ class DbusBleSensors(object):
         for mac in stale_macs:
             self._last_adv_seen.pop(mac, None)
             self._last_mfg_data.pop(mac, None)
+
+        stale_names = [
+            mac for mac, ts in self._last_name_adv.items()
+            if now - ts > DEVICE_SERVICES_TIMEOUT
+        ]
+        for mac in stale_names:
+            self._last_name_adv.pop(mac, None)
 
         # Tap thread watchdog: restart if it died.  Skip while the
         # load throttle has us paused — the throttle deliberately

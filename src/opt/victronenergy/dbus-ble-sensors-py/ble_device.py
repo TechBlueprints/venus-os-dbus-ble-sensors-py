@@ -23,8 +23,17 @@ class BleDevice(object):
     MANUFACTURER_ID = None  # To be overloaded in children classes: int, ble manufacturer id
     CUSTOM_PARSING = False  # Set True in subclasses that override handle_manufacturer_data() and don't use regs
 
+    # Alternative to MANUFACTURER_ID for devices that advertise no
+    # manufacturer data and are identified by their advertised local name
+    # (e.g. the Micro-Air EasyStart).  Tuple of name prefixes; a class
+    # setting this is registered in NAME_CLASSES instead of DEVICE_CLASSES.
+    ADV_NAME_PREFIXES: tuple = ()
+
     # Dict of devices classes, key is manufacturer id
     DEVICE_CLASSES = {}
+
+    # Dict of name-identified device classes, key is advertised-name prefix
+    NAME_CLASSES = {}
 
     def __init__(self, dev_mac: str):
         self._role_services: dict = {}
@@ -106,6 +115,17 @@ class BleDevice(object):
                 # Check and import
                 for name, obj in inspect.getmembers(module, inspect.isclass):
                     if obj.__module__ == module.__name__ and issubclass(obj, BleDevice) and obj is not BleDevice:
+                        prefixes = getattr(obj, 'ADV_NAME_PREFIXES', ())
+                        if prefixes:
+                            # Name-identified device — no manufacturer id.
+                            for prefix in prefixes:
+                                if prefix in BleDevice.NAME_CLASSES:
+                                    prev = BleDevice.NAME_CLASSES[prefix].__name__
+                                    logging.error(
+                                        f"Name prefix {prefix!r} in {module_name!r}@{file_path!r} is already registered in {prev!r}, ignoring it")
+                                    continue
+                                BleDevice.NAME_CLASSES[prefix] = obj
+                            break
                         man_id = getattr(obj, 'MANUFACTURER_ID', None)
                         if not isinstance(man_id, int):
                             logging.error(
@@ -119,6 +139,7 @@ class BleDevice(object):
                         BleDevice.DEVICE_CLASSES[man_id] = obj
                         break
         logging.info(f"Device classes: {BleDevice.DEVICE_CLASSES!r}")
+        logging.info(f"Name-identified device classes: {BleDevice.NAME_CLASSES!r}")
 
     def _load_configuration(self):
         self.info['manufacturer_id'] = self.MANUFACTURER_ID

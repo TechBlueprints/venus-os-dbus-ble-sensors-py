@@ -47,6 +47,8 @@ _SUB_EXT_ADV_REPORT = 0x0D
 
 # ── AD type codes (Bluetooth Core Spec Supplement, Part A, §1) ────────────
 _AD_TYPE_MANUFACTURER = 0xFF
+_AD_TYPE_NAME_SHORT = 0x08
+_AD_TYPE_NAME_COMPLETE = 0x09
 
 # ── Monitor frame header: opcode(u16le), adapter(u16le), payload_len(u16le)
 _FRAME_HDR = struct.Struct("<HHH")
@@ -77,6 +79,10 @@ class TappedAdvertisement:
     address_type: int
     rssi: int
     manufacturer_data: dict[int, bytes] = field(default_factory=dict)
+    # Advertised local name (AD 0x08/0x09), only populated when it matches
+    # a registered name prefix — devices like the Micro-Air EasyStart carry
+    # no manufacturer data and are identified by name alone.
+    local_name: 'str | None' = None
 
 
 def _format_mac(addr_bytes: bytes) -> str:
@@ -120,8 +126,10 @@ def create_tap_socket() -> socket.socket:
 
 
 def _walk_ad_structures(data: bytes,
-                        mfg_filter: frozenset[int] | set[int] | None = None) -> dict[int, bytes]:
-    """Parse AD structures and extract manufacturer-specific data entries.
+                        mfg_filter: frozenset[int] | set[int] | None = None,
+                        name_prefixes: 'tuple[str, ...] | None' = None,
+                        ) -> 'tuple[dict[int, bytes], str | None]':
+    """Parse AD structures: manufacturer-specific data, plus the local name.
 
     AD structure format (Bluetooth Core Spec Supplement, Part A):
         length (1 byte) — covers ad_type + ad_payload
@@ -133,8 +141,15 @@ def _walk_ad_structures(data: bytes,
         payload (remaining bytes)
 
     When *mfg_filter* is provided, only matching company IDs are included.
+
+    The local name (AD 0x08/0x09) is decoded only when *name_prefixes* is
+    given, and returned only when it starts with one of the prefixes —
+    the name is a routing key for name-identified devices, not a general
+    metadata field, and decoding every neighbour's name would be pure
+    per-advertisement overhead.
     """
     result: dict[int, bytes] = {}
+    name: 'str | None' = None
     pos = 0
     end = len(data)
     while pos < end:
@@ -147,13 +162,23 @@ def _walk_ad_structures(data: bytes,
             company = data[pos + 1] | (data[pos + 2] << 8)
             if mfg_filter is None or company in mfg_filter:
                 result[company] = bytes(data[pos + 3 : pos + ad_len])
+        elif (name_prefixes and ad_len >= 2
+                and ad_type in (_AD_TYPE_NAME_SHORT, _AD_TYPE_NAME_COMPLETE)):
+            try:
+                decoded = bytes(data[pos + 1 : pos + ad_len]).decode('utf-8')
+            except UnicodeDecodeError:
+                decoded = None
+            if decoded and decoded.startswith(name_prefixes):
+                name = decoded
         pos += ad_len
-    return result
+    return result, name
 
 
 def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
                           mfg_filter: frozenset[int] | set[int] | None = None,
-                          ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
+                          ignored_macs: set[str] | None = None,
+                          name_prefixes: 'tuple[str, ...] | None' = None,
+                          ) -> list[TappedAdvertisement]:
     """Parse LE Advertising Report (subevent 0x02).
 
     Per-report layout (Bluetooth Core Spec Vol 4, Part E, §7.7.65.2):
@@ -191,21 +216,24 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
         if ignored_macs is not None and mac in ignored_macs:
             continue
 
-        mfg = _walk_ad_structures(ad_data, mfg_filter)
-        if mfg:
+        mfg, name = _walk_ad_structures(ad_data, mfg_filter, name_prefixes)
+        if mfg or name:
             results.append(TappedAdvertisement(
                 adapter_index=adapter_idx,
                 mac=mac,
                 address_type=addr_type,
                 rssi=rssi,
                 manufacturer_data=mfg,
+                local_name=name,
             ))
     return results
 
 
 def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
                             mfg_filter: frozenset[int] | set[int] | None = None,
-                            ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
+                            ignored_macs: set[str] | None = None,
+                            name_prefixes: 'tuple[str, ...] | None' = None,
+                            ) -> list[TappedAdvertisement]:
     """Parse LE Extended Advertising Report (subevent 0x0D).
 
     Per-report layout (Bluetooth Core Spec Vol 4, Part E, §7.7.65.13):
@@ -259,21 +287,24 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
         if ignored_macs is not None and mac in ignored_macs:
             continue
 
-        mfg = _walk_ad_structures(ad_data, mfg_filter)
-        if mfg:
+        mfg, name = _walk_ad_structures(ad_data, mfg_filter, name_prefixes)
+        if mfg or name:
             results.append(TappedAdvertisement(
                 adapter_index=adapter_idx,
                 mac=mac,
                 address_type=addr_type,
                 rssi=rssi,
                 manufacturer_data=mfg,
+                local_name=name,
             ))
     return results
 
 
 def parse_monitor_frame(raw: bytes,
                         mfg_filter: frozenset[int] | set[int] | None = None,
-                        ignored_macs: set[str] | None = None) -> list[TappedAdvertisement]:
+                        ignored_macs: set[str] | None = None,
+                        name_prefixes: 'tuple[str, ...] | None' = None,
+                        ) -> list[TappedAdvertisement]:
     """Parse one monitor channel datagram into advertisement(s).
 
     Each datagram has a 6-byte header followed by the HCI payload.
@@ -302,16 +333,19 @@ def parse_monitor_frame(raw: bytes,
     payload = raw[_FRAME_HDR_SIZE:]
 
     if subevent == _SUB_ADV_REPORT:
-        return _parse_legacy_reports(payload, 3, adapter_idx, mfg_filter, ignored_macs)
+        return _parse_legacy_reports(payload, 3, adapter_idx, mfg_filter,
+                                     ignored_macs, name_prefixes)
     elif subevent == _SUB_EXT_ADV_REPORT:
-        return _parse_extended_reports(payload, 3, adapter_idx, mfg_filter, ignored_macs)
+        return _parse_extended_reports(payload, 3, adapter_idx, mfg_filter,
+                                       ignored_macs, name_prefixes)
 
     return []
 
 
 def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
                  mfg_filter: frozenset[int] | set[int] | None = None,
-                 ignored_macs: set[str] | None = None):
+                 ignored_macs: set[str] | None = None,
+                 name_prefixes: 'tuple[str, ...] | None' = None):
     """Read monitor frames and invoke callback for each parsed advertisement.
 
     Blocks until stop_event is set.  The callback receives a single
@@ -339,7 +373,8 @@ def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
             break
         if not raw:
             break
-        for adv in parse_monitor_frame(raw, mfg_filter, ignored_macs):
+        for adv in parse_monitor_frame(raw, mfg_filter, ignored_macs,
+                                       name_prefixes):
             try:
                 callback(adv)
             except Exception:

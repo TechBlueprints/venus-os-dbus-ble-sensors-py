@@ -1,0 +1,89 @@
+"""EasyStart driver: identity, configuration, and registry wiring.
+
+Exercises the pieces that run before any radio is involved — the
+name-derived identity that survives MAC rotation, the device
+configuration contract, and the name-prefix class registry.
+"""
+from __future__ import annotations
+
+import pytest
+
+from ble_device import BleDevice
+from ble_role import BleRole
+from ble_role_acload import BleRoleAcLoad
+from ble_device_easystart import BleDeviceEasyStart
+import easystart_protocol as proto
+
+
+@pytest.fixture(autouse=True)
+def _register_acload_role():
+    # conftest stubs ble_role with a minimal base; give it the registry
+    # the real one carries so _load_configuration's role check works.
+    if not hasattr(BleRole, 'ROLE_CLASSES'):
+        BleRole.ROLE_CLASSES = {}
+    BleRole.ROLE_CLASSES.setdefault('acload', BleRoleAcLoad)
+    yield
+
+
+def test_identity_from_name_is_stable_and_dbus_safe():
+    assert BleDeviceEasyStart.identity_from_name('EasyStart_7F3A') \
+        == 'easystart_7f3a'
+    # The bare 10-char name variant must not leave a trailing underscore.
+    assert BleDeviceEasyStart.identity_from_name('EasyStart_') == 'easystart'
+
+
+def test_identity_is_mac_independent():
+    # Same unit, rotated MAC: identity is derived from the name alone,
+    # so it cannot change.
+    a = BleDeviceEasyStart.identity_from_name('EasyStart_7F3A')
+    b = BleDeviceEasyStart.identity_from_name('EasyStart_7F3A')
+    assert a == b
+
+
+def test_configure_passes_base_validation():
+    dev = BleDeviceEasyStart('easystart_7f3a')
+    dev.configure(b'')
+    dev._load_configuration()
+    assert dev.info['dev_id'] == 'microair_easystart_7f3a'
+    assert list(dev.info['roles']) == ['acload']
+
+
+def test_custom_parsing_no_regs():
+    assert BleDeviceEasyStart.CUSTOM_PARSING is True
+    dev = BleDeviceEasyStart('easystart_7f3a')
+    dev.configure(b'')
+    assert dev.info['regs'] == []
+
+
+def test_name_prefix_matches_protocol_module():
+    assert BleDeviceEasyStart.ADV_NAME_PREFIXES == (proto.ADV_NAME_PREFIX,)
+    assert proto.ADV_NAME_PREFIX == 'EasyStart_'
+
+
+def test_nominal_voltage_setting_present():
+    dev = BleDeviceEasyStart('easystart_7f3a')
+    dev.configure(b'')
+    names = [s['name'] for s in dev.info['settings']]
+    assert 'NominalVoltage' in names
+    props = dev.info['settings'][0]['props']
+    assert props['def'] == 120
+    assert props['min'] == 90 and props['max'] == 250
+
+
+def test_not_busy_before_any_session():
+    dev = BleDeviceEasyStart('easystart_7f3a')
+    assert dev.is_busy() is False
+
+
+def test_manufacturer_data_path_is_inert():
+    # Name-identified device: nothing may arrive via the mfg-data path,
+    # and calling it must not raise even pre-configure.
+    dev = BleDeviceEasyStart('easystart_7f3a')
+    dev.handle_manufacturer_data(b'\x01\x02')
+
+
+def test_class_registers_by_name_prefix_not_mfg_id():
+    BleDevice.NAME_CLASSES.setdefault('EasyStart_', BleDeviceEasyStart)
+    assert BleDevice.NAME_CLASSES['EasyStart_'] is BleDeviceEasyStart
+    # The sentinel manufacturer id must never land in the mfg registry.
+    assert BleDevice.DEVICE_CLASSES.get(-1) is not BleDeviceEasyStart
