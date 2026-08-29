@@ -212,7 +212,7 @@ class DbusBleSensors(object):
         # prefixes; everything else's name is never even parsed.
         self._name_prefixes: tuple = tuple(BleDevice.NAME_CLASSES.keys())
         self._last_name_adv: dict[str, float] = {}
-        self._acceptlist_name_warned: set = set()
+        self._name_accept_all_logged: bool = False
         # Full dev_ids with stored settings — the discovery gate for
         # name-identified devices, whose dev_id contains no MAC for
         # _configured_macs to find.
@@ -527,8 +527,7 @@ class DbusBleSensors(object):
             # failure streak.  Steady-state re-applies stay quiet at
             # debug; otherwise this fires every ``_scan_reenable_tick``.
             if not was_enabled or prev_policy != policy:
-                policy_label = ("accept-all" if policy == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
-                                else "accept-list-only")
+                policy_label = self._policy_label(policy)
                 mode = ("active" if self._desired_scan_type()
                         == hci_scan_control.SCAN_TYPE_ACTIVE else "passive")
                 logging.info(f"{label}: {mode} scan enabled via HCI socket ({policy_label})")
@@ -608,6 +607,37 @@ class DbusBleSensors(object):
         offset, count = slices[key]
         return devices[offset:offset + count]
 
+    def _policy_label(self, policy: int) -> str:
+        """Human label for what a policy request actually puts on the radio.
+
+        An accept-list request lands as accept-all when a configured
+        name-identified device exists (see ``_apply_scan_policy``); the
+        label must describe the radio, not the request, or the log
+        claims a filter that is not in force.
+        """
+        if policy == hci_scan_control.FILTER_POLICY_ACCEPT_ALL:
+            return "accept-all"
+        if self._has_configured_name_devices():
+            return "accept-all (name-device override)"
+        return "accept-list-only"
+
+    def _has_configured_name_devices(self) -> bool:
+        """Whether any name-identified (rotating-MAC) device is configured.
+
+        Matches stored dev_ids against the DEV_ID_PREFIXES each
+        name-identified device class declares.  Devices adopted during
+        this run are included — their dev_id is added to
+        ``_configured_dev_ids`` at adoption.
+        """
+        prefixes = tuple(
+            prefix
+            for cls in BleDevice.NAME_CLASSES.values()
+            for prefix in getattr(cls, 'DEV_ID_PREFIXES', ()))
+        if not prefixes:
+            return False
+        return any(dev_id.startswith(prefixes)
+                   for dev_id in self._configured_dev_ids)
+
     def _apply_scan_policy(self, key: str, adapter_index: int,
                            policy: int) -> bool:
         """Apply a scan filter policy on the given adapter.
@@ -624,6 +654,27 @@ class DbusBleSensors(object):
         enough to populate the cache.
         """
         if policy == hci_scan_control.FILTER_POLICY_ACCEPT_LIST_ONLY:
+            # A configured name-identified device (EasyStart) rotates
+            # its MAC, so no accept list can ever contain it: the next
+            # rotation happens while the unit is unheard and the device
+            # silently disappears.  The radio therefore stays in
+            # accept-all whenever one is configured — ContinuousScan
+            # OFF still closes the ADOPTION gate (no new devices), it
+            # just cannot buy the controller-level MAC filter on a box
+            # that owns a rotating-MAC device.
+            if self._has_configured_name_devices():
+                if not self._name_accept_all_logged:
+                    self._name_accept_all_logged = True
+                    logging.info(
+                        "accept-list mode requested, but a configured "
+                        "name-identified device (rotating MAC) would be "
+                        "filtered out — scanning accept-all; discovery/"
+                        "adoption stays off per ContinuousScan")
+                return hci_scan_control.enable_scan(
+                    adapter_index,
+                    filter_policy=hci_scan_control.FILTER_POLICY_ACCEPT_ALL,
+                    scan_type=self._desired_scan_type(),
+                )
             devices = sorted(self._mac_address_types.items())
             if not devices:
                 logging.warning(
@@ -685,10 +736,9 @@ class DbusBleSensors(object):
                     self._scan_enabled_adapters.add(key)
                     self._scan_claims.hold(key, exclusive=True)
                     self._scan_filter_policy[key] = desired
-                    policy_label = ("accept-all" if desired == hci_scan_control.FILTER_POLICY_ACCEPT_ALL
-                                    else "accept-list-only")
                     logging.info(f"{adapter_identity.label(key, self._adapter_name(key))}: "
-                                 f"scan filter policy switched to {policy_label}")
+                                 f"scan filter policy switched to "
+                                 f"{self._policy_label(desired)}")
             else:
                 # Steady-state re-issue using the policy we already
                 # have.  For accept-list mode, also re-apply the list
@@ -919,19 +969,9 @@ class DbusBleSensors(object):
                     f"initialization")
                 return
             self._known_mac[identity] = dev_instance
-
-        # A rotating-MAC device cannot live in a controller accept
-        # list: the next rotation happens while the unit is off, so the
-        # new MAC is never heard and the device silently disappears.
-        if (self._desired_filter_policy()
-                == hci_scan_control.FILTER_POLICY_ACCEPT_LIST_ONLY
-                and identity not in self._acceptlist_name_warned):
-            self._acceptlist_name_warned.add(identity)
-            logging.warning(
-                f"{identity}: this device rotates its MAC and Continuous "
-                f"scanning is OFF (accept-list mode) — it will stop being "
-                f"heard after its next address rotation.  Turn Continuous "
-                f"scanning ON to keep it.")
+            # Its settings exist now, so scan-policy decisions made
+            # before the next restart must see it as configured.
+            self._configured_dev_ids.add(dev_instance.info['dev_id'])
 
         try:
             dev_instance.handle_name_advertisement(mac, adv_name, rssi,

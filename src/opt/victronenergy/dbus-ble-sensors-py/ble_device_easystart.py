@@ -84,6 +84,11 @@ class BleDeviceEasyStart(BleDevice):
     MANUFACTURER_ID = -1
     CUSTOM_PARSING = True
     ADV_NAME_PREFIXES = (proto.ADV_NAME_PREFIX,)
+    # dev_id prefix for stored settings (dev_prefix + '_' + identity
+    # prefix).  The scan-policy code uses this to recognise that a
+    # configured rotating-MAC device exists, which rules out controller
+    # accept-list filtering.
+    DEV_ID_PREFIXES = ('microair_easystart',)
 
     @staticmethod
     def identity_from_name(adv_name: str) -> str:
