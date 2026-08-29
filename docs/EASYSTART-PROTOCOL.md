@@ -246,10 +246,19 @@ These dominate the design of any always-on integration:
 
 - **The unit accepts a connection only while the A/C is running.** There is no
   idle telemetry. Absence of a link is the normal off-state, not an error, and
-  must not be logged or retried as a fault. **It does advertise while idle**
-  (confirmed on hardware) — the connect is refused instantly — so presence of
-  the advertisement is not evidence the unit is reachable, and connect
-  attempts against an idle unit need a backoff.
+  must not be logged or retried as a fault.
+- **A unit whose A/C is off does not advertise at all.** Confirmed on hardware:
+  with both A/Cs off (10 W total consumption) and the radios in accept-all for
+  100 s, neither unit was heard. The likely mechanism is simply that the
+  EasyStart sits in the compressor's supply and is unpowered when the A/C is —
+  inferred, not measured. Consequence: **silence is only evidence about the
+  integration if the A/C is provably running.** With the A/C off it says
+  nothing at all, and cannot distinguish a healthy stack from a broken one.
+- **It does advertise while powered but not compressing** (confirmed: heard,
+  adopted, then the connect refused instantly with the compressor stopped) —
+  so an advertisement is not evidence the unit is *connectable*, and connect
+  attempts in that state need a backoff. Note this is a narrower claim than
+  "advertises while idle": powered-but-not-compressing, not A/C-off.
 - **One connection at a time.** Holding a persistent link locks every other
   client out for as long as the compressor runs. This is a product decision, not
   a technical one — an integration should be able to release the link on
