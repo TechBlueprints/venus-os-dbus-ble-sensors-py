@@ -61,44 +61,44 @@ def _mac_bytes(mac_str: str) -> bytes:
 class TestWalkAdStructures(unittest.TestCase):
     def test_single_manufacturer_data(self):
         ad = _build_mfg_ad(0x0059, b'\x01\x02\x03')
-        result = _walk_ad_structures(ad)
+        result, _name = _walk_ad_structures(ad)
         self.assertIn(0x0059, result)
         self.assertEqual(result[0x0059], b'\x01\x02\x03')
 
     def test_multiple_ad_types(self):
         flags = bytes([2, 0x01, 0x06])
         mfg = _build_mfg_ad(0x004C, b'\xAA\xBB')
-        result = _walk_ad_structures(flags + mfg)
+        result, _name = _walk_ad_structures(flags + mfg)
         self.assertNotIn(0x01, result)
         self.assertIn(0x004C, result)
         self.assertEqual(result[0x004C], b'\xAA\xBB')
 
     def test_empty_data(self):
-        self.assertEqual(_walk_ad_structures(b''), {})
+        self.assertEqual(_walk_ad_structures(b'')[0], {})
 
     def test_truncated_ad_structure(self):
-        result = _walk_ad_structures(bytes([5, _AD_TYPE_MANUFACTURER]))
+        result, _name = _walk_ad_structures(bytes([5, _AD_TYPE_MANUFACTURER]))
         self.assertEqual(result, {})
 
     def test_zero_length_ad(self):
-        result = _walk_ad_structures(bytes([0]))
+        result, _name = _walk_ad_structures(bytes([0]))
         self.assertEqual(result, {})
 
     def test_manufacturer_data_too_short_for_company_id(self):
         data = bytes([2, _AD_TYPE_MANUFACTURER, 0x59])
-        result = _walk_ad_structures(data)
+        result, _name = _walk_ad_structures(data)
         self.assertEqual(result, {})
 
     def test_manufacturer_data_with_only_company_id(self):
         data = bytes([3, _AD_TYPE_MANUFACTURER, 0x59, 0x00])
-        result = _walk_ad_structures(data)
+        result, _name = _walk_ad_structures(data)
         self.assertIn(0x0059, result)
         self.assertEqual(result[0x0059], b'')
 
     def test_multiple_manufacturer_entries(self):
         mfg1 = _build_mfg_ad(0x0059, b'\x01')
         mfg2 = _build_mfg_ad(0x004C, b'\x02')
-        result = _walk_ad_structures(mfg1 + mfg2)
+        result, _name = _walk_ad_structures(mfg1 + mfg2)
         self.assertIn(0x0059, result)
         self.assertIn(0x004C, result)
 

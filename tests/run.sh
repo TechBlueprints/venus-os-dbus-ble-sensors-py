@@ -18,8 +18,17 @@ EXT="$DRIVER/ext:$DRIVER/ext/velib_python"
 # that need it — dbus_ble_sensors among them, which is most of the
 # service.  A green run against the wrong interpreter is worse than a
 # red one, so refuse rather than skip.
-if [ -x "$ROOT/.venv-test/bin/python" ]; then
-    PY="$ROOT/.venv-test/bin/python"          # created by: make test-venv
+# In a git worktree, ROOT is the worktree and the venv lives in the main
+# checkout, so look there too -- otherwise this script falls through to a
+# bare python3.12 with no pytest and cannot run at all from a worktree.
+VENV="$ROOT/.venv-test"
+if [ ! -x "$VENV/bin/python" ]; then
+    MAIN=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    [ -n "$MAIN" ] && VENV="$(dirname "$MAIN")/.venv-test"
+fi
+
+if [ -x "$VENV/bin/python" ]; then
+    PY="$VENV/bin/python"                     # created by: make test-venv
 elif command -v python3.12 >/dev/null 2>&1; then
     PY=python3.12
 elif command -v python3.11 >/dev/null 2>&1; then
@@ -37,5 +46,25 @@ if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; t
     exit 1
 fi
 
+# TWO suites live in this repo, and running only one hides breakage in
+# the other.  ``tests/`` holds the integration-level tests; the driver
+# directory carries its own ``tests/`` covering the device classes, the
+# roles and the HCI tap.  Eight tap tests sat broken on main because
+# this script only ever ran the first one.
+#
+# Run them as separate invocations: each has its own conftest.py, and
+# collecting both at once lets one suite's import stubs leak into the
+# other.
+STATUS=0
+
 PYTHONPATH="$DRIVER:$EXT:$HERE" \
-    exec "$PY" -m pytest "$HERE" -v "$@"
+    "$PY" -m pytest "$HERE" -v "$@" || STATUS=$?
+
+if [ -d "$DRIVER/tests" ]; then
+    echo
+    echo "=== driver-internal suite ($DRIVER/tests) ==="
+    PYTHONPATH="$DRIVER:$EXT:$DRIVER/tests" \
+        "$PY" -m pytest "$DRIVER/tests" -v "$@" || STATUS=$?
+fi
+
+exit $STATUS
