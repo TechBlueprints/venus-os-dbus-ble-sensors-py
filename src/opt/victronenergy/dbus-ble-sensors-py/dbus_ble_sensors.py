@@ -1160,8 +1160,58 @@ class DbusBleSensors(object):
         self._last_tap_rx = time.monotonic()
         logging.info("HCI monitor tap started")
 
+    def _restore_name_devices(self) -> None:
+        """Recreate configured name-identified devices at startup.
+
+        A device normally springs into existence on its first
+        advertisement.  That is wrong for a device whose normal state is
+        silence: an EasyStart is unpowered whenever its A/C is off, so
+        after a restart it would be missing from the GUI — no acload
+        service, no settings entry, nothing to rename — until the A/C
+        happened to run, which can be many hours.  It looks broken while
+        being perfectly healthy.
+
+        Everything needed to rebuild it is already persisted: the
+        settings say which units are configured, and the address cache
+        says where each one was last heard.  So rebuild them here and
+        publish the off-state, exactly as a session ending would.
+        """
+        if not BleDevice.NAME_CLASSES:
+            return
+        for dev_id in sorted(self._configured_dev_ids):
+            device_class = None
+            for cls in BleDevice.NAME_CLASSES.values():
+                prefixes = tuple(getattr(cls, 'DEV_ID_PREFIXES', ()))
+                if prefixes and dev_id.startswith(prefixes):
+                    device_class = cls
+                    break
+            if device_class is None:
+                continue
+            # dev_id is f"{dev_prefix}_{identity}"; recover the identity.
+            parts = dev_id.split('_', 1)
+            if len(parts) != 2:
+                continue
+            identity = parts[1]
+            if identity in self._known_mac:
+                continue
+            try:
+                dev_instance = device_class(identity)
+                dev_instance.configure(b'')
+                dev_instance.init()
+                self._known_mac[identity] = dev_instance
+                logging.info(
+                    f"{identity}: restored from stored settings "
+                    f"(silent until its A/C runs)")
+                offline = getattr(dev_instance, '_publish_offline', None)
+                if offline is not None:
+                    offline()
+            except Exception:
+                logging.exception(
+                    f"{identity}: could not restore from stored settings")
+
     def start(self):
         """Start the service: open the tap immediately, begin pruning timer."""
+        self._restore_name_devices()
         self._start_tap()
         self._router.start()
         GLib.timeout_add_seconds(30, self._prune_tick)
@@ -1313,9 +1363,21 @@ class DbusBleSensors(object):
         # never fires for it.  Peek without refreshing, then touch only
         # the busy ones — a blanket items() walk would refresh every TTL
         # and break expiry entirely.
+        # Devices whose normal state is silence (EasyStart: unpowered
+        # whenever its A/C is off) must also survive, or they vanish
+        # from the GUI — service AND settings entry — on a healthy box.
+        # Gated on having stored settings so a stranger adopted during a
+        # discovery window can still age out.
         for key, (value, _ts) in list(self._known_mac._store.items()):
             busy = getattr(value, 'is_busy', None)
             if busy is not None and busy():
+                _ = self._known_mac[key]
+                continue
+            survives = getattr(value, 'survives_silence', None)
+            if survives is None or not survives():
+                continue
+            dev_id = (value.info or {}).get('dev_id')
+            if dev_id and dev_id in self._configured_dev_ids:
                 _ = self._known_mac[key]
 
         self._known_mac.prune()

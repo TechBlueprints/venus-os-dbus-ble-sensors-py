@@ -83,6 +83,24 @@ class BleDevice(object):
         """
         return True
 
+    def survives_silence(self) -> bool:
+        """Whether this device should outlive its advertisement TTL.
+
+        Default False: a device that stops advertising has gone away, and
+        letting it expire releases its D-Bus service and its entry in the
+        BLE settings list.
+
+        True for device classes whose *normal* state is silence — the
+        Micro-Air EasyStart is unpowered whenever its A/C is off, so it
+        is dark for most of any given day.  Expiring those makes the
+        device vanish from the GUI exactly when a user goes looking for
+        it, and takes the settings entry with it, so it cannot even be
+        renamed or disabled.  Only honoured for devices that already
+        have stored settings; a stranger adopted during a discovery
+        window must still be able to age out.
+        """
+        return False
+
     def update_data(self, role_service: DbusRoleService, sensor_data: dict):
         """
         Optional overload. Executed after data parsing, before updating them on service Dbus.

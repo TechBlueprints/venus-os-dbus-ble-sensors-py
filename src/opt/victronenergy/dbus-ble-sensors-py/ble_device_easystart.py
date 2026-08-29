@@ -143,6 +143,20 @@ class BleDeviceEasyStart(BleDevice):
             ],
         })
 
+    def survives_silence(self) -> bool:
+        """Always.  This device is dark whenever its A/C is off.
+
+        Confirmed on hardware: with both A/Cs off the unit does not
+        advertise at all, so the ordinary advertisement TTL expires on a
+        perfectly healthy installation — most of any given day.  Letting
+        it expire released the acload service AND the settings entry,
+        which is what made both units disappear from the GUI device list
+        with nothing wrong.  It also contradicted this driver's own
+        ``_publish_offline``, which writes 0 W and Reachable=0 and only
+        makes sense on a service that is still registered.
+        """
+        return True
+
     def is_busy(self) -> bool:
         """Whether a GATT session is live.
 

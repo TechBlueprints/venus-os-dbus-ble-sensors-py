@@ -263,3 +263,30 @@ def test_the_handler_ignores_cancellation() -> None:
     assert 'except BaseException' not in src, (
         "BaseException would run classification while unwinding a "
         "CancelledError on the way to shutdown")
+
+
+# --- the device must not vanish from the GUI while its A/C is off ------
+#
+# Prod 2026-08-29: both units were absent from Settings > Devices with
+# nothing wrong.  A unit is unpowered whenever its A/C is off, so it
+# stops advertising, and the ordinary advertisement TTL expired it --
+# releasing the acload service AND the /Settings/Devices entry, so it
+# could not even be renamed.  That also contradicted _publish_offline,
+# which writes 0 W to a service it assumes is still registered.
+
+def test_easystart_survives_its_advertisement_ttl():
+    dev = BleDeviceEasyStart('easystart_0c87')
+    assert dev.survives_silence() is True, (
+        "a device that is dark whenever its A/C is off must not be "
+        "expired by the advertisement TTL")
+
+
+def test_ordinary_devices_still_expire():
+    """The exemption must be opt-in, or nothing ever ages out."""
+    class _Ordinary(BleDevice):
+        MANUFACTURER_ID = 0x1234
+
+        def configure(self, manufacturer_data: bytes):
+            pass
+
+    assert _Ordinary('aabbccddeeff').survives_silence() is False
