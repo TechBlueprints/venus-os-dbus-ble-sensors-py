@@ -200,7 +200,12 @@ class BleDeviceEasyStart(BleDevice):
     def _on_session_done(self, result, error):
         """Session ended (GLib thread) — normal for the A/C shutting off."""
         self._session_active = False
-        if error is None:
+        # An error AFTER telemetry was flowing is the compressor stopping
+        # mid-poll — the ordinary way a session ends (observed on prod as
+        # a GATT protocol error on the in-flight write).  Only errors
+        # from sessions that never produced data count toward backoff.
+        was_flowing = self._reachable is True
+        if error is None or was_flowing:
             self._failure_streak = 0
             cooldown = SESSION_COOLDOWN_S
         else:
@@ -211,6 +216,9 @@ class BleDeviceEasyStart(BleDevice):
         self._cooldown_until = time.monotonic() + cooldown
         if error is None:
             logging.info(f"{self._plog} session ended")
+        elif was_flowing:
+            logging.info(f"{self._plog} link dropped mid-session "
+                         f"(A/C stopping is the usual cause): {error!r}")
         elif ble_gatt_link.unreachable(error):
             # Off, out of range, or the phone app holds the exclusive
             # link.  Expected steady state — one debug line, no trace.
