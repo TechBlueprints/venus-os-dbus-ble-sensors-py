@@ -48,37 +48,20 @@ SILENCE_WARNING_SECONDS = 300
 # buys nothing.  One per MAC per this interval is plenty.
 NAME_ADV_MIN_INTERVAL = 5.0
 
-# Rotating-MAC devices cannot live in an accept list permanently, but
-# running the radios accept-all for them costs real CPU: measured on
-# prod, the tap parsing every neighbour advertisement on both adapters
-# held this process at ~23% of a core and the 15-minute load at ~4.0
-# against the 5.5 throttle trip.  So accept-list stays the steady state:
-# each name device's last-heard address is injected into every adapter's
-# list, and one adapter takes a brief accept-all "listening window" on a
-# rotation to catch address rotations and newly powered units.  Window
-# duty = one _scan_reenable_tick (60 s) on one adapter per this many
-# ticks — ~5% of the always-on firehose.
-NAME_WINDOW_EVERY_TICKS = 5
-# After a restart no current address is known; listen wide until one is
-# heard, but never longer than this — beyond it, the windows are the
-# only wide listening and a silent unit is caught by them instead.
+# Name-identified devices ride in the accept lists by their LAST-HEARD
+# address.  Running the radios accept-all for them instead cost real
+# CPU (measured on prod: ~23% of a core parsing the neighbour firehose
+# on both adapters, 15-minute load ~4.0 against the 5.5 throttle trip).
+# The field units hold a fixed Espressif-OUI public address — the
+# community rotation report is unconfirmed on this hardware — so
+# there is no periodic wide listening; if an address ever does rotate
+# while the unit is unheard, the device goes silent until a restart's
+# grace window relearns it (or Continuous scanning is re-enabled), and
+# that is the accepted trade until rotation is actually observed.
+#
+# After a restart no current address is known; listen wide until one
+# is heard, but never longer than this.
 NAME_STARTUP_GRACE_S = 600.0
-
-
-def name_window_adapter(tick_index: int, every: int,
-                        adapter_keys) -> 'str | None':
-    """Which adapter (if any) holds the accept-all window on this tick.
-
-    Windows rotate through the adapters so a device only one radio can
-    hear (the EasyStart's range is 1-2 m) still gets a listening turn,
-    without any learned placement that could go stale.
-    """
-    keys = sorted(adapter_keys)
-    if not keys or every <= 0:
-        return None
-    if tick_index % every != 0:
-        return None
-    return keys[(tick_index // every) % len(keys)]
 # Byte-level identical-advertisement re-forward interval comes from the
 # SensorRoundingPolicy setting at /Settings/SensorRounding/HeartbeatSeconds
 # so this and the publish-level dedup in SensorPublisher share one knob.
@@ -101,6 +84,51 @@ _SCAN_REENABLE_INTERVAL_S = 60
 # and we'd have to bounce the user back through accept-all mode to
 # rediscover our own configured devices.
 _KNOWN_MAC_TYPES_PATH = '/data/conf/dbus-ble-sensors-py-known-mac-types.json'
+# Last-heard address per name-identified device (EasyStart), persisted
+# because the accept lists need it from the first second after a
+# restart: the units can stay silent for hours (a compressor that is
+# off may not advertise), so the startup grace alone cannot be relied
+# on to relearn them, and a unit missing from the accept list is never
+# heard again.  Field units hold fixed public addresses, so a stored
+# value staying valid is the expected case, not a hope.
+_NAME_DEVICE_MACS_PATH = '/data/conf/dbus-ble-sensors-py-name-device-macs.json'
+
+
+def _load_name_device_macs_static() -> 'dict[str, tuple[str, int]]':
+    """Read the persisted ``{identity: [mac, address_type]}`` map.
+
+    Empty on any failure — then the startup grace is the (best-effort)
+    fallback for learning the addresses fresh.
+    """
+    try:
+        with open(_NAME_DEVICE_MACS_PATH, 'r') as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for identity, entry in raw.items():
+            if not isinstance(identity, str) or not identity:
+                continue
+            try:
+                mac, addr_type = entry
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(mac, str) or len(mac) != 12:
+                continue
+            try:
+                addr_type = int(addr_type)
+            except (TypeError, ValueError):
+                continue
+            if addr_type not in (0, 1):
+                continue
+            out[identity] = (mac.lower(), addr_type)
+        return out
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logging.exception(f"Failed to read {_NAME_DEVICE_MACS_PATH!r}, "
+                          "starting fresh")
+        return {}
 
 
 # Adapter identity lives in adapter_identity: a card is its MAC, and the
@@ -247,11 +275,14 @@ class DbusBleSensors(object):
         self._name_accept_all_logged: bool = False
         # identity -> (tap_mac, address_type): the current address of
         # each name-identified device, refreshed on every matched
-        # advertisement.  Injected into every adapter's accept list so
-        # the device stays hearable at accept-list cost between MAC
-        # rotations; the periodic windows re-learn it after one.
-        self._name_device_macs: dict = {}
-        self._scan_tick_index: int = 0
+        # advertisement and injected into every adapter's accept list
+        # so the device stays hearable at accept-list cost.  Loaded
+        # from disk so a restart does not depend on the units speaking
+        # during the grace — they can be silent for hours.
+        self._name_device_macs: dict = _load_name_device_macs_static()
+        if self._name_device_macs:
+            logging.info("%d name-device address(es) loaded from cache",
+                         len(self._name_device_macs))
         self._started_at: float = time.monotonic()
         # Full dev_ids with stored settings — the discovery gate for
         # name-identified devices, whose dev_id contains no MAC for
@@ -462,6 +493,22 @@ class DbusBleSensors(object):
         except Exception:
             logging.exception(f"Failed to persist {_KNOWN_MAC_TYPES_PATH!r}")
 
+    def _save_name_device_macs(self) -> None:
+        """Persist the name-device address map (atomic, best-effort).
+
+        Written on change rather than on a dirty-flag tick: it changes
+        at most once per address rotation or new unit, so eagerness
+        costs nothing and a crash cannot lose the only copy.
+        """
+        try:
+            tmp = _NAME_DEVICE_MACS_PATH + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump({identity: list(entry) for identity, entry
+                           in self._name_device_macs.items()}, f)
+            os.replace(tmp, _NAME_DEVICE_MACS_PATH)
+        except Exception:
+            logging.exception(f"Failed to persist {_NAME_DEVICE_MACS_PATH!r}")
+
     def _on_continuous_scan_changed(self, new_value: bool) -> None:
         """Called by DbusBleService when ``/Settings/BleSensors/ContinuousScan``
         changes (GUI toggle, settings-restore, anywhere).
@@ -658,24 +705,22 @@ class DbusBleSensors(object):
         if policy == hci_scan_control.FILTER_POLICY_ACCEPT_ALL:
             return "accept-all"
         if self._has_configured_name_devices():
-            return "accept-list-only (windowed for rotating-MAC devices)"
+            return "accept-list-only (+name-device addresses)"
         return "accept-list-only"
 
-    def _name_window_active(self, key: str) -> bool:
-        """Whether *key* holds the accept-all listening window right now.
+    def _name_grace_active(self) -> bool:
+        """Whether the post-restart wide-listening grace is in force.
 
-        Also true for every adapter during the startup grace: after a
-        restart no current address is known for any name device, and
+        After a restart no current address is known for any name device;
         idle units advertise, so listening wide briefly converges in
-        seconds instead of waiting for a scheduled window.
+        seconds.  Once an address is learned (or the grace expires) the
+        radios stay accept-list — there is no periodic wide listening,
+        by choice: the field units hold fixed public addresses, and the
+        rotation insurance is deferred until rotation is ever observed.
         """
-        if (not self._name_device_macs
+        return (not self._name_device_macs
                 and time.monotonic() - self._started_at
-                < NAME_STARTUP_GRACE_S):
-            return True
-        return name_window_adapter(self._scan_tick_index,
-                                   NAME_WINDOW_EVERY_TICKS,
-                                   self._adapters) == key
+                < NAME_STARTUP_GRACE_S)
 
     def _has_configured_name_devices(self) -> bool:
         """Whether any name-identified (rotating-MAC) device is configured.
@@ -710,35 +755,30 @@ class DbusBleSensors(object):
         enough to populate the cache.
         """
         if policy == hci_scan_control.FILTER_POLICY_ACCEPT_LIST_ONLY:
-            # A configured name-identified device (EasyStart) rotates
-            # its MAC, so no accept list can hold it permanently.
-            # Running accept-all instead cost ~23% of a core parsing
-            # the neighbour firehose (see NAME_WINDOW_EVERY_TICKS), so:
-            # accept-list stays the steady state with the device's
-            # last-heard address injected on every adapter, and one
-            # adapter periodically takes a brief accept-all window to
-            # re-learn the address after a rotation.  ContinuousScan
-            # OFF still closes the ADOPTION gate throughout.
-            windowed = self._has_configured_name_devices()
-            if windowed and self._name_window_active(key):
+            # Name-identified devices (EasyStart) ride in the accept
+            # list by their last-heard address, injected on every
+            # adapter below.  After a restart no address is known yet,
+            # so listen wide until one is heard (bounded grace).
+            # ContinuousScan OFF still closes the ADOPTION gate
+            # throughout.  See NAME_STARTUP_GRACE_S for why there is
+            # deliberately no periodic wide listening beyond the grace.
+            named = self._has_configured_name_devices()
+            if named and self._name_grace_active():
                 logging.debug(
-                    "%s: accept-all listening window for rotating-MAC "
-                    "devices (tick %d)",
-                    adapter_identity.label(key), self._scan_tick_index)
+                    "%s: startup grace — listening wide until a "
+                    "name-device address is learned",
+                    adapter_identity.label(key))
                 return hci_scan_control.enable_scan(
                     adapter_index,
                     filter_policy=hci_scan_control.FILTER_POLICY_ACCEPT_ALL,
                     scan_type=self._desired_scan_type(),
                 )
-            if windowed and not self._name_accept_all_logged:
+            if named and not self._name_accept_all_logged:
                 self._name_accept_all_logged = True
                 logging.info(
-                    "configured rotating-MAC device(s): accept list "
-                    "includes their last-heard address on every adapter, "
-                    "plus an accept-all listening window (one adapter, "
-                    "one tick in %d) to catch address rotations; "
-                    "discovery/adoption stays off per ContinuousScan",
-                    NAME_WINDOW_EVERY_TICKS)
+                    "configured name-identified device(s): accept list "
+                    "includes their last-heard address on every adapter; "
+                    "discovery/adoption stays off per ContinuousScan")
             devices = sorted(self._mac_address_types.items())
             if not devices and not self._name_device_macs:
                 logging.warning(
@@ -752,10 +792,10 @@ class DbusBleSensors(object):
                     scan_type=self._desired_scan_type(),
                 )
             mine = self._accept_list_for(key, devices)
-            if windowed and self._name_device_macs:
+            if named and self._name_device_macs:
                 # Name-device addresses go on EVERY adapter, after the
                 # capacity slicing: a 1-2 m device sliced onto the far
-                # radio would never be heard between windows.
+                # radio would never be heard at all.
                 have = {mac for mac, _t in mine}
                 mine = mine + sorted(
                     entry for entry in self._name_device_macs.values()
@@ -794,10 +834,6 @@ class DbusBleSensors(object):
         """
         if self._throttled:
             return True
-        # One counter for the whole tick, not per adapter — it drives
-        # the rotating accept-all listening window for rotating-MAC
-        # devices (see _name_window_active).
-        self._scan_tick_index += 1
         desired = self._desired_filter_policy()
         for key in list(self._adapters):
             idx = adapter_identity.index_for(key)
@@ -1050,10 +1086,12 @@ class DbusBleSensors(object):
             self._configured_dev_ids.add(dev_instance.info['dev_id'])
 
         # Track the device's current address for the accept lists —
-        # refreshed on every matched advertisement so a rotation is
-        # picked up the moment the new address is heard.
-        self._name_device_macs[identity] = (
-            tap_mac, address_type if address_type in (0, 1) else 1)
+        # refreshed on every matched advertisement, persisted on change
+        # so the next restart hears the unit from its first second.
+        entry = (tap_mac, address_type if address_type in (0, 1) else 1)
+        if self._name_device_macs.get(identity) != entry:
+            self._name_device_macs[identity] = entry
+            self._save_name_device_macs()
 
         try:
             dev_instance.handle_name_advertisement(mac, adv_name, rssi,

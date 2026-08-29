@@ -50,8 +50,13 @@ Match on the advertised device name, which begins `EasyStart_`. Two lengths
 occur: bare `EasyStart_` (10 characters) and `EasyStart_` plus a four-character
 unit suffix (14 characters). The suffix is the per-unit identifier a user sees.
 
-Match on **name, not address** — the advertised address rotates (observed
-changing within hours). Any driver caching a MAC will lose the unit.
+Match on **name, not address**. Address rotation was reported by one
+community source (observed changing within hours); the two units in this
+project's field deployment contradict it — each holds a fixed public
+address in Espressif's OUI (`38:18:2B`) across dozens of sessions, hours,
+and restarts, and a public address cannot rotate. Treat rotation as
+unconfirmed and possibly model-specific: the name is the identity, and a
+cached address is a usable optimisation that must survive going stale.
 
 ## Commands (confirmed)
 
@@ -249,8 +254,9 @@ These dominate the design of any always-on integration:
   client out for as long as the compressor runs. This is a product decision, not
   a technical one — an integration should be able to release the link on
   request.
-- **The advertised address rotates.** Identify by name; never cache an address
-  as identity.
+- **The advertised address may not be stable** (single-source community
+  report; field units hold fixed public addresses — see Discovery).
+  Identify by name; never cache an address as identity.
 - **Range is roughly 1–2 m.** A rooftop A/C unit is likely out of reach of a
   cabinet-mounted controller without a proxy.
 - A connection can succeed while the configuration read fails. Live telemetry
