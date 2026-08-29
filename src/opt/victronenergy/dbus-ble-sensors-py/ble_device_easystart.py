@@ -9,11 +9,14 @@
 
 The EasyStart is unlike every other device in this service:
 
-* **Identified by advertised name, not address.**  The advertised MAC
-  rotates (observed changing within hours), so the device's identity —
-  its dev_id, its settings, its D-Bus service — is derived from the
-  advertised name (``EasyStart_XXXX``).  The MAC heard in the latest
-  advertisement is only used to open the next connection.
+* **Identified by advertised name, not address.**  The device's identity
+  — its dev_id, its settings, its D-Bus service — is derived from the
+  advertised name (``EasyStart_XXXX``); the MAC heard in the latest
+  advertisement is only used to open the next connection.  Address
+  rotation is reported by one community source but is unconfirmed here
+  (the field units hold fixed public addresses), so a cached address is
+  a usable optimisation that must survive going stale — never identity.
+  See ``docs/EASYSTART-PROTOCOL.md``.
 * **No advertisement telemetry.**  The advertisement is a presence
   signal; all data comes over a GATT connection (bcmv2-routed, same
   adapter pool as every other link this service opens).
@@ -44,6 +47,7 @@ import time
 
 from gi.repository import GLib
 
+import adapter_identity
 import ble_async_loop
 import ble_gatt_link
 import easystart_protocol as proto
@@ -104,7 +108,10 @@ class BleDeviceEasyStart(BleDevice):
         self._adv_name: str = ''
         self._current_mac: 'str | None' = None
         self._address_type: int = 1
-        self._adapter_index: int = 0
+        # The CARD that heard the device, as its identity (MAC), never
+        # as the hciN it happened to answer to at the time — see
+        # :meth:`_resolve_without_scanning`.
+        self._adapter_key: 'str | None' = None
         self._session_active = False
         self._stop_session = False
         self._deleted = False
@@ -155,17 +162,21 @@ class BleDeviceEasyStart(BleDevice):
         """Called on the GLib thread for each (rate-limited) name match.
 
         *mac* is colon-separated uppercase — the address to connect to
-        right now, valid only until the device rotates it.
-        *address_type* and *adapter_index* come from the same HCI report:
-        the connection is opened by handing BlueZ exactly these, on the
-        adapter that provably hears the device (its range is 1-2 m, so
-        the card that heard the advertisement is the card that can reach
-        it), with no discovery scan involved.
+        right now.  *address_type* and *adapter_index* come from the same
+        HCI report, and together they let the connect skip discovery
+        entirely: BlueZ is handed the address, its type, and the card
+        that provably heard it (range is 1-2 m, so the card that heard
+        the advertisement is the card that can reach it).
+
+        The adapter index is converted to the card's identity (its MAC)
+        here and resolved back to a number only at the moment of the
+        connect — ``hciN`` is what a card is called right now, not what
+        it is.  See :meth:`_resolve_without_scanning`.
         """
         self._adv_name = adv_name
         self._current_mac = mac
         self._address_type = address_type
-        self._adapter_index = adapter_index
+        self._adapter_key = adapter_identity.canonical(f"hci{adapter_index}")
 
         if not DbusBleService.get().is_device_enabled(self.info):
             logging.debug(f"{self._plog} seen but not enabled, skipping")
@@ -266,14 +277,32 @@ class BleDeviceEasyStart(BleDevice):
         BlueZ API; bluetoothd runs with -E on this platform, the service
         run script enforces it) creates the ``Device1`` object from
         exactly those and opens the link on that adapter.
+
+        The adapter is named by its MAC and resolved to an ``hciN``
+        **here**, immediately before the call, never carried as a number
+        from when the advertisement arrived.  A replug or USB reset
+        renumbers cards, and a stale number would aim ConnectDevice at a
+        different radio — one that likely cannot hear a device with 1-2 m
+        of range, and that another service may have been promised.  Same
+        rule the scan path follows; see :mod:`adapter_identity`.
         """
         from bleak.backends.bluezdbus.manager import get_global_bluez_manager
         from dbus_fast import Message, Variant
         from dbus_fast.constants import MessageType
 
+        index = adapter_identity.index_for(self._adapter_key)
+        if index is None:
+            # The card that heard it is gone.  Unreachable *through this
+            # route*, not a defect: the next advertisement arrives on
+            # whichever radio is alive and carries that card's identity.
+            raise ble_gatt_link.DeviceNotFound(
+                f"{address}: adapter "
+                f"{adapter_identity.label(self._adapter_key)} that heard "
+                f"this device is no longer present")
+
         manager = await get_global_bluez_manager()
         bus = manager._bus
-        adapter_path = f"/org/bluez/hci{self._adapter_index}"
+        adapter_path = f"/org/bluez/hci{index}"
         dev_path = f"{adapter_path}/dev_{address.upper().replace(':', '_')}"
         type_str = 'public' if self._address_type == 0 else 'random'
 
@@ -288,7 +317,8 @@ class BleDeviceEasyStart(BleDevice):
             # this adapter — connect to it below like any known device.
             if reply.error_name != 'org.bluez.Error.AlreadyExists':
                 raise ble_gatt_link.DeviceNotFound(
-                    f"{address}: ConnectDevice on hci{self._adapter_index} "
+                    f"{address}: ConnectDevice on "
+                    f"{adapter_identity.label(self._adapter_key)} "
                     f"failed: {reply.error_name} {reply.body!r}")
         elif reply.body:
             dev_path = str(reply.body[0])

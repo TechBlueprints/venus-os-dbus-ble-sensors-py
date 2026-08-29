@@ -167,6 +167,52 @@ def test_the_flag_is_never_read_stale():
         "_run_session must clear the flag on entry")
 
 
+# --- hciN is not an identity, on the connect path too -------------------
+#
+# A replug or USB reset renumbers cards.  The advertisement tells us which
+# RADIO heard the device; carrying that as a NUMBER to the connect would
+# aim ConnectDevice at whichever card holds the number by then — likely
+# one that cannot hear a device with 1-2 m of range, and possibly one
+# another service was promised.  So the number must be resolved at the
+# moment of the call, not captured with the advertisement.
+
+def test_adapter_is_stored_as_identity_not_as_a_number():
+    dev = BleDeviceEasyStart('easystart_0c87')
+    assert not hasattr(dev, '_adapter_index'), (
+        "the raw hciN index must not be retained; store the card's "
+        "identity (MAC) instead")
+    assert dev._adapter_key is None
+
+
+def test_advertisement_converts_the_index_to_an_identity():
+    import inspect
+    src = inspect.getsource(BleDeviceEasyStart.handle_name_advertisement)
+    assert 'adapter_identity.canonical' in src, (
+        "the tap's hciN must be canonicalised to the card's MAC on "
+        "arrival")
+
+
+def test_connect_resolves_the_number_at_call_time():
+    import inspect
+    src = inspect.getsource(BleDeviceEasyStart._resolve_without_scanning)
+    assert 'adapter_identity.index_for' in src, (
+        "the hciN must be resolved immediately before ConnectDevice")
+    # The resolve must precede the D-Bus call it targets, or it is not
+    # 'immediately before' in any useful sense.
+    assert src.index('adapter_identity.index_for') < src.index('bus.call'), (
+        "resolve the adapter number before issuing ConnectDevice")
+    assert 'self._adapter_index' not in src
+
+
+def test_a_vanished_adapter_is_unreachable_not_a_defect():
+    """The card that heard it is gone: retry elsewhere, do not warn."""
+    import ble_gatt_link
+    exc = ble_gatt_link.DeviceNotFound('adapter no longer present')
+    assert ble_gatt_link.unreachable(exc), (
+        "a vanished adapter must classify as unreachable so it is logged "
+        "quietly and retried, not reported as an integration fault")
+
+
 def test_a_throwing_classifier_cannot_mask_the_real_error(monkeypatch, caplog):
     """The handler sits on EVERY session; the condition is 1 in 41.
 
