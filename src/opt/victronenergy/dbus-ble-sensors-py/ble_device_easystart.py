@@ -212,7 +212,15 @@ class BleDeviceEasyStart(BleDevice):
         # a GATT protocol error on the in-flight write).  Only errors
         # from sessions that never produced data count toward backoff.
         was_flowing = self._reachable is True
-        if error is None or was_flowing:
+        # The compressor stopping DURING connect ends the link before
+        # service discovery finishes, so the characteristic lookup runs
+        # against an empty GATT database.  Physically identical to the
+        # mid-session drop above, only earlier — so it must not count
+        # toward backoff either.  Observed on prod 2026-08-29 02:18:47,
+        # where it cost a WARNING and an exponential backoff that delayed
+        # picking the unit back up.
+        dropped_early = bool(getattr(self, "_dropped_before_discovery", False))
+        if error is None or was_flowing or dropped_early:
             self._failure_streak = 0
             cooldown = SESSION_COOLDOWN_S
         else:
@@ -226,6 +234,10 @@ class BleDeviceEasyStart(BleDevice):
         elif was_flowing:
             logging.info(f"{self._plog} link dropped mid-session "
                          f"(A/C stopping is the usual cause): {error!r}")
+        elif dropped_early:
+            logging.info(f"{self._plog} link dropped before service "
+                         f"discovery (A/C stopping during connect is the "
+                         f"usual cause): {error!r}")
         elif ble_gatt_link.unreachable(error):
             # Off, out of range, or the phone app holds the exclusive
             # link.  Expected steady state — one debug line, no trace.
@@ -285,6 +297,7 @@ class BleDeviceEasyStart(BleDevice):
             address, dev_path, {'Alias': self._adv_name or address})
 
     async def _run_session(self, address: str):
+        self._dropped_before_discovery = False
         device = await asyncio.wait_for(
             self._resolve_without_scanning(address),
             timeout=CONNECT_OVERALL_TIMEOUT_S)
@@ -356,6 +369,13 @@ class BleDeviceEasyStart(BleDevice):
                     failures = 0
                     GLib.idle_add(self._publish_live_glib, live)
                 await asyncio.sleep(proto.POLL_INTERVAL_S)
+        except BaseException as exc:
+            # Classified here, not in _on_session_done, because the
+            # discriminator is the client's own GATT database and the
+            # callback never sees the client.
+            self._dropped_before_discovery = (
+                ble_gatt_link.dropped_before_discovery(exc, client))
+            raise
         finally:
             await ble_gatt_link.disconnect(client)
 

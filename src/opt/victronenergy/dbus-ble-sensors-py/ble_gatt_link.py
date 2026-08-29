@@ -154,6 +154,71 @@ def unreachable(exc: BaseException) -> bool:
     return bool(names & {"BleakNotFoundError", "BleakDeviceNotFoundError"})
 
 
+def dropped_before_discovery(exc: BaseException, client=None) -> bool:
+    """Whether *exc* means the link died before a GATT database existed.
+
+    Distinct from :func:`unreachable`, which is "the device never
+    answered".  Here it answered, we connected, and it went away before
+    service discovery finished — so the characteristic lookup ran against
+    an empty database.
+
+    That matters because bleak reports it as
+    ``BleakCharacteristicNotFoundError``, which is indistinguishable *by
+    type* from the genuine integration bug it must not be confused with:
+    a wrong UUID, or firmware that dropped a characteristic.  One is a
+    normal end to a session; the other is a defect that has to stay loud.
+
+    The discriminator is the database itself, not the exception:
+
+    * no services resolved  -> the link died before discovery, expected
+    * services resolved, characteristic absent -> a real defect
+
+    Observed on prod: an EasyStart soft starter whose A/C shut off during
+    connect.  bcmv2 recorded the matching ``disconnect event ... last
+    link traffic: never``, and the driver logged a WARNING and took an
+    exponential backoff — delaying the reconnect for a compressor that
+    had simply stopped.  One occurrence in 41 sessions, which is also why
+    frequency alone cannot classify it: a wrong UUID fails every time, so
+    a rare failure is evidence *against* the loud reading.
+
+    Without *client* there is nothing to inspect, so the answer is False
+    and the caller keeps its warning: staying loud is the safe default.
+    """
+    chain = (exc, exc.__cause__, exc.__context__)
+    names = {type(link).__name__ for link in chain if link is not None}
+
+    # bleak refuses a lookup before discovery with a bare BleakError.
+    # That message IS the empty-database signal — no client needed.
+    if "BleakError" in names and any(
+            "service discovery has not been performed" in str(link).lower()
+            for link in chain if link is not None):
+        return True
+
+    if "BleakCharacteristicNotFoundError" not in names:
+        return False
+    if client is None:
+        return False
+
+    try:
+        services = client.services
+    except Exception:
+        # The attribute itself raises before discovery on some versions.
+        return True
+    if services is None:
+        return True
+    try:
+        chars = services.characteristics
+    except Exception:
+        try:
+            chars = list(services)
+        except Exception:
+            return False
+    try:
+        return len(chars) == 0
+    except TypeError:
+        return False
+
+
 async def connect(device, name: str | None = None):
     """Connect to *device* through bcmv2, with retry semantics.
 

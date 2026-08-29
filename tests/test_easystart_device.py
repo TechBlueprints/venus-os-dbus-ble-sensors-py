@@ -6,6 +6,8 @@ configuration contract, and the name-prefix class registry.
 """
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from ble_device import BleDevice
@@ -87,3 +89,79 @@ def test_class_registers_by_name_prefix_not_mfg_id():
     assert BleDevice.NAME_CLASSES['EasyStart_'] is BleDeviceEasyStart
     # The sentinel manufacturer id must never land in the mfg registry.
     assert BleDevice.DEVICE_CLASSES.get(-1) is not BleDeviceEasyStart
+
+
+# --- A/C stopping DURING connect is a normal session end --------------
+#
+# Prod 2026-08-29 02:18:47: the compressor shut off after the link came
+# up but before service discovery finished, so the characteristic lookup
+# ran against an empty GATT database and bleak raised
+# BleakCharacteristicNotFoundError.  bcmv2 recorded the matching
+# "disconnect event ... last link traffic: never".
+#
+# The driver logged WARNING "session failed" and took an exponential
+# backoff -- delaying reconnection for a compressor that had merely
+# stopped.  Physically this is the same event as the mid-session drop
+# already treated as normal, just earlier in the session.
+#
+# 1 occurrence in 41 sessions, which is also why the rate cannot classify
+# it: a genuinely wrong UUID would fail all 41, so rarity is evidence
+# AGAINST the loud reading, not for it.
+
+class _StubRole:
+    def __init__(self):
+        self.published = []
+
+    def __setitem__(self, path, value):
+        self.published.append((path, value))
+
+    def __getitem__(self, path):
+        return 0
+
+
+def _device_after_failed_connect():
+    dev = BleDeviceEasyStart('easystart_0c87')
+    dev._session_active = True
+    dev._reachable = False          # telemetry never started
+    dev._failure_streak = 0
+    dev._role_services = {}
+    dev._publish_offline = lambda: None
+    return dev
+
+
+def test_drop_before_discovery_does_not_count_as_a_failure(caplog):
+    dev = _device_after_failed_connect()
+    dev._dropped_before_discovery = True
+
+    with caplog.at_level(logging.DEBUG):
+        dev._on_session_done(None, RuntimeError('char not found'))
+
+    assert dev._failure_streak == 0, (
+        "a compressor stopping during connect must not drive the "
+        "exponential backoff that delays picking it back up")
+    levels = {r.levelname for r in caplog.records}
+    assert 'WARNING' not in levels, f"expected no warning, got {levels}"
+    assert any('before service discovery' in r.message
+               for r in caplog.records)
+
+
+def test_a_genuine_session_failure_still_warns_and_backs_off(caplog):
+    """The must-stay-loud case: no drop detected, so it is a real defect."""
+    dev = _device_after_failed_connect()
+    dev._dropped_before_discovery = False
+
+    with caplog.at_level(logging.DEBUG):
+        dev._on_session_done(None, RuntimeError('char not found'))
+
+    assert dev._failure_streak == 1
+    assert any(r.levelname == 'WARNING' for r in caplog.records), (
+        "a characteristic missing from a RESOLVED database is a wrong "
+        "UUID or changed firmware, and must not be silenced")
+
+
+def test_the_flag_is_never_read_stale():
+    """It must be reset per session, or one drop silences later defects."""
+    import inspect
+    src = inspect.getsource(BleDeviceEasyStart._run_session)
+    assert 'self._dropped_before_discovery = False' in src, (
+        "_run_session must clear the flag on entry")

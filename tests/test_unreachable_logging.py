@@ -110,3 +110,97 @@ def test_recovery_clears_the_state() -> None:
     assert "AA:BB" in smartshunt_hex._unreachable_state
     smartshunt_hex._note_reachable("AA:BB")
     assert "AA:BB" not in smartshunt_hex._unreachable_state
+
+
+# --- dropped-before-discovery vs a real missing characteristic --------
+#
+# An EasyStart soft starter whose A/C shut off DURING connect produced
+# BleakCharacteristicNotFoundError on prod (2026-08-29 02:18:47), with
+# bcmv2 recording "disconnect event ... last link traffic: never".  The
+# driver logged a WARNING and took an exponential backoff, delaying the
+# reconnect for a compressor that had merely stopped.
+#
+# The same exception type is also how a genuine defect arrives -- a wrong
+# UUID, or firmware that dropped a characteristic -- and that must stay
+# loud.  Frequency cannot separate them either: this was 1 failure in 41
+# sessions, and a wrong UUID would fail all 41.  So the discriminator has
+# to be the GATT database, not the exception and not the rate.
+
+
+class BleakCharacteristicNotFoundError(Exception):
+    """Stands in for bleak's class, matched by name."""
+
+
+class BleakError(Exception):
+    """Stands in for bleak's base error, matched by name."""
+
+
+class _Services:
+    def __init__(self, chars):
+        self.characteristics = chars
+
+
+class _Client:
+    def __init__(self, chars):
+        self.services = _Services(chars)
+
+
+class _ClientRefusingServices:
+    """Some bleak versions raise on .services before discovery."""
+
+    @property
+    def services(self):
+        raise BleakError("Service Discovery has not been performed yet")
+
+
+def test_empty_gatt_database_means_the_link_died() -> None:
+    exc = BleakCharacteristicNotFoundError("d973f2e1-... was not found!")
+    assert ble_gatt_link.dropped_before_discovery(exc, _Client({})) is True
+
+
+def test_a_resolved_database_missing_the_char_stays_loud() -> None:
+    """The real-defect case: discovery worked, the characteristic is gone."""
+    exc = BleakCharacteristicNotFoundError("d973f2e1-... was not found!")
+    client = _Client({"0000180a-0000-1000-8000-00805f9b34fb": object()})
+    assert ble_gatt_link.dropped_before_discovery(exc, client) is False
+
+
+def test_services_attribute_that_refuses_means_no_database() -> None:
+    exc = BleakCharacteristicNotFoundError("nope")
+    assert ble_gatt_link.dropped_before_discovery(
+        exc, _ClientRefusingServices()) is True
+
+
+def test_the_bare_discovery_error_needs_no_client() -> None:
+    # smartshunt_hex hit this form: bleak refuses the lookup outright.
+    exc = BleakError("Service Discovery has not been performed yet")
+    assert ble_gatt_link.dropped_before_discovery(exc) is True
+
+
+def test_without_a_client_we_stay_loud() -> None:
+    """Nothing to inspect means no licence to silence a possible defect."""
+    exc = BleakCharacteristicNotFoundError("nope")
+    assert ble_gatt_link.dropped_before_discovery(exc, None) is False
+
+
+def test_unrelated_errors_are_not_swallowed() -> None:
+    assert ble_gatt_link.dropped_before_discovery(
+        TypeError("bad argument"), _Client({})) is False
+    assert ble_gatt_link.dropped_before_discovery(
+        ValueError("nonsense"), _Client({})) is False
+
+
+def test_a_wrapped_characteristic_error_is_still_seen() -> None:
+    inner = BleakCharacteristicNotFoundError("d973f2e1-... was not found!")
+    outer = RuntimeError("session failed")
+    outer.__cause__ = inner
+    assert ble_gatt_link.dropped_before_discovery(outer, _Client({})) is True
+
+
+def test_it_does_not_overlap_with_unreachable() -> None:
+    """The two classifiers answer different questions and must not blur."""
+    exc = BleakCharacteristicNotFoundError("d973f2e1-... was not found!")
+    assert ble_gatt_link.unreachable(exc) is False, (
+        "a device that answered is not 'unreachable' — keeping these "
+        "separate is what stops a real missing-characteristic defect "
+        "from being filed as 'switched off'")
