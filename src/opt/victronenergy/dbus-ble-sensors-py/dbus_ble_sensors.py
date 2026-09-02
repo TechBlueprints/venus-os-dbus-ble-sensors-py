@@ -37,6 +37,7 @@ from sensor_rounding import SensorRoundingPolicy
 from sensor_publisher import SensorPublisher
 from load_throttle import LoadThrottle
 import adapter_identity
+import ble_gatt_dbus
 import hci_scan_control
 import platform_notifications
 from scan_claims import ScanClaims
@@ -1250,6 +1251,22 @@ class DbusBleSensors(object):
     def start(self):
         """Start the service: open the tap immediately, begin pruning timer."""
         self._restore_name_devices()
+        # Drop links a previous life left behind before we start
+        # listening: a connected peripheral does not advertise, so an
+        # orphaned link makes one of our own devices unhearable on every
+        # card.  See ble_gatt_dbus.disconnect_stale_links.
+        stale_addresses = set(self._configured_macs)
+        for entry in self._name_device_macs.values():
+            try:
+                stale_addresses.add(str(entry[0]))
+            except Exception:
+                continue
+        if stale_addresses:
+            try:
+                ble_gatt_dbus.disconnect_stale_links(dbus.SystemBus(),
+                                                     stale_addresses)
+            except Exception:
+                logging.exception("stale-link sweep failed; starting anyway")
         self._start_tap()
         self._router.start()
         GLib.timeout_add_seconds(30, self._prune_tick)

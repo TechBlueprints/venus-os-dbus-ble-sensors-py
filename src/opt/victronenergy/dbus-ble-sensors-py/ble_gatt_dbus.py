@@ -77,6 +77,69 @@ def _plain(value):
 _warned_out_of_pool: set[str] = set()
 
 
+def disconnect_stale_links(bus, addresses) -> list:
+    """Disconnect links to OUR devices that a previous life left behind.
+
+    Returns ``[(path, address), ...]`` for each link dropped.
+
+    A ``svc -t`` ends this process with ``os._exit(0)``; a crash or a
+    kill ends it with nothing at all.  Either way bleak never sends
+    Disconnect, and bluetoothd keeps the LE link up with no client
+    behind it.  A connected peripheral does not advertise, so the next
+    life cannot hear the device on ANY card — it logs "silent until its
+    A/C runs" while the A/C is running.  Prod, 2026-09-02: easystart_89fe
+    dark for ~17 minutes after a restart, connected on hci9 to a process
+    that no longer existed.
+
+    Runs at startup, before the tap opens.  At that moment this process
+    holds nothing, so any link to one of *addresses* is stale by
+    construction — there is no live-claim check to get wrong.  Every
+    adapter is swept, not just the pool: the orphan above was on a card
+    outside both the allowlist and ble-connect.conf.  Only our own
+    addresses are touched; another consumer's link is never ours to
+    drop.
+
+    Best effort throughout: a failure to reach BlueZ, or to disconnect
+    one device, must not stop the service from starting.
+    """
+    wanted = {str(a).replace(":", "").lower() for a in addresses if a}
+    if not wanted:
+        return []
+    try:
+        om = dbus.Interface(
+            bus.get_object("org.bluez", "/", introspect=False),
+            "org.freedesktop.DBus.ObjectManager")
+        objects = om.GetManagedObjects()
+    except Exception:
+        logger.exception("stale-link sweep: BlueZ object lookup failed; "
+                         "starting without it")
+        return []
+
+    dropped = []
+    for path, interfaces in objects.items():
+        path = str(path)
+        if DEVICE_INTERFACE not in interfaces:
+            continue
+        props = _plain(interfaces[DEVICE_INTERFACE])
+        if not props.get("Connected"):
+            continue
+        address = str(props.get("Address", ""))
+        if address.replace(":", "").lower() not in wanted:
+            continue
+        try:
+            dbus.Interface(bus.get_object("org.bluez", path, introspect=False),
+                           DEVICE_INTERFACE).Disconnect()
+        except Exception as exc:
+            logger.warning("stale-link sweep: could not disconnect %s at %s: %s",
+                           address, path, exc)
+            continue
+        adapter = path.rsplit("/dev_", 1)[0]
+        logger.info("stale link from a previous life: disconnected %s on %s "
+                    "so it can advertise again", address, adapter)
+        dropped.append((path, address))
+    return dropped
+
+
 def lookup_device(bus, mac: str,
                   prefer_adapter: str | None = None,
                   ) -> tuple[str | None, dict | None]:
