@@ -221,7 +221,10 @@ class BleDeviceEasyStart(BleDevice):
         self._session_active = True
         self._stop_session = False
         self._config_published = False
-        logging.info(f"{self._plog} starting GATT session to {mac}")
+        # DEBUG: "live telemetry flowing" is the success signal and the
+        # session-end line is the outcome; the attempt itself is noise
+        # at ~230 lines per 94 h on prod.
+        logging.debug(f"{self._plog} starting GATT session to {mac}")
         ok = ble_async_loop.submit(
             lambda: self._run_session(mac),
             on_done=self._on_session_done,
@@ -551,8 +554,10 @@ class BleDeviceEasyStart(BleDevice):
             pub(role_service, '/EasyStart/Reachable', 0)
         if self._reachable is not False:
             self._reachable = False
-            logging.info(f"{self._plog} offline — publishing 0 W "
-                         "(A/C not running is the normal off state)")
+            # DEBUG: this always follows a session-end line that already
+            # says why, and the message itself says it is the normal state.
+            logging.debug(f"{self._plog} offline — publishing 0 W "
+                          "(A/C not running is the normal off state)")
 
     def handle_manufacturer_data(self, manufacturer_data: bytes):
         # Name-identified device: nothing arrives through the

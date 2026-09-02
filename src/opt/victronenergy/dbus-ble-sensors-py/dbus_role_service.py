@@ -80,7 +80,7 @@ class DbusRoleService(object):
     def _get_vrm_instance(self) -> int:
         # Try and get instance saved in settings
         if (dev_instance := self._dbus_settings.get_value(f"/Settings/Devices/{self._dbus_id}/VrmInstance")):
-            logging.info(f"{self._ble_device._plog} vrm instance {dev_instance!r} found for device {self._dbus_id!r}")
+            logging.debug(f"{self._ble_device._plog} vrm instance {dev_instance!r} found for device {self._dbus_id!r}")
             return dev_instance
 
         # Load devices from settings
@@ -150,9 +150,15 @@ class DbusRoleService(object):
             if not self._get_value('/DeviceInstance'):
                 self._set_value('/DeviceInstance', self._get_vrm_instance())
 
-            logging.info(f"{self._ble_device._plog} registering {self._service_name!r} dbus service on bus {self._bus}")
             self._dbus_service.register()
             self._connected = True
+            # The one INFO line per device registration.  Devices arrive
+            # lazily as their advertisements do, over minutes, so a single
+            # startup summary would miss late arrivals; one line each is
+            # the audit record.  The bus object repr that used to be here
+            # said nothing a reader could use.
+            logging.info(f"{self._ble_device._plog} registered {self._service_name!r} "
+                         f"(instance {self._get_value('/DeviceInstance')})")
 
     def disconnect(self):
         if not self.is_connected():

@@ -23,6 +23,7 @@ from dbus_bus import get_bus
 from dbus_ble_service import DbusBleService
 from gi.repository import GLib
 from logger import setup_logging
+import log_filters
 from collections.abc import MutableMapping
 import json
 import threading
@@ -948,7 +949,11 @@ class DbusBleSensors(object):
                     self._tap_ignored_macs.add(dev_mac)
                     continue
 
-                logging.info(f"{dev_mac}: initializing device with class {device_class}")
+                # One INFO line per device is emitted at registration, in
+                # DbusRoleService.connect, carrying the instance.  This
+                # earlier step is DEBUG: four lines per device per restart
+                # was ~30% of prod output over 94 h.
+                logging.debug(f"{dev_mac}: initializing device with class {device_class}")
                 try:
                     dev_instance = device_class(dev_mac)
                     if not dev_instance.check_manufacturer_data(man_data):
@@ -1069,8 +1074,8 @@ class DbusBleSensors(object):
                         f"and this device has no stored settings")
                 return
 
-            logging.info(f"{identity}: initializing name-identified device "
-                         f"with class {device_class} (currently at {mac})")
+            logging.debug(f"{identity}: initializing name-identified device "
+                          f"with class {device_class} (currently at {mac})")
             try:
                 dev_instance = device_class(identity)
                 dev_instance.configure(b'')
@@ -1500,6 +1505,9 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.debug)
+    # vedbus registers every service at INFO on the root logger; see
+    # log_filters for why that is filtered rather than re-levelled.
+    log_filters.install(args.debug)
 
     if args.snif:
         handler = RotatingFileHandler(

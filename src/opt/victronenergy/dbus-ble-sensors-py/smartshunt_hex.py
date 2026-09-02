@@ -87,6 +87,36 @@ def _note_unreachable(mac: str, exc: BaseException) -> None:
     _unreachable_state[mac] = (now, 0, message)
 
 
+def _note_dropped_before_discovery(mac: str, exc: BaseException) -> None:
+    """Log a link that died before service discovery, once per window.
+
+    Same shape as _note_unreachable — one line, no traceback, throttled —
+    but INFO rather than WARNING, because the device DID answer: it
+    connected, then went away before a GATT database existed.  This is
+    the "Service Discovery has not been performed yet" form that produced
+    229 tracebacks on prod, ~30% of the log, before the discovery gate
+    stopped us connecting to strangers.  It stays possible for our own
+    shunt if it powers down mid-connect.  Shares the suppression state
+    with _note_unreachable so a success clears both.
+    """
+    message = str(exc) or type(exc).__name__
+    now = time.monotonic()
+    last, suppressed, previous = _unreachable_state.get(mac, (0.0, 0, ""))
+    if message == previous and (now - last) < _UNREACHABLE_LOG_INTERVAL_S:
+        _unreachable_state[mac] = (last, suppressed + 1, previous)
+        logger.debug("SmartShunt HEX %s still dropping before discovery: %s",
+                     mac, message)
+        return
+    if suppressed:
+        logger.info("SmartShunt HEX %s dropped before service discovery: %s "
+                    "(%d further attempt(s) since the last report)",
+                    mac, message, suppressed)
+    else:
+        logger.info("SmartShunt HEX %s dropped before service discovery: %s",
+                    mac, message)
+    _unreachable_state[mac] = (now, 0, message)
+
+
 def _note_reachable(mac: str) -> None:
     """Forget the suppression state once a session succeeds."""
     _unreachable_state.pop(mac, None)
@@ -458,6 +488,8 @@ async def _run_forever(mac: str, passkey: int,
             # traceback, because anything else is a bug.
             if ble_gatt_link.unreachable(exc):
                 _note_unreachable(mac, exc)
+            elif ble_gatt_link.dropped_before_discovery(exc):
+                _note_dropped_before_discovery(mac, exc)
             else:
                 logger.exception("SmartShunt HEX session dropped for %s", mac)
         else:
