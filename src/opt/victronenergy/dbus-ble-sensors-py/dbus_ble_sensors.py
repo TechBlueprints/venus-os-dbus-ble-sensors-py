@@ -218,6 +218,11 @@ class DbusBleSensors(object):
         # ordering mistake that silently emptied _configured_macs.
         self._refusal_logged: set = set()
 
+        # Adapters we have already reported as carrying someone else's
+        # scan.  Declared here and never re-initialised — see
+        # _configured_macs for what the alternative cost.
+        self._foreign_scan_logged: set = set()
+
         # MACs with stored settings: our own configured gear.  Declared
         # here and filled immediately below — NOT re-initialised later,
         # which is what silently emptied it and made the gate reject
@@ -1052,6 +1057,34 @@ class DbusBleSensors(object):
                 device_class = cls
                 break
         if device_class is None:
+            return
+
+        # Only act on advertisements from scans WE run.  The tap is
+        # HCI_CHANNEL_MONITOR: it sees every adapter's traffic and stamps
+        # each report with that adapter's index.  A survey by another
+        # process on a card we do not scan therefore arrives here looking
+        # exactly like our own hearing — and the driver treats the index
+        # as "the card that provably heard it" and hands ConnectDevice
+        # that card.  Prod, 2026-09-02 19:40Z: easystart_89fe linked on
+        # an unconfigured ninth radio, outside ble-connect.conf, with no
+        # warning, because the watch ran RSSI surveys there.
+        #
+        # The allowlist is the static fact "we scan here".  It is the
+        # right gate rather than _scan_enabled_adapters, which the
+        # silence-warning and throttle paths clear transiently while the
+        # radio scan is still ours; gating on that would drop our own
+        # adverts for up to 30 s.  An advert from a non-allowlisted card
+        # cannot be ours — we never enable scanning there.
+        hci_name = f"hci{adapter_index}"
+        adapter_key = adapter_identity.canonical(hci_name)
+        if not self._adapter_allowed(adapter_key, hci_name):
+            if adapter_key not in self._foreign_scan_logged:
+                self._foreign_scan_logged.add(adapter_key)
+                logging.info(
+                    f"{hci_name} ({adapter_key}): ignoring name-identified "
+                    f"advertisements heard via this adapter — we do not "
+                    f"scan on it, so another process does; link placement "
+                    f"follows our own cards only")
             return
 
         identity = device_class.identity_from_name(adv_name)
