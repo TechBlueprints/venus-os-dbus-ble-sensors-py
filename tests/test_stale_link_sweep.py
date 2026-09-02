@@ -133,5 +133,122 @@ def test_start_sweeps_before_the_tap_opens() -> None:
     assert body.index("disconnect_stale_links(") < body.index("self._start_tap()"), (
         "the sweep must run before the tap opens, so the freed device is "
         "heard on our own cards from the first advertisement")
-    assert "self._configured_macs" in body and "self._name_device_macs" in body, (
-        "both address stores feed the sweep: HEX devices and EasyStarts alike")
+    assert "owned_macs()" in body and "self._name_device_macs" in body, (
+        "both address stores feed the sweep: HEX devices (owned prefixes "
+        "only) and EasyStarts alike")
+
+
+# --- Ownership and live claims: the two guards added after 20:19Z ------
+#
+# The first sweep keyed its address set on configured_macs(), which
+# harvests a MAC from EVERY /Settings/Devices entry -- other services'
+# included -- and disconnected power-watchdog's link (24:EC:4A:E4:69:A5,
+# hci5) and easytouch's (88:13:BF:2E:10:BE, hci7).  Both had live .use.
+# claims from live pids.  "Stale" means no live claimant; that is the
+# definition, and the prefix filter is defence in depth behind it.
+
+import glob
+import importlib.util
+import sys
+import tempfile
+
+
+def _load_real(name):
+    """Load the real driver module from disk under a private name.
+
+    Other test modules install stubs called ``dbus_ble_service`` into
+    sys.modules that persist for the session, so a plain import here
+    returns whichever stub ran first (it did: '_StubBleSvc' has no
+    owned_macs).  Same trap, same fix as test_preferred_adapter_identity.
+    """
+    spec = importlib.util.spec_from_file_location(
+        f"_real_{name}", os.path.join(SRC_DIR, f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+SRC_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "src", "opt", "victronenergy", "dbus-ble-sensors-py"))
+dbus_ble_service = _load_real("dbus_ble_service")
+
+
+class _Settings:
+    def __init__(self, keys):
+        self._keys = keys
+
+    def list_device_settings(self):
+        return self._keys
+
+
+def test_owned_macs_excludes_other_services_entries() -> None:
+    svc = dbus_ble_service.DbusBleService.__new__(dbus_ble_service.DbusBleService)
+    svc._dbus_settings = _Settings([
+        "orion_tr_c36eed421ff2/charger/Enabled",
+        "microair_easystart_89fe/acload/Enabled",      # no MAC segment: skipped
+        "seelevel_btp3_00a0508d9569_01/tank/Enabled",
+        "power_watchdog_24ec4ae469a5/Enabled",          # NOT ours
+        "easytouch_8813bf2e10be/Enabled",               # NOT ours
+        "serialbattery_A4C138334124/Enabled",           # NOT ours
+        "vebus_ttyS4/Enabled",
+    ])
+    assert svc.owned_macs() == {"c36eed421ff2", "00a0508d9569"}
+
+
+def test_owned_prefixes_match_the_device_classes() -> None:
+    """Every dev_prefix literal in a driver must be in OWNED_PREFIXES."""
+    found = set()
+    for path in glob.glob(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "src", "opt",
+            "victronenergy", "dbus-ble-sensors-py", "ble_device_*.py")):
+        for m in re.finditer(r"""['"]dev_prefix['"]\s*:\s*['"]([a-z0-9_]+)['"]""",
+                             open(path).read()):
+            found.add(m.group(1))
+        for m in re.finditer(r"""DEV_PREFIX\s*=\s*['"]([a-z0-9_]+)['"]""",
+                             open(path).read()):
+            found.add(m.group(1))
+    found.discard("dummy")   # the test-only device class
+    missing = found - set(dbus_ble_service.DbusBleService.OWNED_PREFIXES)
+    assert not missing, f"add to OWNED_PREFIXES: {sorted(missing)}"
+    assert found, "the scan found no prefixes — the regex is dead"
+
+
+def test_a_live_claimed_address_is_never_dropped(monkeypatch) -> None:
+    _install(monkeypatch)
+    bus = _Bus({"/org/bluez/hci5/dev_24_EC_4A_E4_69_A5":
+                {"Address": "24:EC:4A:E4:69:A5", "Connected": True}})
+    got = ble_gatt_dbus.disconnect_stale_links(
+        bus, {"24ec4ae469a5"}, held={"24EC4AE469A5"})
+    assert _Obj.disconnected == [] and got == [], (
+        "even an address in our set must be left alone while a live "
+        "process claims it — that is what 'stale' means")
+
+
+def test_live_claims_are_parsed_from_the_real_filename_shapes() -> None:
+    d = tempfile.mkdtemp()
+    for n in ["000195C9B2EA.use.dbus-power-watchdog-15166.24EC4AE469A5",
+              "000195C9B4C6.use.dbus-serialbattery.5320b7d7f9e7-7411.5320B7D7F9E7",
+              "000195CC32F7.use.dbus-ble-sensors-py-4550.38182BFB9B76",
+              "000195CC32F7.scan",
+              "000195CC32F7.scan.holder.dbus-ble-sensors-py-8837-8837-5",
+              "000195C9B4C6.link.0"]:
+        open(os.path.join(d, n), "w").close()
+    alive = lambda pid: pid != 4550          # the old sensors-py life is dead
+    held = ble_gatt_dbus.live_claimed_addresses(d, alive=alive)
+    assert held == {"24ec4ae469a5", "5320b7d7f9e7"}, (
+        "dotted owners parse, dead pids do not count, scan/link files "
+        "are not use-claims")
+
+
+def test_start_uses_owned_macs_and_passes_live_claims() -> None:
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+               "src", "opt", "victronenergy", "dbus-ble-sensors-py",
+               "dbus_ble_sensors.py")).read()
+    body = src[src.index("    def start(self):"):]
+    body = body[:body.index("\n    def ", 10)]
+    assert "owned_macs()" in body
+    assert "set(self._configured_macs)" not in body, (
+        "configured_macs harvests other services' devices")
+    assert "held=ble_gatt_dbus.live_claimed_addresses()" in body

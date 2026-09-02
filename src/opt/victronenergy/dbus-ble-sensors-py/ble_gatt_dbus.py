@@ -77,7 +77,35 @@ def _plain(value):
 _warned_out_of_pool: set[str] = set()
 
 
-def disconnect_stale_links(bus, addresses) -> list:
+_CLAIM_DIR = "/run/bt-claims"
+_USE_CLAIM = re.compile(
+    r"^[0-9A-Fa-f]{12}\.use\.(?P<owner>.+)-(?P<pid>\d+)\.(?P<addr>[0-9A-Fa-f]{12})$")
+
+
+def live_claimed_addresses(claim_dir: str = _CLAIM_DIR, alive=None) -> set:
+    """Addresses currently claimed by a LIVE process, from /run/bt-claims.
+
+    ``<adapter>.use.<owner>-<pid>.<ADDR>`` is the convention; the owner
+    may itself contain dots (``dbus-serialbattery.5320b7d7f9e7-7411``),
+    so the pid is the last ``-<digits>`` before the final address.  A
+    claim whose pid is gone is not a claim.  Best effort: an unreadable
+    directory yields the empty set, which makes the sweep MORE cautious
+    only in the sense that it then relies on the prefix filter alone.
+    """
+    alive = alive or (lambda pid: os.path.exists(f"/proc/{pid}"))
+    held = set()
+    try:
+        names = os.listdir(claim_dir)
+    except Exception:
+        return held
+    for name in names:
+        m = _USE_CLAIM.match(name)
+        if m and alive(int(m.group("pid"))):
+            held.add(m.group("addr").lower())
+    return held
+
+
+def disconnect_stale_links(bus, addresses, held=()) -> list:
     """Disconnect links to OUR devices that a previous life left behind.
 
     Returns ``[(path, address), ...]`` for each link dropped.
@@ -93,7 +121,7 @@ def disconnect_stale_links(bus, addresses) -> list:
 
     Runs at startup, before the tap opens.  At that moment this process
     holds nothing, so any link to one of *addresses* is stale by
-    construction — there is no live-claim check to get wrong.  Every
+    construction — and *held* (live claims) is checked regardless.  Every
     adapter is swept, not just the pool: the orphan above was on a card
     outside both the allowlist and ble-connect.conf.  Only our own
     addresses are touched; another consumer's link is never ours to
@@ -103,6 +131,7 @@ def disconnect_stale_links(bus, addresses) -> list:
     one device, must not stop the service from starting.
     """
     wanted = {str(a).replace(":", "").lower() for a in addresses if a}
+    held_set = {str(a).replace(":", "").lower() for a in held if a}
     if not wanted:
         return []
     try:
@@ -124,7 +153,17 @@ def disconnect_stale_links(bus, addresses) -> list:
         if not props.get("Connected"):
             continue
         address = str(props.get("Address", ""))
-        if address.replace(":", "").lower() not in wanted:
+        key = address.replace(":", "").lower()
+        if key not in wanted:
+            continue
+        if key in held_set:
+            # A live process claims this link.  "Stale" means no live
+            # claimant — that is the whole definition, and it is what
+            # keeps another consumer's link (or a second instance of us)
+            # out of reach.  2026-09-02: the first version lacked this
+            # and cut power-watchdog's and easytouch's live links.
+            logger.info("stale-link sweep: %s at %s is claimed by a live "
+                        "process; leaving it", address, path)
             continue
         try:
             dbus.Interface(bus.get_object("org.bluez", path, introspect=False),

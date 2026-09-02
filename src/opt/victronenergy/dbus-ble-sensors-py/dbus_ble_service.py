@@ -253,6 +253,34 @@ class DbusBleService(object):
             ids.add(str(key).split("/", 1)[0])
         return ids
 
+    # The dev_prefix of every device class this service owns.  /Settings/
+    # Devices is shared with every other service on the box — serialbattery,
+    # easytouch, power_watchdog, vebus, vedirect all keep entries there —
+    # so "has a settings entry with a MAC in it" is NOT "is ours".
+    # configured_macs() deliberately ignores that (for adoption it is
+    # harmless: a foreign device never matches our classes), but anything
+    # DESTRUCTIVE keyed on addresses must use owned_macs() instead.
+    #
+    # On 2026-09-02 the stale-link sweep was keyed on configured_macs() and
+    # disconnected power-watchdog's and easytouch's live links at startup.
+    # test_owned_prefixes_match_the_device_classes keeps this list honest.
+    OWNED_PREFIXES = ("gobius", "ip22", "microair", "mopeka", "mopeka_std",
+                      "orion_tr", "ruuvi", "safiery", "seelevel_btp3",
+                      "seelevel_btp7", "smartshunt", "solarsense", "teltonika")
+
+    def owned_macs(self) -> set:
+        """MACs with settings under one of OUR device prefixes only."""
+        macs = set()
+        for key in self._dbus_settings.list_device_settings():
+            dev_id = str(key).split("/", 1)[0]
+            if not any(dev_id.startswith(p + "_") for p in self.OWNED_PREFIXES):
+                continue
+            for seg in reversed(dev_id.lower().split("_")):
+                if len(seg) == 12 and all(c in "0123456789abcdef" for c in seg):
+                    macs.add(seg)
+                    break
+        return macs
+
     def is_device_role_enabled(self, device_info: dict, role_name: str) -> bool:
         """
         Check if the given role is enabled through settings

@@ -1255,7 +1255,9 @@ class DbusBleSensors(object):
         # listening: a connected peripheral does not advertise, so an
         # orphaned link makes one of our own devices unhearable on every
         # card.  See ble_gatt_dbus.disconnect_stale_links.
-        stale_addresses = set(self._configured_macs)
+        # owned_macs(), never _configured_macs: the latter harvests a MAC
+        # from EVERY /Settings/Devices entry, other services' included.
+        stale_addresses = set(self._dbus_ble_service.owned_macs())
         for entry in self._name_device_macs.values():
             try:
                 stale_addresses.add(str(entry[0]))
@@ -1263,8 +1265,9 @@ class DbusBleSensors(object):
                 continue
         if stale_addresses:
             try:
-                ble_gatt_dbus.disconnect_stale_links(dbus.SystemBus(),
-                                                     stale_addresses)
+                ble_gatt_dbus.disconnect_stale_links(
+                    dbus.SystemBus(), stale_addresses,
+                    held=ble_gatt_dbus.live_claimed_addresses())
             except Exception:
                 logging.exception("stale-link sweep failed; starting anyway")
         self._start_tap()
