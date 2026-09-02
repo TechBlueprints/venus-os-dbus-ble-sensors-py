@@ -53,6 +53,14 @@ Optional deployment config, ``/data/apps/dbus-ble-sensors-py/ble-connect.conf``:
     # uncapped adapters are never slot-gated.
     link_caps = hci1:5
 
+The GATT notify path is also decided by the stack, not by any caller in
+this tree: the ``/data/bcm`` shim exports ``BCM_FORCE_START_NOTIFY=true``
+and :func:`install_bleak_catcher` reads it, so every ``start_notify`` in
+this process goes out as StartNotify and an explicit AcquireNotify request
+is rewritten with a warning.  Nothing here passes ``force_start_notify``
+— inheriting the fleet setting is the point.  See
+``hex_key_session._start_notify`` for the history and the open question.
+
 This is *not* ``adapter-allowlist.conf``.  That file reserves adapters away
 from the advertisement scanner; this one bounds where GATT links may be
 placed.  They are separate on purpose: a card reserved from our scanning is

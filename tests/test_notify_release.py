@@ -1,9 +1,12 @@
 """Every notify we acquire must be released before the link drops.
 
-We ask bleak for the fd-based notify path — `bluez={"use_start_notify":
-False}` — because on Venus StartNotify plus PropertiesChanged delivers
-empty payloads for these characteristics once the link is SMP-paired.
-That makes us the only consumer on the box that calls AcquireNotify.
+We USED to ask bleak for the fd-based notify path — `bluez=
+{"use_start_notify": False}` — because on Venus StartNotify plus
+PropertiesChanged once delivered empty payloads for these characteristics
+after SMP pairing.  As of 2026-09-02 the shared BLE stack forces
+StartNotify fleet-wide and rewrites that request at the wrapper, so we no
+longer ask; see test_notify_policy.py.  The release bookkeeping below is
+kept so re-enabling it is one line if AcquireNotify ever returns.
 
 BlueZ 5.72 stores the notify client into chrc->notify_io->data without
 taking a reference (fixed upstream in 5.84/5.86; Venus ships 5.72), so
@@ -101,8 +104,9 @@ def test_subscribing_records_the_acquire(mod) -> None:
 
     assert acquired == ["char-a"], (
         "an unrecorded acquire is one teardown will not release")
-    assert client.started[0][1].get("use_start_notify") is False, (
-        "we must still be asking for the acquire path")
+    assert "use_start_notify" not in client.started[0][1], (
+        "we no longer ask for the acquire path: BCM forces StartNotify "
+        "fleet-wide and an explicit False only earns an override warning")
 
 
 def test_releasing_empties_the_list(mod) -> None:

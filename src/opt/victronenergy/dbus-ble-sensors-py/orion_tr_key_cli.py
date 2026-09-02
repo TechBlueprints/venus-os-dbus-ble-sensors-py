@@ -38,11 +38,13 @@ a bcmv2 pin: try the card that worked last time first, then walk.
 
 Protocol notes, all of them hard-won on real hardware:
 
-* **Notifications must use AcquireNotify.**  On Venus OS, StartNotify plus
-  PropertiesChanged delivers *empty* payloads for the 306b characteristics
-  once the link is SMP-paired, so bleak is asked for the fd-based path
-  (``bluez={"use_start_notify": False}``) with StartNotify only as a
-  fallback.
+* **The notify path is fleet policy, not a local choice.**  The shared BLE
+  stack forces StartNotify (``BCM_FORCE_START_NOTIFY`` via the
+  ``/data/bcm`` shim) because AcquireNotify is the BlueZ 5.72
+  use-after-free path.  This tool used to insist on AcquireNotify because
+  StartNotify once delivered *empty* payloads for the 306b characteristics
+  after SMP pairing; that is unverified under the current stack and the
+  wrapper overrides the request regardless.
 * **The CTRL read is load-bearing.**  Reading the control characteristic
   is what puts the device into CBOR mode; skip it and DATA_LAST never
   fires.

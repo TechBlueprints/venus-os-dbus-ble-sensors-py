@@ -109,28 +109,21 @@ class _ReadCollector:
 
 
 async def _start_notify(client, char, callback, acquired=None) -> None:
-    """Subscribe, preferring AcquireNotify, recording it for teardown.
+    """Subscribe, recording the characteristic for teardown.
 
-    ``acquired`` is a list the caller passes so :func:`_stop_notify_all`
-    knows what to release.  That matters more than it looks: bluetoothd
-    5.72 stores the notify client into ``chrc->notify_io->data`` without
-    taking a reference, so an acquire still outstanding when the link
-    goes away leaves a dangling pointer that detonates when the
-    temporary device is cleaned up 30-120 s later.  Upstream fixed it in
-    5.84/5.86; Venus ships 5.72.
+    The notify path is decided by fleet policy, not here: the shared BLE
+    stack forces StartNotify (``BCM_FORCE_START_NOTIFY`` via the
+    ``/data/bcm`` shim) and rewrites an AcquireNotify request at the
+    wrapper, with a warning.  This module used to ask for the fd-based
+    path because StartNotify once delivered empty payloads for these
+    characteristics after SMP pairing; that is unverified under the
+    current stack, and the override made asking pointless anyway.  See
+    hex_key_session._start_notify for the full account.
 
-    We ask for the fd-based path deliberately — StartNotify plus
-    PropertiesChanged delivers empty payloads for these characteristics
-    once the link is SMP-paired — so releasing it is our job.
+    ``acquired`` still feeds :func:`_stop_notify_all`, which is kept but
+    disabled at its call sites.  Under StartNotify there is no fd to
+    release, so the list is bookkeeping rather than a safety net.
     """
-    try:
-        await client.start_notify(char, callback,
-                                  bluez={"use_start_notify": False})
-        if acquired is not None:
-            acquired.append(char)
-        return
-    except Exception:
-        pass
     try:
         await client.start_notify(char, callback)
         if acquired is not None:

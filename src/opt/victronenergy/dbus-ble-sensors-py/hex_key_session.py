@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import binascii
 import logging
-import os
 import struct
 import time
 
@@ -40,10 +39,6 @@ import victron_vreg as vreg
 
 logger = logging.getLogger(__name__)
 
-# Escape hatch for the AcquireNotify-vs-StartNotify question; see
-# _start_notify.  Env var so it can be flipped for one CLI run
-# without touching the service.
-_PREFER_START_NOTIFY = os.environ.get("HEX_START_NOTIFY") == "1"
 
 
 def _err(*a) -> None:
@@ -142,46 +137,34 @@ class _Collector:
 async def _start_notify(client, char, callback, acquired=None) -> bool:
     """Subscribe.  Returns False if the characteristic is absent.
 
-    Which BlueZ path we take is the single highest-stakes choice in this
-    module, so it is a switch rather than a constant.
+    Which BlueZ notify path this takes is no longer decided here.  The
+    shared BLE stack enforces StartNotify fleet-wide as a deploy-level
+    setting (``BCM_FORCE_START_NOTIFY``, exported by the ``/data/bcm``
+    shim); a caller that asks for AcquireNotify has the request rewritten
+    to StartNotify at the wrapper and earns one warning per device for
+    asking.  So this asks for nothing and lets policy decide.
 
-    ``AcquireNotify`` (``use_start_notify: False``) hands back a file
-    descriptor.  It was chosen because on Venus, StartNotify plus
-    PropertiesChanged delivered EMPTY payloads for these characteristics
-    once the link was SMP-paired.  Its cost only became clear later: it
-    is what creates ``chrc->notify_io`` in bluetoothd, and BlueZ 5.72
-    stores the notify client there without a reference — the
-    use-after-free behind ~240 SIGSEGVs on the prod Cerbo in one day.
+    Why the policy exists: AcquireNotify is what creates
+    ``chrc->notify_io`` in bluetoothd, and BlueZ 5.72 stores the notify
+    client there without a reference — the use-after-free behind ~240
+    SIGSEGVs on the prod Cerbo in one day.  StartNotify never creates
+    ``notify_io``, so the crash site is unreachable however a session
+    ends.  Venus still ships 5.72.
 
-    ``StartNotify`` (bleak's default) never creates ``notify_io`` at
-    all, so ``notify_io_destroy`` is never reached and the UAF is
-    unreachable — however a session ends, clean or failed or killed.
-    That removes the crash site instead of tiptoeing around it, which
-    three separate teardown guards failed to do.
+    Why this module used to insist on AcquireNotify: on Venus, StartNotify
+    plus PropertiesChanged once delivered EMPTY payloads for these
+    characteristics after SMP pairing.  That finding predates the current
+    bleak/BCM stack and has NOT been re-verified under it.  The test is
+    the first ``Recovered key`` line after 2026-09-02 13:50Z, when the
+    policy took effect on prod; a key read that times out instead is the
+    finding still being true, and the answer then is a conversation with
+    the operator, not a local opt-out that the wrapper will override.
 
-    The empty-payload finding predates the current bleak/BCM stack, so
-    it is worth re-testing rather than inheriting.  Set
-    ``HEX_START_NOTIFY=1`` to take the StartNotify path and compare.
+    ``acquired`` is still recorded: :func:`_stop_notify_all` is kept
+    (disabled at its call sites) so re-enabling release is one line.
     """
     if client.services.get_characteristic(char) is None:
         return False
-    if _PREFER_START_NOTIFY:
-        try:
-            await client.start_notify(char, callback)
-            if acquired is not None:
-                acquired.append(char)
-            return True
-        except Exception:
-            logger.warning("StartNotify failed on %s", char)
-            return False
-    try:
-        await client.start_notify(char, callback,
-                                  bluez={"use_start_notify": False})
-        if acquired is not None:
-            acquired.append(char)
-        return True
-    except Exception as exc:
-        _err(f"AcquireNotify {char} failed ({exc}); trying StartNotify")
     try:
         await client.start_notify(char, callback)
         if acquired is not None:
@@ -190,6 +173,7 @@ async def _start_notify(client, char, callback, acquired=None) -> bool:
     except Exception as exc:
         _err(f"StartNotify {char} failed: {exc}")
         return False
+
 
 async def _stop_notify_all(client, acquired, ok: bool) -> None:
     """Release every notify we hold, before the link goes away.

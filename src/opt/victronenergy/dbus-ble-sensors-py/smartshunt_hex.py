@@ -161,22 +161,19 @@ class _Collector:
 
 
 async def _start_notify(client, char, callback, acquired=None) -> bool:
+    # Notify path is fleet policy (StartNotify, forced by the /data/bcm
+    # shim); asking for AcquireNotify only earns an override warning.
+    # See hex_key_session._start_notify for why.
     if client.services.get_characteristic(char) is None:
         return False
     try:
-        await client.start_notify(char, callback,
-                                  bluez={"use_start_notify": False})
+        await client.start_notify(char, callback)
         if acquired is not None:
             acquired.append(char)
         return True
     except Exception:
-        try:
-            await client.start_notify(char, callback)
-            if acquired is not None:
-                acquired.append(char)
-            return True
-        except Exception:
-            return False
+        return False
+
 
 async def _stop_notify_all(client, acquired, ok: bool) -> None:
     """Release every notify we hold, before the link goes away.
