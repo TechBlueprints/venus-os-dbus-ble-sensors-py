@@ -107,13 +107,29 @@ def _format_mac_colons(dev_mac: str) -> str:
 
 
 def is_smartsolar_manufacturer_data(manufacturer_data: bytes) -> bool:
-    """Structural gate: product id in the accepted set AND solar mode."""
-    if len(manufacturer_data) < 5:
+    """Structural gate: product id in the accepted set, and solar mode.
+
+    Like the IP22, an MPPT that has nothing to report drops the encrypted
+    payload and advertises a short "product-id only" frame, so anything
+    from length 4 up is ours if the product id matches; the mode byte is
+    only checked once the frame is long enough to carry one.
+
+    Requiring the full frame here is not merely a missed reading.  A
+    frame this returns False for falls through the dispatcher to
+    BleDeviceVictronEnergy, whose own check then fails, and THAT puts the
+    MAC in ``_ignored_mac`` for the life of the process — so one short
+    beacon arriving first silences the device until the next restart.
+    Prod did exactly that on 2026-09-03: heard at 20:03:01, ignored, and
+    never adopted again.
+    """
+    if len(manufacturer_data) < 4:
         return False
     pid = struct.unpack("<H", manufacturer_data[2:4])[0]
     if pid not in ACCEPTED_PRODUCT_IDS:
         return False
-    return manufacturer_data[4] == SOLAR_CHARGER_MODE
+    if len(manufacturer_data) >= 5 and manufacturer_data[4] != SOLAR_CHARGER_MODE:
+        return False
+    return True
 
 
 class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):

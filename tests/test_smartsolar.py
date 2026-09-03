@@ -96,7 +96,27 @@ def test_detector_rejects_other_victron_families(ss) -> None:
         assert not ss.is_smartsolar_manufacturer_data(bytes.fromhex(hexs))
     frame = bytearray(bytes.fromhex(SMARTSOLAR_PORTABLE_HEX)); frame[4] = 0x08
     assert not ss.is_smartsolar_manufacturer_data(bytes(frame)), "0xA053 but not solar mode"
-    assert not ss.is_smartsolar_manufacturer_data(b"\x10\x02\x53\xa0")
+    assert not ss.is_smartsolar_manufacturer_data(b"\x10\x02\x57\xa0"), "short frame, but a 100/50"
+    assert not ss.is_smartsolar_manufacturer_data(b"\x10\x02\x53")
+
+
+def test_short_product_id_only_beacon_is_still_ours(ss) -> None:
+    """An MPPT with nothing to report drops the payload and beacons its id.
+
+    This MUST match: a False here falls through the dispatcher to
+    BleDeviceVictronEnergy, whose failing check blacklists the MAC in
+    _ignored_mac for the life of the process.  On prod one such beacon
+    arriving first silenced the charger until the next restart.
+    """
+    assert ss.is_smartsolar_manufacturer_data(b"\x10\x02\x53\xa0")
+    dev = ss.BleDeviceSmartSolar.__new__(ss.BleDeviceSmartSolar)
+    dev.info = {"dev_mac": "c120d54f7125"}; dev._plog = "x"
+    dev._adv_key_hex = None; dev._dbus_settings = None; dev._role_services = {}
+    dev._stored_key_invalid = False; dev._last_provision_attempt = 0.0
+    dev._provision_attempts = 0; dev._gave_up_logged = False
+    # configure() must survive the 4-byte frame, and a short frame must
+    # never reach the decoder.
+    ss.BleDeviceSmartSolar.check_manufacturer_data(dev, b"\x10\x02\x53\xa0")
 
 
 class _Writer:
