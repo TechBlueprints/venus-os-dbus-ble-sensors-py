@@ -183,6 +183,17 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
             "product_name": product_name,
             "device_name": "SmartSolar",
             "dev_prefix": "smartsolar",
+            # MUST be int or None, NEVER a str.  systemcalc's DVCC
+            # delegate does ``v & 0xFF0000`` on a solarcharger's
+            # /FirmwareVersion (dvcc.py has_externalcontrol_support); a
+            # str raises TypeError there and takes systemcalc down in a
+            # restart loop, which drops DVCC for the WHOLE system.  Prod
+            # 2026-09-03: the two hardwired MPPTs lost BMS control
+            # (NetworkMode 13 -> 0) the moment this service appeared,
+            # because the base class defaults this to the string
+            # "1.0.0".  None is the documented "not known" case and
+            # systemcalc returns True for it rather than warning.
+            "firmware_version": None,
             "roles": {"solarcharger": {}},
             "regs": [{"name": "_smartsolar_placeholder", "type": VE_UN8,
                       "offset": 0, "roles": [None]}],
@@ -298,16 +309,19 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
         firmware_raw = payload.get("firmware")
         if firmware_raw:
             try:
+                # Keep the human-readable form in SETTINGS only.  The
+                # /FirmwareVersion PATH on a solarcharger is read by
+                # systemcalc as an integer bitmask -- see the note in
+                # configure().  Publishing the pretty "1.05" string here
+                # is exactly the crash we already caused once, arriving a
+                # few minutes later instead of at registration.
                 set_firmware_version(self._dbus_settings,
                                      self.info["dev_mac"], firmware_raw)
-                pretty = format_firmware_version(firmware_raw) or firmware_raw
-                self.info["firmware_version"] = pretty
-                for role_service in self._role_services.values():
-                    try:
-                        self._publish_value(role_service, "/FirmwareVersion",
-                                            pretty)
-                    except Exception:
-                        pass
+                logger.info("%s: firmware %s recorded in settings (the "
+                            "/FirmwareVersion path stays unset: systemcalc "
+                            "requires an int there)", self._plog,
+                            format_firmware_version(firmware_raw)
+                            or firmware_raw)
             except Exception:
                 logger.exception("%s: failed to persist firmware version",
                                  self._plog)
