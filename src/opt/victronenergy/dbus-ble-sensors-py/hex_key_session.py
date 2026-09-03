@@ -456,14 +456,16 @@ async def _read_key(client, collector: _Collector, passkey: int,
     voltage = vreg.encode_read_command(0xED8D)
     await _ask_key(client, collector, voltage, "voltage 0xED8D", 4.0)
     for inst in instances:
-        batch = vreg.encode_read_commands(
-            [vreg.VREG_BLE_MAC_ADDRESS, vreg.VREG_ADVERTISEMENT_KEY],
-            instance=inst)
-        key = await _ask_key(
-            client, collector, batch,
-            f"0x05 [EC66,EC65] inst {inst}", 8.0)
-        if key is not None:
-            return key
+        for definite in (False, True):
+            batch = vreg.encode_read_commands(
+                [vreg.VREG_BLE_MAC_ADDRESS, vreg.VREG_ADVERTISEMENT_KEY],
+                instance=inst, definite=definite)
+            key = await _ask_key(
+                client, collector, batch,
+                f"0x05 [EC66,EC65] inst {inst}"
+                f" {'definite' if definite else 'indefinite'}", 8.0)
+            if key is not None:
+                return key
 
     key = await _ask_key(client, collector, _GET_KEY, "fast 0x25", 6.0)
     if key is not None:
@@ -482,14 +484,26 @@ async def _read_key(client, collector: _Collector, passkey: int,
 
     authed_window = min(timeout_s, 12.0)
     for inst in instances:
-        batch = vreg.encode_read_commands(
-            [vreg.VREG_BLE_MAC_ADDRESS, vreg.VREG_ADVERTISEMENT_KEY],
-            instance=inst)
-        key = await _ask_key(
-            client, collector, batch,
-            f"authed 0x05 [EC66,EC65] inst {inst}", authed_window)
-        if key is not None:
-            return key
+        # Both CBOR array forms.  cbor_array's own note records why:
+        # the IP22 and Orion want the indefinite form (9F ... FF), while
+        # a SmartShunt rejects it on CTRL and only answers definite-length
+        # arrays.  Sending only the indefinite form means a device of the
+        # second kind is asked in a dialect it will not answer, so it
+        # stays silent through a perfectly good PUK+PIN auth and the link
+        # eventually dies with the key unread -- which is what the
+        # SmartSolar MPPT 75/15 does.  Indefinite stays first so the
+        # devices that already work are asked exactly as before.
+        for definite in (False, True):
+            batch = vreg.encode_read_commands(
+                [vreg.VREG_BLE_MAC_ADDRESS, vreg.VREG_ADVERTISEMENT_KEY],
+                instance=inst, definite=definite)
+            key = await _ask_key(
+                client, collector, batch,
+                f"authed 0x05 [EC66,EC65] inst {inst}"
+                f" {'definite' if definite else 'indefinite'}",
+                authed_window)
+            if key is not None:
+                return key
         priv = bytes([0x25, inst, 0x9F, 0x19, 0xEC, 0x65, 0xFF])
         key = await _ask_key(
             client, collector, priv, f"authed 0x25 inst {inst}", 6.0)
