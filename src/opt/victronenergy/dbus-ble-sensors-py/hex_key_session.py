@@ -103,6 +103,10 @@ class _Collector:
         self._bulk = bytearray()
         self.puk: list[bytes] = []
         self.pin: list[bytes] = []
+        # F7 flow control: set when the peer asks for credits, with the
+        # count it asked for.  See on_ctrl.
+        self.f7 = False
+        self.f7_n = 0
 
     def reset(self) -> None:
         self.frames.clear()
@@ -119,11 +123,26 @@ class _Collector:
         _dbg(f"[BULK] +{len(data)}B: {data.hex()}")
 
     def on_ctrl(self, _char, data: bytearray) -> None:
-        # Device-side control traffic (F7 error, F9 credits, F8 buffer
-        # clear).  Logged only — the handshake is driven explicitly below,
-        # and reacting here would race our own writes.
-        if data:
-            _dbg(f"[CTRL-RX] {len(data)}B: {bytes(data).hex()}")
+        # Device-side control traffic (F9 credits, F8 buffer clear) is
+        # logged only: the handshake is driven explicitly below, and
+        # reacting here would race our own writes.
+        #
+        # F7 is the exception, and calling it an "error" here cost us a
+        # device.  It is flow control: the peer is asking for a specific
+        # number of credits before it will send the next chunk.  The
+        # SmartShunt taught us this (see smartshunt_hex.on_ctrl) --
+        # answer it with exactly that many and the register Push
+        # arrives; ignore it and blindly re-write a fixed window, and it
+        # never does.  The SmartSolar MPPT 75/15 sends F7 and then
+        # withholds 0xEC65 forever, which our own message described as
+        # "F7 / no EC65 push" while treating the F7 as the failure.
+        raw = bytes(data)
+        if raw:
+            _dbg(f"[CTRL-RX] {len(raw)}B: {raw.hex()}")
+        if raw[:1] == b"\xf7":
+            self.f7 = True
+            if len(raw) >= 3:
+                self.f7_n = int.from_bytes(raw[1:3], "little") or 2
 
     def on_puk(self, _char, data: bytearray) -> None:
         self.puk.append(bytes(data))
@@ -216,10 +235,17 @@ async def _stop_notify_all(client, acquired, ok: bool) -> None:
             pass
 
 
-async def _credits(client) -> None:
-    """Hand the device another credit window; failures are not fatal."""
+async def _credits(client, n: int | None = None) -> None:
+    """Hand the device credits; failures are not fatal.
+
+    With *n*, grant exactly that many -- the answer to an F7 request.
+    Without it, re-write the standing window, which is all we can do
+    for a peer that never asks.
+    """
+    payload = (bytes([vreg.OPCODE_READY_TO_RECV, n & 0xFF])
+               if n else _CTRL_CREDITS)
     try:
-        await client.write_gatt_char(vreg.CHAR_CONTROL, _CTRL_CREDITS,
+        await client.write_gatt_char(vreg.CHAR_CONTROL, payload,
                                      response=False)
     except Exception:
         pass
@@ -354,7 +380,14 @@ async def _ask_key(client, collector: _Collector, request: bytes,
         if key is not None:
             _err(f"Recovered key: {len(key)}B")
             return key
-        await _credits(client)
+        if collector.f7:
+            # Answer the peer's own request rather than our standing
+            # window -- this is what unblocks a device that withholds
+            # the Push until it is credited the amount it asked for.
+            n, collector.f7 = collector.f7_n, False
+            await _credits(client, n)
+        else:
+            await _credits(client)
     return None
 
 
