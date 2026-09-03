@@ -145,6 +145,18 @@ class BleDevice(object):
                                 BleDevice.NAME_CLASSES[prefix] = obj
                             break
                         man_id = getattr(obj, 'MANUFACTURER_ID', None)
+                        if man_id is None and callable(getattr(obj, 'matches_manufacturer_data', None)):
+                            # Detector-routed class (the 0x02E1 Victron
+                            # family: Orion-TR, IP22, SmartShunt,
+                            # SmartSolar).  The dispatcher picks these by
+                            # payload, not by manufacturer id, and the
+                            # instance sets MANUFACTURER_ID in configure().
+                            # Nothing to register here, and not an error:
+                            # four ERROR lines per restart said otherwise
+                            # and sent one investigation the wrong way.
+                            logging.debug(
+                                f"Device class {module_name!r} is detector-routed; not registered by manufacturer id")
+                            continue
                         if not isinstance(man_id, int):
                             logging.error(
                                 f"Device class {module_name!r}@{file_path!r} has invalid MANUFACTURER_ID: {man_id!r}")
