@@ -55,6 +55,7 @@ from ve_types import VE_UN8
 # accumulators, charger alarms, DVCC engagement + /State=252 override.
 import hex_key_session
 from ble_charger_common import (
+    format_firmware_version,
     ChargerCommonMixin,
     CHARGE_CURRENT_DEADBAND_A,
     CHARGE_VOLTAGE_DEADBAND_V,
@@ -157,39 +158,7 @@ def _gatt() -> AsyncGATTWriter:
     return _gatt_writer
 
 def _format_firmware_version(raw_hex: Optional[str]) -> Optional[str]:
-    if not raw_hex:
-        return None
-    try:
-        blob = bytes.fromhex(raw_hex)
-    except ValueError:
-        return None
-
-    def _bcd_byte(b: int) -> int:
-        return ((b >> 4) & 0xF) * 10 + (b & 0xF)
-
-    def _format_low16(value16: int) -> Optional[str]:
-        if value16 in (0, 0xFFFF):
-            return None
-        major = _bcd_byte((value16 >> 8) & 0xFF)
-        minor = _bcd_byte(value16 & 0xFF)
-        return f"{major}.{minor:02d}"
-
-    if len(blob) == 2:
-        v = int.from_bytes(blob, "little")
-        s = _format_low16(v)
-        if s:
-            return s
-    if len(blob) == 4:
-        v = int.from_bytes(blob, "little")
-        if v in (0, 0xFFFFFFFF):
-            return raw_hex
-        base = _format_low16(v & 0xFFFF)
-        if base is None:
-            return raw_hex
-        kind = (v >> 24) & 0xF0
-        suffix = {0x40: "", 0x50: "~beta", 0xF0: "~dev"}.get(kind, "")
-        return base + suffix
-    return raw_hex
+    return format_firmware_version(raw_hex)
 
 def _battery_voltage_for_product(model_name: Optional[str],
                                  pid: int) -> Optional[int]:

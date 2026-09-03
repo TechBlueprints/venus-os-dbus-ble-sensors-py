@@ -106,6 +106,43 @@ _SERIAL_TOKEN_RE = re.compile(r"(HQ[0-9A-Z]{8,12})")
 # Pure helpers
 # ---------------------------------------------------------------------------
 
+def format_firmware_version(raw_hex: Optional[str]) -> Optional[str]:
+    """VREG 0x0140 firmware bytes -> "major.minor", or None when blank/0xFFFF."""
+    if not raw_hex:
+        return None
+    try:
+        blob = bytes.fromhex(raw_hex)
+    except ValueError:
+        return None
+
+    def _bcd_byte(b: int) -> int:
+        return ((b >> 4) & 0xF) * 10 + (b & 0xF)
+
+    def _format_low16(value16: int) -> Optional[str]:
+        if value16 in (0, 0xFFFF):
+            return None
+        major = _bcd_byte((value16 >> 8) & 0xFF)
+        minor = _bcd_byte(value16 & 0xFF)
+        return f"{major}.{minor:02d}"
+
+    if len(blob) == 2:
+        v = int.from_bytes(blob, "little")
+        s = _format_low16(v)
+        if s:
+            return s
+    if len(blob) == 4:
+        v = int.from_bytes(blob, "little")
+        if v in (0, 0xFFFFFFFF):
+            return raw_hex
+        base = _format_low16(v & 0xFFFF)
+        if base is None:
+            return raw_hex
+        kind = (v >> 24) & 0xF0
+        suffix = {0x40: "", 0x50: "~beta", 0xF0: "~dev"}.get(kind, "")
+        return base + suffix
+    return raw_hex
+
+
 def serial_from_advertised_name(name: Optional[str]) -> Optional[str]:
     """Extract the Victron serial token (``HQxxxxxxxxx``) from a BlueZ
     advertised name like ``"BSC IP22 12/30...HQ2133XMU6Y"`` or

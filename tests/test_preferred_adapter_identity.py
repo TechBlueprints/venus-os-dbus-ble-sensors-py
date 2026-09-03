@@ -23,7 +23,7 @@ DRIVER_DIR = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..", "src", "opt", "victronenergy", "dbus-ble-sensors-py"))
 
-MODULES = ["orion_tr_key_settings", "smartshunt_key_settings",
+MODULES = ["orion_tr_key_settings", "smartshunt_key_settings", "smartsolar_key_settings",
            "ip22_key_settings"]
 
 MAC = "AA:BB:CC:DD:EE:FF"

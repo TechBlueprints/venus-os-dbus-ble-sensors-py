@@ -1,5 +1,5 @@
 """
-Victron SmartSolar MPPT charger over BLE advertisements only.
+Victron SmartSolar MPPT charger over BLE advertisements.
 
 The unit broadcasts encrypted Instant Readout frames (manufacturer 0x02E1,
 mode byte 0x01 = solar charger).  With its 32-hex Instant Readout key in
@@ -8,13 +8,23 @@ load current, charge state and error code — the same AES-CTR scheme and
 the same vendored ``victron_ble`` library the IP22 driver uses, with the
 ``SolarCharger`` parser instead of ``AcCharger``.
 
+Key recovery works the IP22 way.  A device that is enabled but has no
+key gets ONE paired HEX session (VREG 0xEC65 through the shared
+single-slot writer, same passkey resolution as the Orion/IP22 drivers);
+the key, the firmware string and the adapter that succeeded are
+persisted under ``/Settings/Devices/smartsolar_<mac>/`` and the link is
+dropped.  That is the only GATT this driver ever does: telemetry stays
+on advertisements, there are no writes, and a device nobody enabled is
+never connected to.
+
 Deliberate limits of this first version, both for caution:
 
-* **No GATT, ever.**  The IP22 driver fetches a missing key over a paired
-  HEX session; this driver does not.  Without a key it logs once and
-  waits.  The key is read from VictronConnect (Product info → Instant
-  readout details) and written to
-  ``/Settings/Devices/smartsolar_<mac>/AdvertisementKey``.
+* **Bounded provisioning.**  The IP22 retries a failed key read every
+  backoff window for the life of the process.  Under the fleet notify
+  policy the HEX path is not yet proven, so a session that keeps timing
+  out would churn a GATT link on prod indefinitely; this driver stops
+  after ``_PROVISION_MAX_ATTEMPTS`` per process, says so once, and waits
+  for a hand-set ``AdvertisementKey`` or a restart.
 * **Product 0xA053 only** (SmartSolar Charger MPPT 75/15).  The box also
   has two SmartSolar 100/50s (0xA057) that are already wired over
   VE.Direct.  The discovery gate would keep them out while discovery is
@@ -25,15 +35,32 @@ Deliberate limits of this first version, both for caution:
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import time
 from typing import Any, Dict, Optional
 
-from ble_charger_common import ChargerCommonMixin, serial_from_advertised_name
+import dbus
+
+import hex_key_session
+from ble_charger_common import (
+    ChargerCommonMixin,
+    format_firmware_version,
+    serial_from_advertised_name,
+)
 from ble_device import BleDevice
 from dbus_ble_service import DbusBleService
 from dbus_settings_service import DbusSettingsService
-from smartsolar_key_settings import get_advertisement_key
+from orion_tr_gatt import AsyncGATTWriter
+from orion_tr_pin import resolve_pairing_passkey
+from smartsolar_key_settings import (
+    advertisement_key_setting_path,
+    get_advertisement_key,
+    get_preferred_adapter,
+    set_advertisement_key,
+    set_firmware_version,
+    set_preferred_adapter,
+)
 from ve_types import VE_UN8
 from victron_ble.devices import detect_device_type  # type: ignore
 from victron_ble.exceptions import AdvertisementKeyMismatchError  # type: ignore
@@ -56,6 +83,28 @@ SMARTSOLAR_PRODUCT_NAMES = {
 # What this driver will actually adopt.  See the module docstring.
 ACCEPTED_PRODUCT_IDS = frozenset({0xA053})
 
+# One writer for the family, one provisioning session in flight at a
+# time — the same shape as the IP22 module.
+_gatt_writer: Optional[AsyncGATTWriter] = None
+_provision_busy = False
+
+
+def _shared_bus() -> dbus.Bus:
+    return (dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ
+            else dbus.SystemBus())
+
+
+def _gatt() -> AsyncGATTWriter:
+    global _gatt_writer
+    if _gatt_writer is None:
+        _gatt_writer = AsyncGATTWriter(_shared_bus())
+    return _gatt_writer
+
+
+def _format_mac_colons(dev_mac: str) -> str:
+    s = dev_mac.replace(":", "").upper()
+    return ":".join(s[i:i + 2] for i in range(0, 12, 2))
+
 
 def is_smartsolar_manufacturer_data(manufacturer_data: bytes) -> bool:
     """Structural gate: product id in the accepted set AND solar mode."""
@@ -72,7 +121,8 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
 
     SETTINGS_NS_PREFIX = "smartsolar"
     PERSISTED_SETTING_SUFFIXES_TO_PATHS: Dict[str, str] = {}
-    _NO_KEY_LOG_INTERVAL_S = 1800.0
+    _PROVISION_BACKOFF_SECS = 180.0
+    _PROVISION_MAX_ATTEMPTS = 5
 
     @staticmethod
     def matches_manufacturer_data(manufacturer_data: bytes) -> bool:
@@ -81,10 +131,19 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
     def __init__(self, dev_mac: str):
         self._adv_key_hex: Optional[str] = None
         self._dbus_settings = DbusSettingsService()
-        self._no_key_logged_at: float = 0.0
+        self._pairing_passkey: int = resolve_pairing_passkey(
+            self._dbus_settings)
+        self._last_provision_attempt: float = 0.0
+        self._provision_attempts: int = 0
+        self._stored_key_invalid = False
+        self._gave_up_logged = False
         self._last_full_telemetry_at: float = 0.0
         self._init_charger_common()
         super().__init__(dev_mac)
+
+    @staticmethod
+    def _gatt_writer() -> AsyncGATTWriter:
+        return _gatt()
 
     def configure(self, manufacturer_data: bytes):
         pid = struct.unpack("<H", manufacturer_data[2:4])[0]
@@ -115,19 +174,11 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
     def handle_manufacturer_data(self, manufacturer_data: bytes):
         if not DbusBleService.get().is_device_enabled(self.info):
             return
-        key = self._adv_key_hex or get_advertisement_key(
-            self._dbus_settings, self.info["dev_mac"])
+        key = self._adv_key_hex or (
+            None if self._stored_key_invalid else get_advertisement_key(
+                self._dbus_settings, self.info["dev_mac"]))
         if not key:
-            # No provisioning path by design: say so once per window.
-            now = time.monotonic()
-            if now - self._no_key_logged_at >= self._NO_KEY_LOG_INTERVAL_S:
-                self._no_key_logged_at = now
-                logger.info(
-                    "%s: no Instant Readout key configured — set "
-                    "/Settings/Devices/smartsolar_%s/AdvertisementKey from "
-                    "VictronConnect (Product info → Instant readout details); "
-                    "this driver never opens a GATT link to fetch it",
-                    self._plog, self.info["dev_mac"])
+            self._maybe_provision_key()
             return
         self._adv_key_hex = key
         if len(manufacturer_data) < 10:
@@ -135,9 +186,11 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
         try:
             parsed = self._decode_advertisement(key, manufacturer_data)
         except AdvertisementKeyMismatchError:
-            logger.warning("%s: advertisement decrypt failed (key mismatch); "
-                           "check the stored AdvertisementKey", self._plog)
+            logger.warning("%s: advertisement decrypt failed (key mismatch) — "
+                           "re-reading VREG 0xEC65", self._plog)
+            self._stored_key_invalid = True
             self._adv_key_hex = None
+            self._maybe_provision_key()
             return
         except ValueError as exc:
             logger.debug("%s: advertisement undecodable: %s", self._plog, exc)
@@ -150,6 +203,104 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
             return
         self._last_full_telemetry_at = time.monotonic()
         self._publish(parsed)
+
+    # ------------------------------------------------------------------
+    # Key provisioning (mirrors ble_device_ip22_charger, bounded)
+    # ------------------------------------------------------------------
+
+    def _maybe_provision_key(self) -> None:
+        global _provision_busy
+        if _provision_busy:
+            return
+        if self._provision_attempts >= self._PROVISION_MAX_ATTEMPTS:
+            if not self._gave_up_logged:
+                self._gave_up_logged = True
+                logger.warning(
+                    "%s: %d key-provisioning sessions failed — giving up "
+                    "until restart; set %s by hand from VictronConnect "
+                    "(Product info → Instant readout details) if this "
+                    "persists", self._plog, self._provision_attempts,
+                    advertisement_key_setting_path(self.info["dev_mac"]))
+            return
+        now = time.monotonic()
+        if (self._last_provision_attempt > 0
+                and now - self._last_provision_attempt
+                < self._PROVISION_BACKOFF_SECS):
+            return
+        self._last_provision_attempt = now
+        self._provision_attempts += 1
+        mac_colon = _format_mac_colons(self.info["dev_mac"])
+        logger.info(
+            "%s: no advertisement key cached — provisioning in-process "
+            "(VREG 0xEC65, attempt %d/%d)", self._plog,
+            self._provision_attempts, self._PROVISION_MAX_ATTEMPTS)
+        _provision_busy = True
+        pref_adapter = get_preferred_adapter(self._dbus_settings,
+                                             self.info["dev_mac"])
+
+        def done(payload):
+            global _provision_busy
+            _provision_busy = False
+            payload = hex_key_session.valid_key_payload(payload)
+            if not payload:
+                logger.warning(
+                    "%s: key provisioning did not produce a 16-byte key "
+                    "(attempt %d/%d); will retry after backoff", self._plog,
+                    self._provision_attempts, self._PROVISION_MAX_ATTEMPTS)
+                return
+            self._provision_attempts = 0
+            self._persist_provisioning_result(payload)
+
+        self._gatt_writer().provision_key(
+            mac_colon, self._pairing_passkey, on_done=done,
+            prefer_adapter=pref_adapter)
+
+    def _persist_provisioning_result(self, payload: Dict[str, Any]) -> None:
+        key_hex = str(payload.get("key") or "").strip().lower()
+        if key_hex:
+            try:
+                set_advertisement_key(self._dbus_settings,
+                                      self.info["dev_mac"], key_hex)
+                self._adv_key_hex = key_hex
+                self._stored_key_invalid = False
+                logger.info("%s: advertisement key stored at %s", self._plog,
+                            advertisement_key_setting_path(self.info["dev_mac"]))
+            except Exception:
+                logger.exception("%s: failed to persist advertisement key",
+                                 self._plog)
+        firmware_raw = payload.get("firmware")
+        if firmware_raw:
+            try:
+                set_firmware_version(self._dbus_settings,
+                                     self.info["dev_mac"], firmware_raw)
+                pretty = format_firmware_version(firmware_raw) or firmware_raw
+                self.info["firmware_version"] = pretty
+                for role_service in self._role_services.values():
+                    try:
+                        self._publish_value(role_service, "/FirmwareVersion",
+                                            pretty)
+                    except Exception:
+                        pass
+            except Exception:
+                logger.exception("%s: failed to persist firmware version",
+                                 self._plog)
+        hw_version = payload.get("hardware_version")
+        if hw_version:
+            self.info["hardware_version"] = hw_version
+            for role_service in self._role_services.values():
+                try:
+                    self._publish_value(role_service, "/HardwareVersion",
+                                        hw_version)
+                except Exception:
+                    pass
+        adapter = payload.get("adapter")
+        if adapter:
+            try:
+                set_preferred_adapter(self._dbus_settings,
+                                      self.info["dev_mac"], adapter)
+            except Exception:
+                logger.exception("%s: failed to store preferred adapter",
+                                 self._plog)
 
     @staticmethod
     def _decode_advertisement(key_hex: str, manufacturer_data: bytes) -> Optional[dict]:
