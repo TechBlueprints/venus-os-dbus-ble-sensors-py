@@ -387,6 +387,6 @@ PIN) and returned a valid advertisement key.
   ticks correctly there.  The Orion-TR's `DcDcConverterData` doesn't
   expose current at all, so its history accumulator sees
   `current_a=None` and only OperationTime advances.  Closing this
-  gap requires GATT-polling a current register on a slow loop — see
-  `sample-driver/research/ORION-TR-INTEGRATED-CHARGER.md` §3 for
-  the design discussion.
+  gap requires GATT-polling a current register on a slow loop; that
+  design is deferred until a read-only HEX register poll is proven
+  safe under the notify-path policy.
