@@ -873,6 +873,36 @@ class DbusBleSensors(object):
         self._save_known_mac_types()
         return True
 
+
+    def _should_silence_mac(self, dev_mac: str, routed: bool) -> bool:
+        """Whether an advertisement nothing could parse should silence *dev_mac*.
+
+        Silencing puts the MAC in ``_tap_ignored_macs``, and the tap then
+        stops delivering it for the life of the process — there is no TTL
+        on that set, unlike ``_ignored_mac``.  That is the right answer for
+        a stranger whose frames no class wants: it is how we stop paying
+        for junk.
+
+        It is the wrong answer for a device we already hold settings for.
+        Those devices are not all single-format: a Victron charger
+        interleaves its Instant Readout record with a second record whose
+        bytes 2-3 are not a product id, so no detector claims it, and the
+        0x02E1 fallback class then fails its own check.  Silencing on that
+        frame throws away the device over a frame we were never going to
+        read, and the Instant Readout frame that WOULD have matched, a
+        second later, is never delivered.
+
+        Prod, 2026-09-03: the SmartSolar was heard at 20:03:01, silenced on
+        one such frame, and stayed dark across two restarts — adoption
+        succeeded only when the first frame happened to be the right type.
+
+        So: strangers still get silenced; configured gear gets the next
+        frame.
+        """
+        if routed:
+            return False
+        return dev_mac not in self._configured_macs
+
     def _process_advertisement(self, dev_mac: str, manufacturer_data: dict[int, bytes],
                                adapter_index: int = 0, rssi: int = 0,
                                address_type: int = 0):
@@ -972,7 +1002,7 @@ class DbusBleSensors(object):
                         logging.info(
                             f"{dev_mac}: manufacturer data check failed for "
                             f"{device_class.__name__}, ignoring")
-                        if not routed:
+                        if self._should_silence_mac(dev_mac, routed):
                             self._ignored_mac[dev_mac] = True
                             self._tap_ignored_macs.add(dev_mac)
                         continue
