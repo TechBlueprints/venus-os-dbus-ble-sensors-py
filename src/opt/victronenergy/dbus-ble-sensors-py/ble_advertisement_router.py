@@ -382,7 +382,16 @@ class BleAdvertisementRouter:
         if not service_name.startswith('com.victronenergy.'):
             return
         try:
-            obj = self._bus.get_object(service_name, '/')
+            # introspect=False: we issue the Introspect below ourselves,
+            # with our own reply/error handlers.  Letting dbus-python do
+            # its automatic one as well buys nothing and costs twice --
+            # a second round-trip per service, and, because the proxy
+            # resolves the well-known name to its unique owner first, an
+            # ERROR from dbus.proxies naming a name nobody can read
+            # ("Introspect error on :1.5524:/ ... NoReply") whenever a
+            # short-lived service goes away before it answers.  Prod
+            # 2026-09-03: 22 of those, describing nothing wrong.
+            obj = self._bus.get_object(service_name, '/', introspect=False)
             intro = dbus.Interface(obj, 'org.freedesktop.DBus.Introspectable')
             intro.Introspect(
                 reply_handler=lambda xml: self._on_introspect_reply(service_name, xml),
@@ -463,7 +472,11 @@ class BleAdvertisementRouter:
                 continue
             child_path = f"{path}/{child_name}".replace('//', '/')
             try:
-                obj = self._bus.get_object(service_name, child_path)
+                # Same again, and it matters more here: this walk builds
+                # one proxy per node, so the automatic introspection
+                # doubles the round-trips of the whole recursive scan.
+                obj = self._bus.get_object(service_name, child_path,
+                                           introspect=False)
                 intro = dbus.Interface(obj, 'org.freedesktop.DBus.Introspectable')
                 child_xml = intro.Introspect()
                 self._parse_registrations(service_name, child_path, child_xml)
