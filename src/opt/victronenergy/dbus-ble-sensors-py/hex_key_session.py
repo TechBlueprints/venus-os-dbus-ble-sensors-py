@@ -528,22 +528,33 @@ async def _fetch_vreg(client, collector: _Collector, register: int,
     Never fatal: a firmware that does not expose a given register should
     not cost us the key we already have.
     """
-    try:
-        request = vreg.encode_read_command(register)
-        collector.reset()
-        _dbg(f"GetValue 0x{register:04X} ({label}): {request.hex()}")
-        await client.write_gatt_char(vreg.CHAR_DATA_LAST, request,
-                                     response=True)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.4)
-            value = vreg.scan_for_vreg(collector.frames, register)
-            if value is not None:
-                _dbg(f"Recovered {label} bytes: {value.hex()}")
-                return value.hex()
-            await _credits(client)
-    except Exception as exc:
-        _err(f"{label} read failed (non-fatal): {exc}")
+    # Both array dialects, for the reason cbor_array documents: a
+    # SmartShunt-class device answers only definite-length arrays and is
+    # silent to the indefinite form.  Sending one dialect made EVERY
+    # register read fail on such a device, not just the key -- the
+    # firmware, product-id and temperature reads here were all returning
+    # None on the SmartSolar MPPT 75/15 for that reason alone.  A probe
+    # with known-good positive controls returned nothing until the
+    # definite form was used, then read 13.64 V and 7.0 A correctly.
+    for definite in (False, True):
+        try:
+            request = vreg.encode_read_command(register, definite=definite)
+            collector.reset()
+            _dbg(f"GetValue 0x{register:04X} ({label})"
+                 f" {'definite' if definite else 'indefinite'}:"
+                 f" {request.hex()}")
+            await client.write_gatt_char(vreg.CHAR_DATA_LAST, request,
+                                         response=True)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.4)
+                value = vreg.scan_for_vreg(collector.frames, register)
+                if value is not None:
+                    _dbg(f"Recovered {label} bytes: {value.hex()}")
+                    return value.hex()
+                await _credits(client)
+        except Exception as exc:
+            _err(f"{label} read failed (non-fatal): {exc}")
     return None
 
 

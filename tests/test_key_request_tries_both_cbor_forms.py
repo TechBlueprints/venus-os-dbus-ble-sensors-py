@@ -45,3 +45,19 @@ def test_key_read_asks_in_both_dialects_indefinite_first() -> None:
         assert order.replace(" ", "") == "False,True", (
             "indefinite must be tried first so working devices are "
             f"unchanged; got ({order})")
+
+
+def test_single_register_reads_also_try_both_dialects() -> None:
+    """_fetch_vreg had the same single-dialect bug as the key read.
+
+    On a device that answers only definite-length arrays this made every
+    register read return None -- firmware, product id and temperature
+    included -- which looks like "firmware does not expose it" and is
+    really "we asked in the wrong dialect".
+    """
+    src = open(os.path.join(SRC, "hex_key_session.py")).read()
+    body = src[src.index("async def _fetch_vreg"):]
+    body = body[:body.index("\nasync def ", 10)] if "\nasync def " in body[10:] else body
+    assert "for definite in (False, True)" in body, (
+        "_fetch_vreg must try both array dialects")
+    assert "definite=definite" in body
