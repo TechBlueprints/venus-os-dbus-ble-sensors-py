@@ -266,7 +266,8 @@ class DbusBleService(object):
     # test_owned_prefixes_match_the_device_classes keeps this list honest.
     OWNED_PREFIXES = ("gobius", "ip22", "microair", "mopeka", "mopeka_std",
                       "orion_tr", "ruuvi", "safiery", "seelevel_btp3",
-                      "seelevel_btp7", "smartshunt", "solarsense", "teltonika")
+                      "seelevel_btp7", "smartshunt", "smartsolar",
+                      "solarsense", "teltonika")
 
     def owned_macs(self) -> set:
         """MACs with settings under one of OUR device prefixes only."""

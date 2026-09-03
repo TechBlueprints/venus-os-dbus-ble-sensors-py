@@ -14,6 +14,10 @@ from ble_device_ip22_charger import (
     BleDeviceIP22Charger,
     is_ip22_charger_manufacturer_data,
 )
+from ble_device_smartsolar import (
+    BleDeviceSmartSolar,
+    is_smartsolar_manufacturer_data,
+)
 from ble_device_smartshunt import (
     BleDeviceSmartShunt,
     is_smartshunt_manufacturer_data,
@@ -913,6 +917,8 @@ class DbusBleSensors(object):
                     device_class = BleDeviceIP22Charger
                 elif man_id == 0x02E1 and is_smartshunt_manufacturer_data(man_data):
                     device_class = BleDeviceSmartShunt
+                elif man_id == 0x02E1 and is_smartsolar_manufacturer_data(man_data):
+                    device_class = BleDeviceSmartSolar
                 else:
                     device_class = BleDevice.DEVICE_CLASSES.get(man_id, None)
                 if device_class is None:

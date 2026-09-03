@@ -124,3 +124,16 @@ GATT_PROBE_RESPONSES = {
     "err_param":       "0900190200ed00f602", # code 2 (param error)
     "err_readonly":    "09001902010103",     # code 3 (read-only) for 0x0201
 }
+
+
+# --- SmartSolar, captured passively on prod hci9, 2026-09-03 ------------
+# Manufacturer 0x02E1 payloads, hex.  Byte layout: [0]=0x10 record,
+# [2:4]=product id LE, [4]=mode (0x01 = solar charger), rest encrypted.
+SMARTSOLAR_PORTABLE_MAC = "C1:20:D5:4F:71:25"          # "SmartSolar Portable", HQ2218CTMGD
+SMARTSOLAR_PORTABLE_HEX = "100253a0019c045f80326a2bd1055bc3cc97e931"   # pid 0xA053, MPPT 75/15
+# The two HARDWIRED VE.Direct MPPT 100/50s ("Exterior", "Rooftop Solar").
+# They advertise too, and must never be adopted by the SmartSolar class.
+SMARTSOLAR_HARDWIRED_100_50_HEX = (
+    "100257a001955ebc4d9ac8eafb9f76ed23a17df5",   # FF:64:B4:CD:89:F4 "Exterior"
+    "100257a001f493a5e6d4c81efb6d453e6c529bfa",   # F0:9D:2E:E9:A9:11 "Rooftop Solar"
+)
