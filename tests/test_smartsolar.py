@@ -124,6 +124,7 @@ class _Writer:
     def __init__(self): self.calls = []
     def provision_key(self, mac, passkey, on_done, prefer_adapter=None, timeout_s=60.0):
         self.calls.append((mac, passkey, prefer_adapter)); self.on_done = on_done
+        self.timeout_s = timeout_s
 
 
 def _device(ss, monkeypatch, enabled=True):
@@ -153,6 +154,9 @@ def test_no_key_starts_one_provisioning_session_not_one_per_frame(ss, monkeypatc
         for _ in range(3):
             dev.handle_manufacturer_data(bytes.fromhex(SMARTSOLAR_PORTABLE_HEX))
     assert w.calls == [("C1:20:D5:4F:71:25", 123456, "AA:BB:CC:DD:EE:01")]
+    # The shared 60 s default cannot finish this model's session: prod tore
+    # the link down at 61.7 s with PIN accepted at ~50 s and 0xEC65 unread.
+    assert w.timeout_s >= 100, "provisioning must outlast the slow fast-path probe"
     assert sum("provisioning" in r.message for r in caplog.records) == 1
     # A valid payload is persisted key + adapter + firmware, and the key is live.
     w.on_done({"key": "0F" * 16, "adapter": "AA:BB:CC:DD:EE:01", "firmware": "0159"})

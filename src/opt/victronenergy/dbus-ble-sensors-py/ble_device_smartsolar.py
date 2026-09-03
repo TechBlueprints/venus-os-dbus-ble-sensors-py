@@ -140,6 +140,16 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
     _PROVISION_BACKOFF_SECS = 180.0
     _PROVISION_MAX_ATTEMPTS = 5
 
+    # The shared default is 60 s, which this model cannot finish in.  It
+    # does not answer the per-instance 0x05 / fast 0x25 key path at all,
+    # so ~46 s is spent there before the session falls back to PUK+PIN;
+    # prod measured "PIN accepted" at ~50 s in, with the link torn down
+    # at 61.7 s having never read 0xEC65.  Every auth step succeeds --
+    # this is a budget problem, not a protocol one.  Provisioning runs
+    # once per device, so the longer hold on the writer's single slot is
+    # paid once.
+    _PROVISION_TIMEOUT_S = 120.0
+
     @staticmethod
     def matches_manufacturer_data(manufacturer_data: bytes) -> bool:
         return is_smartsolar_manufacturer_data(manufacturer_data)
@@ -269,7 +279,8 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
 
         self._gatt_writer().provision_key(
             mac_colon, self._pairing_passkey, on_done=done,
-            prefer_adapter=pref_adapter)
+            prefer_adapter=pref_adapter,
+            timeout_s=self._PROVISION_TIMEOUT_S)
 
     def _persist_provisioning_result(self, payload: Dict[str, Any]) -> None:
         key_hex = str(payload.get("key") or "").strip().lower()
