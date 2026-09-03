@@ -127,15 +127,20 @@ class _Collector:
         # logged only: the handshake is driven explicitly below, and
         # reacting here would race our own writes.
         #
-        # F7 is the exception, and calling it an "error" here cost us a
-        # device.  It is flow control: the peer is asking for a specific
-        # number of credits before it will send the next chunk.  The
-        # SmartShunt taught us this (see smartshunt_hex.on_ctrl) --
-        # answer it with exactly that many and the register Push
-        # arrives; ignore it and blindly re-write a fixed window, and it
-        # never does.  The SmartSolar MPPT 75/15 sends F7 and then
-        # withholds 0xEC65 forever, which our own message described as
-        # "F7 / no EC65 push" while treating the F7 as the failure.
+        # F7 is the exception.  It is flow control: the peer asks for a
+        # specific number of credits before it will send the next chunk.
+        # smartshunt_hex.on_ctrl answers with exactly that many and its
+        # register Pushes arrive, so mirroring that here is the known-good
+        # behaviour and costs nothing for a peer that never sends F7.
+        #
+        # Do NOT read this as the explanation for the SmartSolar MPPT
+        # 75/15's silent 0xEC65.  The message that suggested it,
+        # "(F7 / no EC65 push)", is a static label on the else-branch of
+        # an encryption-refused check further down -- it means "not
+        # encryption-refused", NOT "an F7 arrived".  Answering F7
+        # properly did not change that device's behaviour; whether it
+        # sends F7 at all is still unmeasured (on_ctrl only logs at
+        # DEBUG).
         raw = bytes(data)
         if raw:
             _dbg(f"[CTRL-RX] {len(raw)}B: {raw.hex()}")
