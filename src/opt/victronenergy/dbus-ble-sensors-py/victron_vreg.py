@@ -106,10 +106,20 @@ def cbor_bstr(data: bytes) -> bytes:
     return bytes([0x58, n]) + data
 
 
-def encode_write_command(register_id: int, value_bytes: bytes) -> bytes:
-    """CBOR for "write *value_bytes* to *register_id*"."""
+def encode_write_command(register_id: int, value_bytes: bytes,
+                         definite: bool = False) -> bytes:
+    """CBOR for "write *value_bytes* to *register_id*".
+
+    Carries the same dialect split the reads do -- see :func:`cbor_array`.
+    A device that only answers definite-length arrays will ignore a write
+    sent in the indefinite form exactly as it ignores a read, and a write
+    that is ignored is far more dangerous than a read that is: the caller
+    believes a setpoint was applied when nothing was.  Default stays
+    indefinite so the IP22 and Orion write paths are untouched.
+    """
     return (cbor_uint(6) + cbor_uint(0)
-            + cbor_array([cbor_uint(register_id), cbor_bstr(value_bytes)]))
+            + cbor_array([cbor_uint(register_id), cbor_bstr(value_bytes)],
+                         definite=definite))
 
 
 def encode_get_devices() -> bytes:

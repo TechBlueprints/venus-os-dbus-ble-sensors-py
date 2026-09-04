@@ -61,3 +61,21 @@ def test_single_register_reads_also_try_both_dialects() -> None:
     assert "for definite in (False, True)" in body, (
         "_fetch_vreg must try both array dialects")
     assert "definite=definite" in body
+
+
+def test_write_command_can_be_sent_in_either_dialect() -> None:
+    """A write ignored for dialect reasons is worse than a read ignored.
+
+    An ignored read returns None and the caller knows it failed.  An
+    ignored write looks like success, so a caller can believe it applied
+    a charge-voltage setpoint that the device never accepted.
+    """
+    import sys
+    if SRC not in sys.path:
+        sys.path.insert(0, SRC)
+    import victron_vreg as v
+    indef = v.encode_write_command(0x2001, b"\x91\x05")
+    defin = v.encode_write_command(0x2001, b"\x91\x05", definite=True)
+    assert indef == bytes.fromhex("06009f192001429105ff"), indef.hex()
+    assert defin == bytes.fromhex("0600821920014291 05".replace(" ", "")), defin.hex()
+    assert indef != defin
