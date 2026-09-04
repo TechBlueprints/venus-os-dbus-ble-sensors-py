@@ -140,14 +140,22 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
     _PROVISION_BACKOFF_SECS = 180.0
     _PROVISION_MAX_ATTEMPTS = 5
 
-    # The shared default is 60 s, which this model cannot finish in.  It
-    # does not answer the per-instance 0x05 / fast 0x25 key path at all,
-    # so ~46 s is spent there before the session falls back to PUK+PIN;
-    # prod measured "PIN accepted" at ~50 s in, with the link torn down
-    # at 61.7 s having never read 0xEC65.  Every auth step succeeds --
-    # this is a budget problem, not a protocol one.  Provisioning runs
-    # once per device, so the longer hold on the writer's single slot is
-    # paid once.
+    # Headroom over the shared 60 s default.
+    #
+    # The comment that used to sit here said the 60 s budget was the
+    # reason this model never returned 0xEC65, and that was wrong: the
+    # real cause was that the key was requested only as an
+    # indefinite-length CBOR array, which this device does not answer at
+    # all (see victron_vreg.cbor_array).  Raising the budget to 120 s
+    # changed nothing on its own; asking in the definite dialect
+    # recovered the key on the first attempt.
+    #
+    # The larger value stays because the session legitimately needs it --
+    # this model spends ~46 s on the fast key path before falling back to
+    # PUK+PIN, and "PIN accepted" landed ~50 s in, leaving almost nothing
+    # of a 60 s window for the read that follows.  Provisioning runs once
+    # per device, so the longer hold on the writer's single slot is paid
+    # once.
     _PROVISION_TIMEOUT_S = 120.0
 
     @staticmethod
