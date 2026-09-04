@@ -314,6 +314,28 @@ class _PairingAgent(dbus.service.Object):
         logger.info("Pairing agent: providing passkey for %s", device)
         return dbus.UInt32(self._passkey)
 
+    @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        """The string form of the same secret.
+
+        BlueZ asks for a passkey (a uint32) or a PIN code (a string)
+        depending on the pairing method the peer negotiates, and it is
+        the peer that decides.  Implementing only RequestPasskey means a
+        device that asks for the string form gets no answer at all from
+        our agent, and the pairing fails as
+        org.bluez.Error.AuthenticationFailed -- which reads exactly like
+        a wrong secret and is really a missing method.
+
+        Zero-padded to six digits, because as a STRING the leading zero
+        is part of the secret: a PIN shown as 014916 is "014916", not
+        "14916".  As a uint32 the padding is meaningless, which is why
+        the same value works through RequestPasskey and would silently
+        differ here.
+        """
+        pin = "%06d" % self._passkey
+        logger.info("Pairing agent: providing PIN code for %s", device)
+        return dbus.String(pin)
+
     @dbus.service.method(AGENT_INTERFACE, in_signature="ou", out_signature="")
     def RequestConfirmation(self, device, passkey):
         pass
