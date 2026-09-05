@@ -1402,6 +1402,13 @@ class DbusBleSensors(object):
         for key in list(self._adapters):
             self._start_passive_scan(key)
 
+        # Restart the silence clock from here.  The throttled stretch was
+        # our own doing, so counting it as "no advertisements received"
+        # would fire the watchdog immediately on release, before the tap
+        # has had any chance to deliver one.
+        self._last_tap_rx = time.monotonic()
+        self._silence_warned = False
+
         if self._throttle_notification is not None:
             try:
                 self._throttle_notification.dismiss()
@@ -1521,17 +1528,33 @@ class DbusBleSensors(object):
                 if key not in self._scan_enabled_adapters:
                     self._start_passive_scan(key)
 
-        # Silence detection: force a scan re-enable if no ads for 5 min
-        if self._last_tap_rx > 0 and now - self._last_tap_rx > SILENCE_WARNING_SECONDS:
-            if not self._silence_warned:
-                logging.warning(
-                    f"No matching advertisements received for "
-                    f"{int(now - self._last_tap_rx)}s — re-enabling passive scan")
-                # Drop our cached "scan is enabled" markers so the
-                # next _prune_tick / _scan_reenable_tick re-issues the
-                # HCI commands.
-                self._scan_enabled_adapters.clear()
-                self._silence_warned = True
+            # Silence detection: force a scan re-enable if no ads for 5 min.
+            #
+            # Inside the throttle guard, because while throttled the
+            # silence is OURS: the throttle tore the tap down and
+            # disabled scanning on purpose.  Warning about it reports a
+            # deliberate action as a fault, and the message claims to
+            # re-enable scanning when it cannot — every re-enable path
+            # is itself gated on _throttled, so nothing happens until
+            # release.  Prod 2026-09-05: the throttle tripped at
+            # 15:22:50Z and this warned at 15:28:20Z about 329 s of
+            # silence it had caused, and a reader outside this service
+            # took those lines for process restarts.
+            #
+            # Nothing is lost by skipping it: _release_throttle restarts
+            # the tap and re-enables every adapter itself.
+            if (self._last_tap_rx > 0
+                    and now - self._last_tap_rx > SILENCE_WARNING_SECONDS):
+                if not self._silence_warned:
+                    logging.warning(
+                        f"No matching advertisements received for "
+                        f"{int(now - self._last_tap_rx)}s — re-enabling "
+                        f"passive scan")
+                    # Drop our cached "scan is enabled" markers so the
+                    # next _prune_tick / _scan_reenable_tick re-issues the
+                    # HCI commands.
+                    self._scan_enabled_adapters.clear()
+                    self._silence_warned = True
 
         return True
 
