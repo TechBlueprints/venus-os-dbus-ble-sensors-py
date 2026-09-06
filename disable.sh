@@ -57,10 +57,19 @@ fi
 BT_CONFIG="/lib/udev/bt-config"
 BT_REMOVE="/lib/udev/bt-remove"
 
-if [ -f "$BT_CONFIG" ] && grep -q "dbus-ble-sensors-py" "$BT_CONFIG"; then
-    /opt/victronenergy/swupdate-scripts/remount-rw.sh 2>/dev/null || true
-    sed -i 's|/service/dbus-ble-sensors-py |/service/dbus-ble-sensors |g' "$BT_CONFIG"
-    echo "  bt-config restored"
+if [ -f "$BT_CONFIG" ]; then
+    if grep -q "/service/dbus-ble-sensors-py " "$BT_CONFIG"; then
+        # older install that renamed the stock token into ours: rename back
+        /opt/victronenergy/swupdate-scripts/remount-rw.sh 2>/dev/null || true
+        sed -i 's|/service/dbus-ble-sensors-py |/service/dbus-ble-sensors |g' "$BT_CONFIG"
+        echo "  bt-config restored"
+    elif ! grep -q "/service/dbus-ble-sensors " "$BT_CONFIG"; then
+        # current install DROPS our token, so there is nothing to rename;
+        # put the stock entry back so stock Venus can start its own service
+        /opt/victronenergy/swupdate-scripts/remount-rw.sh 2>/dev/null || true
+        sed -i -E 's#(services="[^"]*)"#\1 /service/dbus-ble-sensors"#' "$BT_CONFIG"
+        echo "  bt-config: stock service re-added to the hotplug restart list"
+    fi
 fi
 
 if [ -f "$BT_REMOVE" ] && grep -q "dbus-ble-sensors-py" "$BT_REMOVE"; then
