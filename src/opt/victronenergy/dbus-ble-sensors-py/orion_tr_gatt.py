@@ -112,7 +112,7 @@ async def _start_notify(client, char, callback, acquired=None) -> None:
     """Subscribe, recording the characteristic for teardown.
 
     The notify path is decided by fleet policy, not here: the shared BLE
-    stack forces StartNotify (``conf.FORCE_START_NOTIFY`` passed at
+    stack forces StartNotify (``conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY`` passed at
     ``/data/bcm`` shim) and rewrites an AcquireNotify request at the
     wrapper, with a warning.  This module used to ask for the fd-based
     path because StartNotify once delivered empty payloads for these
