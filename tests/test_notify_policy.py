@@ -58,5 +58,5 @@ def test_install_passes_the_consumer_side_policy() -> None:
     retired shim's BCM_FORCE_START_NOTIFY env export."""
     code = re.sub(r'"""[\s\S]*?"""', "", _src("ble_catcher.py"))
     code = re.sub(r"#.*", "", code)
-    assert "force_start_notify=conf.FORCE_START_NOTIFY" in code, (
-        "the catcher must pass conf.FORCE_START_NOTIFY explicitly")
+    assert "force_start_notify" in code and "inspect.signature" in code, (
+        "policy is passed explicitly, guarded by the install signature")

@@ -60,29 +60,18 @@ def _source_shared_stack() -> str:
     Idempotent.  Runs ``ble_stack.ensure_ble_stack`` with our own config
     key and no vendored fallback (this repo carries no ext/ble copy of
     the stack -- the shared install or plain bleak, nothing between).
-    The three log strings are part of the fleet contract; the monitor
-    greps for them.  See bleak-connection-manager/CONSUMER_MIGRATION.md.
     """
     global _sourced
     if _sourced is not None:
         return _sourced
-    shared_dir = conf.BLUETOOTH_CONNECTION_MANAGER_DIR
-    state = ble_stack.ensure_ble_stack(shared_dir, vendored_dir=None)
-    if state == "shared":
-        _logger.info("BLE coordination: bleak_connection_manager loaded "
-                     "from %s", shared_dir)
-    elif state == "provided":
-        _logger.debug("BLE coordination: bleak_connection_manager already "
-                      "provided; inserted nothing")
-    elif ble_stack.shared_failure is not None:
-        _logger.error("BLE coordination: shared install at %s is present "
-                      "but unusable: %s", shared_dir,
-                      ble_stack.shared_failure)
-    else:
-        _logger.warning("BLE coordination: no shared install at %s",
-                        shared_dir)
-    _sourced = state
-    return state
+    # No logging here: the coordination status is logged by
+    # ble_catcher.install(), which is the point the contract's "BLE
+    # coordination:" strings attach to.  This call runs regardless of the
+    # enable flag -- importing bleak_connection_manager is what stands the
+    # sitewide autowire down for this process (CONSUMER_MIGRATION.md rule 4).
+    _sourced = ble_stack.ensure_ble_stack(
+        conf.BLUETOOTH_CONNECTION_MANAGER_DIR, vendored_dir=None)
+    return _sourced
 
 
 

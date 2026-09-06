@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import re
 import sys
 
 import pytest
@@ -75,46 +76,42 @@ def test_absent_shared_dir_returns_vendored_without_failure(ble_stack, tmp_path)
     assert state == "vendored" and ble_stack.shared_failure is None
 
 
-def test_coordination_log_strings_are_verbatim(caplog) -> None:
-    """The three strings the monitor greps for, per state."""
-    saved = dict(sys.modules)
-    try:
-        fake = _load("ble_stack")
-        c = type(sys)("conf")
-        c.BLUETOOTH_CONNECTION_MANAGER_DIR = "/data/bcm"
-        c.FORCE_START_NOTIFY = True
-        sys.modules["conf"] = c
-        sys.modules["ble_stack"] = fake
-        bep = _load("ble_ext_path")
-        _body(bep, fake, caplog)
-    finally:
-        for k in [k for k in sys.modules if k not in saved]:
-            del sys.modules[k]
-        sys.modules.update(saved)
+def test_all_five_coordination_strings_are_verbatim_in_the_catcher() -> None:
+    """The monitor greps these across the fleet; a refactor must not drift them.
+
+    They live in ble_catcher (INFO on install, WARNING/ERROR when the
+    catcher does not install, WARNING when the install predates the
+    force_start_notify parameter).  Checked as source substrings so the
+    wording, not just the behaviour, is pinned.
+    """
+    raw = open(os.path.join(SRC, "ble_catcher.py")).read()
+    # Collapse Python implicit string concatenation ("a" \n "b" -> "ab") so a
+    # log string wrapped across source lines still matches verbatim.
+    src = re.sub(r'"\s*\n\s*"', "", raw)
+    assert "BLE coordination: bleak_connection_manager loaded from %s" in src
+    assert ("BLE coordination: no shared install at %s; running uncoordinated, "
+            "no claims, no adapter routing, no card recovery") in src
+    assert ("BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
+            "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated, "
+            "no claims, no adapter routing, no card recovery") in src
+    assert ("BLE coordination: shared install at %s is present but unusable, "
+            "running uncoordinated: %s") in src
+    assert ("BLE coordination: shared install at %s predates the "
+            "force_start_notify parameter; StartNotify policy passed "
+            "through the legacy BCM_FORCE_START_NOTIFY environment") in src
 
 
-def _body(bep, fake, caplog):
-    def run(state, failure=None):
-        fake.shared_failure = failure
-        bep._sourced = None
-        bep.ble_stack = type(sys)("s")
-        bep.ble_stack.ensure_ble_stack = lambda *a, **k: state
-        bep.ble_stack.shared_failure = failure
-        caplog.clear()
-        with caplog.at_level(logging.DEBUG):
-            bep._source_shared_stack()
-        return caplog.text
-
-    assert "BLE coordination: bleak_connection_manager loaded from /data/bcm" in run("shared")
-    assert "BLE coordination: no shared install at /data/bcm" in run("vendored", None)
-    assert ("BLE coordination: shared install at /data/bcm is present but unusable: boom"
-            in run("vendored", "boom"))
-
-
-def test_catcher_passes_force_start_notify_and_run_script_is_plain() -> None:
+def test_catcher_is_enable_gated_and_signature_guards_the_policy() -> None:
     catcher = open(os.path.join(SRC, "ble_catcher.py")).read()
-    assert "force_start_notify=conf.FORCE_START_NOTIFY" in catcher, (
-        "StartNotify policy must be passed at install_bleak_catcher, not via env")
+    assert "if not conf.BLUETOOTH_CONNECTION_MANAGER:" in catcher, (
+        "manager-off must skip the catcher (rule 6)")
+    assert "inspect.signature(install_bleak_catcher)" in catcher, (
+        "the policy pass must be guarded by the install's signature")
+    assert 'policy["force_start_notify"]' in catcher
+    assert "conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY" in catcher
+
+
+def test_run_script_is_a_plain_interpreter() -> None:
     run = open(os.path.join(SRC, "start-dbus-ble-sensors-py.sh")).read()
     assert "/data/bcm/python3" not in run, "the shim exec must be gone"
     assert "exec python3 " in run, "run script must exec a plain interpreter"
@@ -122,5 +119,6 @@ def test_catcher_passes_force_start_notify_and_run_script_is_plain() -> None:
 
 def test_config_keys_exist_with_the_contract_defaults() -> None:
     conf = _load("conf")
+    assert conf.BLUETOOTH_CONNECTION_MANAGER is True
     assert conf.BLUETOOTH_CONNECTION_MANAGER_DIR == "/data/bcm"
-    assert conf.FORCE_START_NOTIFY is True
+    assert conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY is True
