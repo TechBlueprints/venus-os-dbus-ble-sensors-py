@@ -246,6 +246,8 @@ class DbusBleSensors(object):
             logging.exception("could not load configured devices; "
                               "treating all as new")
 
+        self._dbus_ble_service.register_enabled_changed_callback(
+            self._refresh_tap_disabled)
         self._dbus_ble_service.register_continuous_scan_callback(
             self._on_continuous_scan_changed)
         # Passive vs active scanning re-applies through the same path:
@@ -307,6 +309,18 @@ class DbusBleSensors(object):
         self._last_mfg_data: dict[str, tuple[bytes, float]] = {}
         self._tap_seen_macs: dict[str, float] = {}
         self._tap_ignored_macs: set[str] = set()
+        # MACs of devices we hold settings for but whose every role is
+        # disabled.  The tap thread keeps writing their presence (so the
+        # known-device TTL still refreshes and they stay in the GUI) but
+        # does not hand their frames to the main loop, where the enabled
+        # check would only throw them away.  Measured on prod 2026-09-06:
+        # 51 % of all accepted advertisements -- 25.8 of 50.9 per second,
+        # 23.9 of them from two disabled SmartShunts -- crossed threads,
+        # were dispatched, and were dropped.  This is NOT _tap_ignored_macs:
+        # an ignored MAC never reaches the presence map, so a disabled
+        # device would expire and vanish from the GUI and its settings.
+        # Maintained by _refresh_tap_disabled; reconciled in _prune_tick.
+        self._tap_disabled_macs: set[str] = set()
         self._last_tap_rx: float = 0.0
         self._silence_warned: bool = False
         self._tap_thread: threading.Thread | None = None
@@ -1010,6 +1024,7 @@ class DbusBleSensors(object):
                     dev_instance.init()
                     self._known_mac[dev_mac] = dev_instance
                     self._configured_macs.add(dev_mac)
+                    self._refresh_tap_disabled(dev_instance)
                     # Newly-configured device — remember its BLE
                     # address type so we can put it in the controller's
                     # accept list when ``Continuous scanning`` is OFF.
@@ -1191,6 +1206,7 @@ class DbusBleSensors(object):
         known_mfg_ids = self._known_mfg_ids
         last_mfg_data = self._last_mfg_data
         tap_seen = self._tap_seen_macs
+        tap_disabled = self._tap_disabled_macs
 
         def _on_advertisement(adv: TappedAdvertisement):
             if not adv.manufacturer_data and not adv.local_name:
@@ -1207,6 +1223,11 @@ class DbusBleSensors(object):
                         >= NAME_ADV_MIN_INTERVAL:
                     self._last_name_adv[mac] = now
                     GLib.idle_add(self._glib_process_name_tap, adv)
+            # Presence is recorded above; that is all a fully-disabled
+            # device needs from us.  Do not cross to the main loop for a
+            # frame the enabled check there would discard.
+            if mac in tap_disabled:
+                return
             for mfg_id in adv.manufacturer_data:
                 raw = adv.manufacturer_data[mfg_id]
                 prev = last_mfg_data.get(mac)
@@ -1450,6 +1471,30 @@ class DbusBleSensors(object):
         if to_unsuppress:
             logging.info("Unsuppressed %d MAC(s) due to new MAC registrations", len(to_unsuppress))
 
+    def _refresh_tap_disabled(self, dev_instance) -> None:
+        """Keep ``_tap_disabled_macs`` in step with a device's enabled state.
+
+        Called at adoption and on every role Enabled flip (GLib thread).
+        A device counts as disabled only when NO role is enabled.
+        """
+        info = getattr(dev_instance, "info", None) or {}
+        mac = info.get("dev_mac")
+        if not mac:
+            return   # name-identified devices are keyed by identity, not MAC
+        try:
+            enabled = self._dbus_ble_service.is_device_enabled(info)
+        except Exception:
+            logging.exception("%s: could not read enabled state; forwarding", mac)
+            enabled = True
+        if enabled:
+            if mac in self._tap_disabled_macs:
+                self._tap_disabled_macs.discard(mac)
+                logging.info(f"{mac}: enabled — advertisements forwarded again")
+        elif mac not in self._tap_disabled_macs:
+            self._tap_disabled_macs.add(mac)
+            logging.info(f"{mac}: all roles disabled — presence tracked, "
+                         f"advertisements no longer forwarded to the main loop")
+
     def _prune_tick(self):
         """GLib timer callback — prune caches, check tap health."""
         # Refresh TTLs for devices the tap thread has seen since last tick,
@@ -1483,6 +1528,11 @@ class DbusBleSensors(object):
 
         self._known_mac.prune()
         self._ignored_mac.prune()
+        # A disabled device that fell silent past its TTL has just been
+        # evicted above.  Its MAC must leave the disabled set too, or its
+        # first frame on return would be skipped at the tap and it could
+        # never be re-adopted.  keys() does not refresh TTLs.
+        self._tap_disabled_macs.intersection_update(self._known_mac.keys())
 
         # Sync tap-level MAC filter: remove entries that expired from
         # _ignored_mac or were promoted to _known_mac.

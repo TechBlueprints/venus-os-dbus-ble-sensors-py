@@ -57,6 +57,11 @@ class DbusBleService(object):
         # to re-apply scan filter policy immediately on GUI toggle
         # rather than waiting for the 60 s polling tick.
         self._continuous_scan_callbacks: list = []
+        # Fired on the GLib thread whenever any role's Enabled flips.
+        # Receives the BleDevice, not the flag: a multi-role device is
+        # "enabled" if ANY role is, so listeners recompute rather than
+        # trust the one role that changed.  See notify_device_enabled_changed.
+        self._enabled_changed_callbacks: list = []
         # Same chain for /Settings/BleSensors/ActiveScan — see
         # init_active_scan for what the toggle actually costs.
         self._active_scan_callbacks: list = []
@@ -361,6 +366,25 @@ class DbusBleService(object):
 
     def get_continuous_scan(self) -> bool:
         return bool(self._dbus_ble_service['/ContinuousScan'])
+
+    def register_enabled_changed_callback(self, callback) -> None:
+        """Register *callback(ble_device)* for any role's Enabled flip.
+
+        Same contract as :meth:`register_continuous_scan_callback`: GLib
+        main thread, callbacks accumulate, one failing does not stop the
+        rest.  The device is passed rather than the new value because
+        enabledness is per DEVICE (any role on) while the flip is per
+        role; the listener should recompute with :meth:`is_device_enabled`.
+        """
+        self._enabled_changed_callbacks.append(callback)
+
+    def notify_device_enabled_changed(self, ble_device) -> None:
+        """Fan an Enabled flip out to the registered listeners."""
+        for cb in list(self._enabled_changed_callbacks):
+            try:
+                cb(ble_device)
+            except Exception:
+                logging.exception("enabled-changed callback failed")
 
     def register_continuous_scan_callback(self, callback) -> None:
         """Register *callback* to be invoked whenever
