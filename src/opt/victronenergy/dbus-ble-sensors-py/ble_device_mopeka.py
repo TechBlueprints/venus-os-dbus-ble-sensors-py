@@ -183,6 +183,7 @@ class BleDeviceMopeka(BleDevice):
                     'offset': 3,
                     'bits': 14,
                     'roles': ['tank'],
+                    'sensor_type': 'distance',   # cm; rounded to 0.1 cm
                     # .format	= &veUnitcm,
                 },
                 {
