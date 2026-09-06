@@ -62,7 +62,7 @@ warning.  This dodges the BlueZ 5.72 AcquireNotify UAF.  An install older
 than 159536a lacks the parameter and takes the policy through the legacy
 ``BCM_FORCE_START_NOTIFY`` environment instead.  The shim that used to
 export it is retired.  See ``hex_key_session._start_notify`` for the
-history and the open question, and CONSUMER_MIGRATION.md for the contract.
+history and the open question, and CONSUMERS.md for the contract.
 
 This is *not* ``adapter-allowlist.conf``.  That file reserves adapters away
 from the advertisement scanner; this one bounds where GATT links may be
@@ -162,7 +162,7 @@ def link_adapter_names() -> set[str]:
 def _log_uncoordinated() -> None:
     """The WARNING/ERROR the monitor greps when the catcher did not install.
 
-    Verbatim per CONSUMER_MIGRATION.md rule 6: "no shared install"
+    Verbatim per CONSUMERS.md rule 6: "no shared install"
     (normal on a box without one), "DIR empty" (misconfiguration), and
     "present but unusable" (a fault) are different operator actions.
     """
@@ -201,7 +201,7 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
     # Manager deliberately off: the shared stack was still sourced early
     # (ble_ext_path, which stands the sitewide autowire down), but install
     # no catcher and emit no "loaded from" line -- that line would read as
-    # coordination-active for a process that has none.  CONSUMER_MIGRATION.md
+    # coordination-active for a process that has none.  CONSUMERS.md
     # rule 6.
     if not conf.BLUETOOTH_CONNECTION_MANAGER:
         return False
@@ -224,7 +224,7 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
 
     # StartNotify policy is passed when the shared install understands it;
     # an install older than 159536a lacks the parameter, and takes the
-    # policy through the legacy environment instead.  CONSUMER_MIGRATION.md.
+    # policy through the legacy environment instead.  CONSUMERS.md.
     policy = {}
     params = inspect.signature(install_bleak_catcher).parameters
     if ("force_start_notify" in params

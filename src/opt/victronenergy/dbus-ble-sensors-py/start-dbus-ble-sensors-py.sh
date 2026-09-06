@@ -53,5 +53,5 @@ export PYTHONFAULTHANDLER=1
 # in-process by ble_stack.ensure_ble_stack (config key
 # BLUETOOTH_CONNECTION_MANAGER_DIR), not by a launcher shim — so where
 # the stack comes from no longer depends on how we were started.  See
-# bleak-connection-manager/CONSUMER_MIGRATION.md.
+# bleak-connection-manager/CONSUMERS.md.
 exec python3 "$SCRIPT_DIR/dbus_ble_sensors.py"

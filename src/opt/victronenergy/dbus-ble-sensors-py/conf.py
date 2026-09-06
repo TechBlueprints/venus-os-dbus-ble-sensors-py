@@ -13,7 +13,7 @@ ORION_OPTIONAL_INI = "/data/conf/dbus-ble-sensors-py-orion.ini"
 
 # --- shared BLE connection-manager: three consumer-side keys (fleet ----
 # contract, names shared with the other consumers).  See
-# bleak-connection-manager/CONSUMER_MIGRATION.md §2.  There is no shared
+# bleak-connection-manager/CONSUMERS.md §2.  There is no shared
 # config file: each consumer configures its own.
 def _envbool(name: str, default: bool) -> bool:
     v = os.environ.get(name)

@@ -1622,7 +1622,7 @@ def main():
     log_filters.install(args.debug)
 
     # Source the shared BLE stack in-process before anything imports bleak
-    # (CONSUMER_MIGRATION.md rule 5), then install the catcher so the
+    # (CONSUMERS.md rule 5), then install the catcher so the
     # "BLE coordination:" status line lands in the service's first log
     # lines (contract §4).  Both idempotent; the lazy GATT gates re-call
     # them harmlessly.

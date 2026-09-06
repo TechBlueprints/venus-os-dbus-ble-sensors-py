@@ -68,7 +68,7 @@ def _source_shared_stack() -> str:
     # ble_catcher.install(), which is the point the contract's "BLE
     # coordination:" strings attach to.  This call runs regardless of the
     # enable flag -- importing bleak_connection_manager is what stands the
-    # sitewide autowire down for this process (CONSUMER_MIGRATION.md rule 4).
+    # sitewide autowire down for this process (CONSUMERS.md rule 4).
     _sourced = ble_stack.ensure_ble_stack(
         conf.BLUETOOTH_CONNECTION_MANAGER_DIR, vendored_dir=None)
     return _sourced

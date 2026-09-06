@@ -1,4 +1,4 @@
-"""sensors-py meets the BCM consumer contract (CONSUMER_MIGRATION.md section 2).
+"""sensors-py meets the BCM consumer contract (CONSUMERS.md section 2).
 
 The shared bleak-connection-manager install is sourced IN-PROCESS by
 ble_stack.ensure_ble_stack, keyed on our own config value, with no
