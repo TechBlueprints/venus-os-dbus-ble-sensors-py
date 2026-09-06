@@ -292,10 +292,22 @@ svc -d .' "$STOCK_START"
         echo "  Stock service not found (may not be installed)"
     fi
 
-    if [ -f "$BT_CONFIG" ] && grep -q "/service/dbus-ble-sensors " "$BT_CONFIG"; then
+    # bt-config runs on EVERY udev "bluetooth host add" and ends by
+    # restarting the services in its list -- so any card re-enumerating
+    # restarted us, blinking the tap and every registered D-Bus service.
+    # We handle the adapter lifecycle ourselves from BlueZ signals
+    # (_on_interfaces_added / _on_interfaces_removed, plus the 60 s
+    # re-apply), so that restart is pure loss.  Remove our token from the
+    # restart line instead of renaming the stock one into it; the regex
+    # also matches the stock token, which a firmware update puts back
+    # before rc.local re-runs this installer.  Idempotent.  The per-card
+    # radio setup above that line (public-addr, le on, bredr off) is
+    # shared infrastructure for every BLE consumer on the box and is left
+    # exactly as it is.
+    if [ -f "$BT_CONFIG" ] && grep -qE '/service/dbus-ble-sensors(-py)? ' "$BT_CONFIG"; then
         /opt/victronenergy/swupdate-scripts/remount-rw.sh 2>/dev/null || true
-        sed -i 's|/service/dbus-ble-sensors |/service/dbus-ble-sensors-py |g' "$BT_CONFIG"
-        echo "  bt-config patched"
+        sed -i -E 's#(/service/dbus-ble-sensors(-py)? )##g' "$BT_CONFIG"
+        echo "  bt-config: removed our service from the hotplug restart list"
     fi
 
     if [ -f "$BT_REMOVE" ] && ! grep -q "dbus-ble-sensors-py" "$BT_REMOVE"; then
