@@ -194,6 +194,117 @@ async def _credits(client, n: int = 0x80) -> None:
         pass
 
 
+async def _perform_instance_read(address: str, path: Optional[str],
+                                 props: Optional[dict],
+                                 register_ids: list[int], pair: bool,
+                                 window_s: float) -> dict[int, bytes]:
+    """Resolve → connect → GetDevices → subscribe instances → collect Pushes.
+
+    The SmartShunt-class HEX dialect, which the SmartSolar MPPT speaks.
+    :func:`_perform_read` asks instance 0 in the indefinite CBOR array
+    form; measured on the 75/15 (2026-09-05) that earns error 1 "unknown
+    register" for EVERY register, the known-good 0xED8D included, and the
+    indefinite form is not answered at all.  Once GetDevices has listed
+    the instances (``[0, 1, 3]`` there) and each is subscribed, the live
+    instance Pushes its registers unasked and a definite-dialect GetValue
+    on it is answered.  So: subscribe everything, nudge each wanted
+    register once per instance in the definite form, and harvest Pushes
+    for up to *window_s*.  The newest Push for a register wins.
+
+    No PUK/PIN step: the same measurement got the PV registers back on
+    an unauthenticated bonded link, and the authenticated run returned
+    the same values.
+    """
+    device = await ble_gatt_link.resolve(address, path, props)
+    client = await ble_gatt_link.connect(device, address)
+    values: dict[int, bytes] = {}
+    acquired: list = []
+    wanted = list(register_ids)
+    try:
+        if pair:
+            logger.info("%s: pairing", address)
+            await client.pair()
+        collector = _ReadCollector()
+        await _start_notify(client, victron_vreg.CHAR_CONTROL,
+                            collector.on_ctrl, acquired)
+        await _start_notify(client, victron_vreg.CHAR_DATA_LAST,
+                            collector.on_last, acquired)
+        await _start_notify(client, victron_vreg.CHAR_DATA_BULK,
+                            collector.on_bulk, acquired)
+        try:
+            await client.read_gatt_char(victron_vreg.CHAR_CONTROL)
+        except Exception:
+            pass
+        await client.write_gatt_char(
+            victron_vreg.CHAR_CONTROL, b"\xFA\x80\xFF", response=False)
+        await asyncio.sleep(victron_vreg.HANDSHAKE_SETTLE_S)
+        await _credits(client, 0x80)
+        await asyncio.sleep(victron_vreg.HANDSHAKE_SETTLE_S)
+
+        seen = 0
+
+        def harvest() -> None:
+            nonlocal seen
+            for frame in collector.frames[seen:]:
+                parsed = victron_vreg.parse_push_frame(frame)
+                if parsed is not None and parsed[1] in wanted and parsed[2]:
+                    values[parsed[1]] = parsed[2]
+                    continue
+                for reg in wanted:
+                    raw = victron_vreg.scan_for_vreg([frame], reg)
+                    if raw:
+                        values[reg] = raw
+            seen = len(collector.frames)
+
+        await client.write_gatt_char(
+            victron_vreg.CHAR_DATA_LAST, victron_vreg.encode_get_devices(),
+            response=False)
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.3)
+            await _credits(client, collector.f7_n)
+        instances = victron_vreg.parse_device_list_instances(collector.frames)
+        logger.info("%s: HEX instances %s", address, instances)
+        for inst in instances:
+            await client.write_gatt_char(
+                victron_vreg.CHAR_DATA_LAST,
+                victron_vreg.encode_subscribe_instance(inst), response=False)
+            await asyncio.sleep(0.5)
+            await _credits(client, collector.f7_n)
+        harvest()
+
+        deadline = time.monotonic() + window_s
+        for inst in instances:
+            for reg in wanted:
+                if reg in values or time.monotonic() >= deadline:
+                    continue
+                await client.write_gatt_char(
+                    victron_vreg.CHAR_DATA_LAST,
+                    victron_vreg.encode_read_command(reg, inst, definite=True),
+                    response=False)
+                await asyncio.sleep(0.5)
+                await _credits(client, collector.f7_n)
+                harvest()
+        while (time.monotonic() < deadline
+               and any(reg not in values for reg in wanted)):
+            await asyncio.sleep(0.3)
+            await _credits(client, collector.f7_n)
+            harvest()
+        harvest()
+        if not values:
+            logger.info("%s: HEX instance read saw %d frames, no wanted "
+                        "VREGs", address, len(collector.frames))
+        return values
+    finally:
+        # Same teardown as _perform_read, for the same reason: the notify
+        # release is disabled pending the BlueZ 5.72 diagnosis there.
+        acquired.clear()
+        try:
+            await ble_gatt_link.disconnect(client)
+        finally:
+            ble_gatt_link.force_close(client)
+
+
 async def _perform_provision(address: str, path, props,
                              passkey: int, pair: bool,
                              timeout_s: float) -> dict:
@@ -471,6 +582,77 @@ class AsyncGATTWriter:
             self._finish_read(on_done, False, {})
 
 
+    def read_instance_pushes(self, mac: str, passkey: int,
+                             register_ids: list[int],
+                             on_done: Optional[Callable] = None,
+                             prefer_adapter: Optional[str] = None,
+                             window_s: float = 6.0):
+        """Short HEX session in the SmartShunt-class dialect.
+
+        ``on_done(success, values, adapter)`` on the GLib thread, where
+        ``values`` is ``{register_id: bytes}`` and ``adapter`` the
+        ``hciN`` the link used (``None`` when the device was unknown to
+        BlueZ).  Same single slot as every other session on this writer.
+        See :func:`_perform_instance_read` for why this is not
+        :meth:`read_registers`.
+        """
+        if self._busy:
+            logger.warning("GATT writer busy, rejecting instance read for %s",
+                           mac)
+            if on_done:
+                on_done(False, {}, None)
+            return
+
+        mac = mac.upper()
+        self._busy = True
+
+        if not ble_async_loop.start():
+            logger.error("%s: BLE connection stack unavailable — cannot "
+                         "read VREGs", mac)
+            self._finish_read(on_done, False, {}, (None,))
+            return
+
+        path, props = ble_gatt_dbus.lookup_device(
+            self._bus, mac, prefer_adapter=prefer_adapter)
+        needs_pair = not (props or {}).get("Paired")
+        if needs_pair:
+            self._agent = ble_gatt_dbus.PairingAgent(self._bus, passkey, mac)
+            self._agent.register()
+        adapter = ble_gatt_dbus.adapter_from_path(path)
+
+        logger.info("HEX instance read starting for %s: regs=%s via %s",
+                    mac, [f"0x{r:04X}" for r in register_ids],
+                    adapter or "discovery")
+
+        def make_coro():
+            return asyncio.wait_for(
+                _perform_instance_read(mac, path, props, list(register_ids),
+                                       needs_pair, window_s),
+                timeout=OPERATION_TIMEOUT_S)
+
+        def settled(result, error):
+            if error is not None:
+                if isinstance(error, asyncio.TimeoutError):
+                    logger.error("%s: HEX instance read timed out after "
+                                 "%.0fs", mac, OPERATION_TIMEOUT_S)
+                elif ble_gatt_link.unreachable(error):
+                    # Out of range, switched off, or bonded on a card
+                    # that cannot hear it: an expected steady state, not
+                    # a traceback.
+                    logger.warning("%s: HEX instance read: device "
+                                   "unreachable via %s (%s)", mac,
+                                   adapter or "discovery", error)
+                else:
+                    logger.error("%s: HEX instance read failed: %s",
+                                 mac, error)
+                self._finish_read(on_done, False, {}, (adapter,))
+                return
+            self._finish_read(on_done, True, result or {}, (adapter,))
+
+        if not ble_async_loop.submit(make_coro, settled):
+            logger.error("%s: could not schedule HEX instance read", mac)
+            self._finish_read(on_done, False, {}, (adapter,))
+
     def provision_key(self, mac: str, passkey: int,
                       on_done: Callable,
                       prefer_adapter: Optional[str] = None,
@@ -547,14 +729,14 @@ class AsyncGATTWriter:
             self._finish(lambda ok: on_done(None), False)
 
     def _finish_read(self, on_done: Optional[Callable], success: bool,
-                     values: dict) -> None:
+                     values: dict, extra: tuple = ()) -> None:
         if self._agent is not None:
             self._agent.unregister()
             self._agent = None
         self._busy = False
         if on_done is not None:
             try:
-                on_done(success, values)
+                on_done(success, values, *extra)
             except Exception:
                 logger.exception("HEX read completion callback raised")
 

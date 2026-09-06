@@ -13,9 +13,18 @@ key gets ONE paired HEX session (VREG 0xEC65 through the shared
 single-slot writer, same passkey resolution as the Orion/IP22 drivers);
 the key, the firmware string and the adapter that succeeded are
 persisted under ``/Settings/Devices/smartsolar_<mac>/`` and the link is
-dropped.  That is the only GATT this driver ever does: telemetry stays
-on advertisements, there are no writes, and a device nobody enabled is
-never connected to.
+dropped.
+
+The PV side is polled, IP22-style.  The advertisement has no PV voltage,
+and gui-v2's Solar list shows ``/Pv/V`` as *Voltage* and derives
+*Current* from ``/Yield/Power`` over it, so both columns read "--" on
+advertisements alone.  Every ``_PV_POLL_INTERVAL_S`` an enabled, keyed
+device gets a short unauthenticated HEX session
+(:meth:`AsyncGATTWriter.read_instance_pushes`) for 0xEDBB / 0xEDBC /
+0xEDB3, publishing ``/Pv/V`` and ``/MppOperationMode``; a value older
+than ``_PV_STALE_S`` is withdrawn to ``None`` rather than left to age.
+There are still no writes, and a device nobody enabled is never
+connected to.
 
 Deliberate limits of this first version, both for caution:
 
@@ -41,8 +50,10 @@ import time
 from typing import Any, Dict, Optional
 
 import dbus
+from gi.repository import GLib
 
 import hex_key_session
+import victron_vreg as vreg
 from ble_charger_common import (
     ChargerCommonMixin,
     format_firmware_version,
@@ -87,6 +98,21 @@ ACCEPTED_PRODUCT_IDS = frozenset({0xA053})
 # time — the same shape as the IP22 module.
 _gatt_writer: Optional[AsyncGATTWriter] = None
 _provision_busy = False
+
+# PV-side HEX poll (see the module docstring and _maybe_poll_pv).
+# Two minutes: panel voltage in MPP drifts slowly with irradiance and
+# temperature, gui-v2 derives the live current from the live power over
+# this voltage, and every session is a connect/disconnect the unit
+# spends not advertising.  The IP22 polls at 45 s only while its
+# advertisement is the short beacon; here the advertisement stays live.
+_PV_POLL_INTERVAL_S = 120.0
+_PV_POLL_RETRY_S = 5.0
+_PV_POLL_WINDOW_S = 6.0
+# Three missed polls and the value is withdrawn: a stale PV voltage
+# under a live power reading would show a fabricated current.
+_PV_STALE_S = 3 * _PV_POLL_INTERVAL_S + 30.0
+_PV_REGS = (vreg.VREG_PV_VOLTAGE, vreg.VREG_PV_POWER,
+            vreg.VREG_MPP_OPERATION_MODE)
 
 
 def _shared_bus() -> dbus.Bus:
@@ -172,6 +198,12 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
         self._stored_key_invalid = False
         self._gave_up_logged = False
         self._last_full_telemetry_at: float = 0.0
+        self._pv_poll_busy = False
+        self._pv_poll_retry_scheduled = False
+        self._last_pv_poll_attempt: float = 0.0
+        self._last_pv_ok_at: float = 0.0
+        self._pv: Dict[str, Any] = {}
+        self._pv_adapter_persisted: Optional[str] = None
         self._init_charger_common()
         super().__init__(dev_mac)
 
@@ -248,6 +280,105 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
             return
         self._last_full_telemetry_at = time.monotonic()
         self._publish(parsed)
+        self._maybe_poll_pv()
+
+    # ------------------------------------------------------------------
+    # PV-side HEX poll (mirrors ble_device_ip22_charger._maybe_hex_telemetry)
+    # ------------------------------------------------------------------
+
+    def _maybe_poll_pv(self) -> bool:
+        """Start a short HEX session for the PV registers when one is due.
+
+        Returns True when a session was started or is already in flight.
+        Only reached from a decoded advertisement, so the device is
+        enabled and keyed; a provisioning session in flight defers us.
+        """
+        if not DbusBleService.get().is_device_enabled(self.info):
+            return False
+        if _provision_busy or getattr(self, "_pv_poll_busy", False):
+            return True
+        now = time.monotonic()
+        last = getattr(self, "_last_pv_poll_attempt", 0.0)
+        if last > 0 and now - last < _PV_POLL_INTERVAL_S:
+            return False
+        writer = self._gatt_writer()
+        if writer.busy:
+            self._schedule_pv_retry()
+            return True
+        self._last_pv_poll_attempt = now
+        self._pv_poll_busy = True
+        mac = _format_mac_colons(self.info["dev_mac"])
+        logger.info("%s: PV poll (HEX %s)", self._plog,
+                    " ".join(f"0x{r:04X}" for r in _PV_REGS))
+        writer.read_instance_pushes(
+            mac, self._pairing_passkey, register_ids=list(_PV_REGS),
+            on_done=self._on_pv_poll_done,
+            prefer_adapter=get_preferred_adapter(self._dbus_settings,
+                                                 self.info["dev_mac"]),
+            window_s=_PV_POLL_WINDOW_S)
+        return True
+
+    def _on_pv_poll_done(self, success: bool, values: Optional[dict] = None,
+                         adapter: Optional[str] = None) -> None:
+        """GLib thread, when the session ends.  Publish or say why not."""
+        self._pv_poll_busy = False
+        fields: Dict[str, Any] = {}
+        for register_id, payload in (values or {}).items():
+            fields.update(vreg.decode_solarcharger_vreg(int(register_id),
+                                                        payload))
+        if fields.get("pv_voltage") is None:
+            logger.info("%s: PV poll returned no PV voltage (success=%s, "
+                        "regs=%s)", self._plog, success,
+                        [f"0x{int(r):04X}" for r in (values or {})])
+            return
+        self._pv = fields
+        self._last_pv_ok_at = time.monotonic()
+        logger.info("%s: PV %.2f V, %s W, MPP mode %s via %s", self._plog,
+                    fields["pv_voltage"], fields.get("pv_power"),
+                    fields.get("mpp_operation_mode"), adapter)
+        for role_service in list(self._role_services.values()):
+            if not DbusBleService.get().is_device_role_enabled(
+                    self.info, role_service.ble_role.NAME):
+                continue
+            with role_service:
+                self._publish_pv(role_service)
+        # Remember the card that worked, as provisioning does -- the
+        # stored preference is what lookup_device ranks first, and a
+        # bond left on a card that can no longer hear the unit (hci9 on
+        # prod, 2026-09-05) would otherwise be tried forever.  Once per
+        # process per card: this is a settings write.
+        if adapter and adapter != getattr(self, "_pv_adapter_persisted", None):
+            self._pv_adapter_persisted = adapter
+            try:
+                set_preferred_adapter(self._dbus_settings,
+                                      self.info["dev_mac"], adapter)
+            except Exception:
+                logger.exception("%s: failed to store preferred adapter",
+                                 self._plog)
+
+    def _publish_pv(self, role_service) -> None:
+        """Current PV-side values, or None once they have gone stale."""
+        last_ok = getattr(self, "_last_pv_ok_at", 0.0)
+        stale = last_ok <= 0 or time.monotonic() - last_ok > _PV_STALE_S
+        pv = {} if stale else getattr(self, "_pv", {})
+        self._publish_value(role_service, "/Pv/V", pv.get("pv_voltage"),
+                            sensor_type="voltage")
+        self._publish_value(role_service, "/MppOperationMode",
+                            pv.get("mpp_operation_mode"))
+
+    def _pv_retry_tick(self) -> bool:
+        self._pv_poll_retry_scheduled = False
+        try:
+            self._maybe_poll_pv()
+        except Exception:
+            logger.exception("%s: PV poll retry failed", self._plog)
+        return False  # one-shot
+
+    def _schedule_pv_retry(self) -> None:
+        if getattr(self, "_pv_poll_retry_scheduled", False):
+            return
+        self._pv_poll_retry_scheduled = True
+        GLib.timeout_add(int(_PV_POLL_RETRY_S * 1000), self._pv_retry_tick)
 
     # ------------------------------------------------------------------
     # Key provisioning (mirrors ble_device_ip22_charger, bounded)
@@ -395,6 +526,9 @@ class BleDeviceSmartSolar(ChargerCommonMixin, BleDevice):
                                     (1 if load_i else 0) if load_i is not None else None)
                 self._publish_value(role_service, "/State", int(parsed["device_state"]))
                 self._publish_value(role_service, "/ErrorCode", int(parsed["charger_error"]))
+                # PV side rides along on every advertisement so a value
+                # the poll stopped refreshing is withdrawn on time.
+                self._publish_pv(role_service)
                 if "serial" not in self.info:
                     self.info["serial"] = serial_from_advertised_name(
                         self.info.get("adv_name")) or ""
