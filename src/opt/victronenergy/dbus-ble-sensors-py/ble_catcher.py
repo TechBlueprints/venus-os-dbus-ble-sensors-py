@@ -268,6 +268,14 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
     import bleak_connection_manager as _bcm
     logger.info("BLE coordination: bleak_connection_manager loaded from %s",
                 os.path.dirname(getattr(_bcm, "__file__", "?")))
+    # Seventh contract line (CONSUMERS.md): the policy that actually took
+    # effect, once per life, right after "loaded from".  Emitted by the
+    # consumer because BCM's own install-time INFO lines never reach a log
+    # whose root sits at WARNING, and BCM's logger stays closed here.
+    logger.info("BLE coordination: catcher installed (force_start_notify=%s, "
+                "adapters=%s configured, %s pinned)",
+                conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY,
+                len(adapters), sum(1 for a in adapters if "@" in a))
     logger.info("bcmv2 catcher installed (adapters=%s link_caps=%s); "
                 "advertisement scanning stays on the HCI tap",
                 adapters or "all", link_caps or "none")
