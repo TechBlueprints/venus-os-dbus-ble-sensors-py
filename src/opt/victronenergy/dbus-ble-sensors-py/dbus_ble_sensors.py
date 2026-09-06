@@ -1621,6 +1621,13 @@ def main():
     # log_filters for why that is filtered rather than re-levelled.
     log_filters.install(args.debug)
 
+    # Source the shared BLE stack in-process before anything imports bleak
+    # (CONSUMER_MIGRATION.md rule 5).  Idempotent; every GATT gate also
+    # triggers it, this just makes it early and unconditional and logs the
+    # coordination line once at startup.
+    import ble_ext_path
+    ble_ext_path.install()
+
     if args.snif:
         handler = RotatingFileHandler(
             "/var/log/dbus-ble-sensors-py/sniffer.log",

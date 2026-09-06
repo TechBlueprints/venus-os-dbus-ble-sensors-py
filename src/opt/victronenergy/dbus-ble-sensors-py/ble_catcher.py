@@ -73,6 +73,7 @@ import os
 
 import adapter_identity
 import ble_ext_path
+import conf
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,9 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
             # docstring for why the recurring sweeps stay off.
             wrap_scanner=True,
             scan_to_score=False,
+            # Consumer-side policy now (was BCM_FORCE_START_NOTIFY on the
+            # retired shim).  See conf.FORCE_START_NOTIFY.
+            force_start_notify=conf.FORCE_START_NOTIFY,
         )
     except Exception:
         logger.exception("bleak catcher install failed — "

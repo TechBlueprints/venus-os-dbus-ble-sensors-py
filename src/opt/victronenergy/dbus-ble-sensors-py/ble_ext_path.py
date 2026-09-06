@@ -44,11 +44,47 @@ from __future__ import annotations
 import logging
 import sys
 
+import ble_stack
+import conf
+
 _logger = logging.getLogger(__name__)
 
-_SHIM = "/data/bcm/python3"
-
 _installed: bool | None = None
+# The shared stack is sourced once, by whichever gate is reached first.
+_sourced: str | None = None
+
+
+def _source_shared_stack() -> str:
+    """Put the shared BLE stack on the path, once, and log the outcome.
+
+    Idempotent.  Runs ``ble_stack.ensure_ble_stack`` with our own config
+    key and no vendored fallback (this repo carries no ext/ble copy of
+    the stack -- the shared install or plain bleak, nothing between).
+    The three log strings are part of the fleet contract; the monitor
+    greps for them.  See bleak-connection-manager/CONSUMER_MIGRATION.md.
+    """
+    global _sourced
+    if _sourced is not None:
+        return _sourced
+    shared_dir = conf.BLUETOOTH_CONNECTION_MANAGER_DIR
+    state = ble_stack.ensure_ble_stack(shared_dir, vendored_dir=None)
+    if state == "shared":
+        _logger.info("BLE coordination: bleak_connection_manager loaded "
+                     "from %s", shared_dir)
+    elif state == "provided":
+        _logger.debug("BLE coordination: bleak_connection_manager already "
+                      "provided; inserted nothing")
+    elif ble_stack.shared_failure is not None:
+        _logger.error("BLE coordination: shared install at %s is present "
+                      "but unusable: %s", shared_dir,
+                      ble_stack.shared_failure)
+    else:
+        _logger.warning("BLE coordination: no shared install at %s",
+                        shared_dir)
+    _sourced = state
+    return state
+
+
 
 
 def _importable(name: str) -> bool:
@@ -73,16 +109,16 @@ def install() -> bool:
     global _installed
     if _installed is not None:
         return _installed
-
+    _source_shared_stack()
     _installed = _importable("bleak_connection_manager") and _importable("bleak")
     if not _installed:
         _logger.warning(
             "BLE connection stack unavailable — could not import "
-            "bleak_connection_manager and bleak.  This service runs under "
-            "%s, which puts the shared checkout at /data/bcm on the path; "
-            "re-run install.sh to converge it.  Advertisement-driven "
-            "sensors are unaffected; GATT writes and key provisioning "
-            "cannot run until this is fixed.", _SHIM)
+            "bleak_connection_manager and bleak.  Set "
+            "BLUETOOTH_CONNECTION_MANAGER_DIR to a converged /data/bcm "
+            "(or re-run install.sh).  Advertisement-driven sensors are "
+            "unaffected; GATT writes and key provisioning cannot run "
+            "until this is fixed.")
     return _installed
 
 
@@ -99,4 +135,5 @@ def claims_available() -> bool:
     publishes its claims through the claims layer and never touches
     bleak at all.
     """
+    _source_shared_stack()
     return _importable("bleak_connection_manager")

@@ -49,12 +49,9 @@ fi
 # to the log.  faulthandler prints the stack of every thread on fatal
 # signals, which is what makes the next one identifiable in one look.
 export PYTHONFAULTHANDLER=1
-# Run under the shared BLE stack at /data/bcm when it is present:
-# one checkout serves every BLE consumer on this box, so a fix
-# there arrives on restart rather than waiting for a submodule
-# bump in this repo.  The fallback keeps a bare clone working.
-# The shim also exports BCM_AUTOWIRE=0 — a shim-launched process
-# is a deliberate consumer and is never autowired.
-BCM_PY=/data/bcm/python3
-[ -x "$BCM_PY" ] || BCM_PY=python3
-exec "$BCM_PY" "$SCRIPT_DIR/dbus_ble_sensors.py"
+# Plain interpreter.  The shared BLE stack at /data/bcm is sourced
+# in-process by ble_stack.ensure_ble_stack (config key
+# BLUETOOTH_CONNECTION_MANAGER_DIR), not by a launcher shim — so where
+# the stack comes from no longer depends on how we were started.  See
+# bleak-connection-manager/CONSUMER_MIGRATION.md.
+exec python3 "$SCRIPT_DIR/dbus_ble_sensors.py"
