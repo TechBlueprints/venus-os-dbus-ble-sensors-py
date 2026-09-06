@@ -185,6 +185,17 @@ class DbusRoleService(object):
             self.connect()
         else:
             self.disconnect()
+        # Tell the service so the advertisement path can react (the tap
+        # stops forwarding a fully-disabled device's frames).  Late import:
+        # dbus_ble_service is a consumer of this module, not a dependency.
+        # The singleton is None only in tests that never built one.
+        try:
+            from dbus_ble_service import DbusBleService
+            svc = DbusBleService.get()
+            if svc is not None:
+                svc.notify_device_enabled_changed(self._ble_device)
+        except Exception:
+            logging.exception("enabled-changed notification failed")
 
     @staticmethod
     def _clear_path(path: str) -> str:

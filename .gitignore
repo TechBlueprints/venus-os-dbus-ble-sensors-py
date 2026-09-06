@@ -22,11 +22,6 @@ src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/**/*.pyc
 # dbus-fast 5.x that must shadow Venus OS's site-packages 2.21.1) +
 # bleak-retry-connector and its deps.  Pinned to the same commits
 # dbus-easytouchrv runs on Venus OS.  install.sh inits/updates them.
-!src/opt/victronenergy/dbus-ble-sensors-py/ext/aiooui
-!src/opt/victronenergy/dbus-ble-sensors-py/ext/bleak
-!src/opt/victronenergy/dbus-ble-sensors-py/ext/bleak-connection-manager
-!src/opt/victronenergy/dbus-ble-sensors-py/ext/bleak-retry-connector
-!src/opt/victronenergy/dbus-ble-sensors-py/ext/bluetooth-adapters
 *.iml
 .idea/
 *.code-workspace
