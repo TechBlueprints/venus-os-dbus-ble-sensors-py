@@ -246,7 +246,11 @@ def test_publish_maps_the_solar_record_honestly(ss) -> None:
     assert v["/Load/I"] == 0.0 and v["/Load/State"] == 0
     assert v["/State"] == 3 and v["/ErrorCode"] == 0
     assert "/Serial" not in v, "custom name carries no HQ serial; do not fabricate one"
-    assert "/Pv/V" not in v and "/MppOperationMode" not in v, "HEX-only fields stay untouched (None from the role)"
+    # HEX-only fields come from the driver's PV poll (0xEDBB / 0xEDB3), not
+    # the advertisement.  With no poll having run they are published as None
+    # -- never a fabricated 0 -- and fill in once a poll succeeds.
+    assert v["/Pv/V"] is None and v["/MppOperationMode"] is None, \
+        "HEX-only fields are None until the PV poll fills them, never a fabricated 0"
 
 
 def test_role_declares_what_systemcalc_reads() -> None:

@@ -52,6 +52,16 @@ VREG_DEVICE_STATE = 0x0201
 VREG_OUTPUT_VOLTAGE = 0xED8D
 VREG_OUTPUT_CURRENT = 0xED8F  # charger current, 0.1 A
 
+# Solar-charger (MPPT) PV-side registers.  None of these are in the
+# Instant Readout advertisement, which carries battery V/A, PV power,
+# today's yield and load current only.  Units are the VE.Direct HEX
+# protocol's; the sentinel for "not available" is all-ones.
+VREG_MPP_OPERATION_MODE = 0xEDB3  # un8: 0 off, 1 V/I limited, 2 MPP tracker active
+VREG_PV_VOLTAGE = 0xEDBB          # un16, 0.01 V
+VREG_PV_POWER = 0xEDBC            # un32, 0.01 W
+VREG_PV_CURRENT = 0xEDBD          # un16, 0.1 A -- the 75/15 answers "unknown register"
+VREG_YIELD_TODAY = 0xEDD3         # un16/un32, 0.01 kWh
+
 # HEX command opcodes (first CBOR uint of a DATA_LAST write).
 OPCODE_GET_DEVICES = 0x01
 OPCODE_SUBSCRIBE = 0x03
@@ -287,6 +297,59 @@ def decode_smartshunt_vreg(vreg_id: int, payload: bytes) -> dict:
         out["firmware"] = payload.hex()
     if "voltage" in out and "current" in out:
         out["power"] = round(out["voltage"] * out["current"], 2)
+    return out
+
+
+def parse_device_list_instances(frames, default=(0,)) -> list[int]:
+    """Instances from a GetDevices Push ``02 9F <uints...> FF``.
+
+    The wire is a flat uint list in ``(instance, extra)`` pairs.  A
+    SmartShunt-class device (the SmartSolar MPPT 75/15 among them) lists
+    ``[0, 1, 3]`` and serves its live registers on 3; asking instance 0
+    earns error 1 "unknown register" for every register, the known-good
+    ones included.  *default* is what to assume when no list came back.
+    """
+    joined = b"".join(frames)
+    start = joined.find(b"\x02\x9f")
+    if start < 0:
+        return list(default)
+    body = joined[start + 2:]
+    end = body.find(b"\xff")
+    if end < 0:
+        return list(default)
+    vals = []
+    for b in body[:end]:
+        if b < 24:
+            vals.append(b)
+        else:
+            break
+    return vals[0::2] or list(default)
+
+
+def decode_solarcharger_vreg(vreg_id: int, payload: bytes) -> dict:
+    """Map one MPPT Push payload to solarcharger-path fields.
+
+    Measured on a SmartSolar MPPT 75/15 (2026-09-05): 0xEDBB ``7e06`` =
+    16.62 V, 0xEDBC ``a23e0000`` = 160.34 W, 0xEDB3 ``02``, 0xEDD3
+    ``29000000`` = 0.41 kWh, each matching the unit's live advertisement
+    and the GUI at the time.  An all-ones payload is the protocol's "not
+    available" and yields nothing rather than a huge number.
+    """
+    out: dict = {}
+    if not payload:
+        return out
+    raw = le_uint(payload)
+    not_available = all(b == 0xFF for b in payload)
+    if vreg_id == VREG_PV_VOLTAGE and len(payload) >= 2 and not not_available:
+        out["pv_voltage"] = le_uint(payload[:2]) / 100.0
+    elif vreg_id == VREG_PV_POWER and len(payload) >= 2 and not not_available:
+        out["pv_power"] = raw / 100.0
+    elif vreg_id == VREG_PV_CURRENT and len(payload) >= 2 and not not_available:
+        out["pv_current"] = le_uint(payload[:2]) / 10.0
+    elif vreg_id == VREG_MPP_OPERATION_MODE and not not_available:
+        out["mpp_operation_mode"] = payload[0]
+    elif vreg_id == VREG_YIELD_TODAY and len(payload) >= 2 and not not_available:
+        out["yield_today_kwh"] = raw / 100.0
     return out
 
 
