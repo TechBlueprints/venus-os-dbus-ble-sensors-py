@@ -1671,6 +1671,16 @@ def main():
     # log_filters for why that is filtered rather than re-levelled.
     log_filters.install(args.debug)
 
+    # Source the shared BLE stack in-process before anything imports bleak
+    # (CONSUMERS.md rule 5), then install the catcher so the
+    # "BLE coordination:" status line lands in the service's first log
+    # lines (contract §4).  Both idempotent; the lazy GATT gates re-call
+    # them harmlessly.
+    import ble_ext_path
+    import ble_catcher
+    ble_ext_path.install()
+    ble_catcher.install()
+
     if args.snif:
         handler = RotatingFileHandler(
             "/var/log/dbus-ble-sensors-py/sniffer.log",

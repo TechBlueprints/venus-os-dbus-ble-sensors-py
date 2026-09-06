@@ -163,7 +163,7 @@ async def _start_notify(client, char, callback, acquired=None) -> bool:
 
     Which BlueZ notify path this takes is no longer decided here.  The
     shared BLE stack enforces StartNotify fleet-wide as a deploy-level
-    setting (``BCM_FORCE_START_NOTIFY``, exported by the ``/data/bcm``
+    consumer policy (``conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY``, passed at catcher install;
     shim); a caller that asks for AcquireNotify has the request rewritten
     to StartNotify at the wrapper and earns one warning per device for
     asking.  So this asks for nothing and lets policy decide.

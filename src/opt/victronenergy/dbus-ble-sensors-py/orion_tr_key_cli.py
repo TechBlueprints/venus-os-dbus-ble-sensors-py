@@ -39,7 +39,7 @@ a bcmv2 pin: try the card that worked last time first, then walk.
 Protocol notes, all of them hard-won on real hardware:
 
 * **The notify path is fleet policy, not a local choice.**  The shared BLE
-  stack forces StartNotify (``BCM_FORCE_START_NOTIFY`` via the
+  stack forces StartNotify (``conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY`` passed at
   ``/data/bcm`` shim) because AcquireNotify is the BlueZ 5.72
   use-after-free path.  This tool used to insist on AcquireNotify because
   StartNotify once delivered *empty* payloads for the 306b characteristics

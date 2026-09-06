@@ -49,7 +49,8 @@ def test_reports_unavailable_and_says_what_to_do(monkeypatch, caplog) -> None:
     assert mod.install() is False
     assert mod.available() is False
     # A bare "unavailable" sends the reader looking in the wrong repo.
-    assert "/data/bcm/python3" in caplog.text
+    # The shim is retired; the pointer is now the config key + install.sh.
+    assert "BLUETOOTH_CONNECTION_MANAGER_DIR" in caplog.text
     assert "install.sh" in caplog.text
 
 

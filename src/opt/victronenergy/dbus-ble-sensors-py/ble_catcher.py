@@ -53,13 +53,16 @@ Optional deployment config, ``/data/apps/dbus-ble-sensors-py/ble-connect.conf``:
     # uncapped adapters are never slot-gated.
     link_caps = hci1:5
 
-The GATT notify path is also decided by the stack, not by any caller in
-this tree: the ``/data/bcm`` shim exports ``BCM_FORCE_START_NOTIFY=true``
-and :func:`install_bleak_catcher` reads it, so every ``start_notify`` in
-this process goes out as StartNotify and an explicit AcquireNotify request
-is rewritten with a warning.  Nothing here passes ``force_start_notify``
-— inheriting the fleet setting is the point.  See
-``hex_key_session._start_notify`` for the history and the open question.
+The GATT notify path is a consumer-side policy: :func:`install` passes
+``force_start_notify=conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY``
+(default true) to :func:`install_bleak_catcher` when the shared install
+understands the parameter, so every ``start_notify`` goes out as
+StartNotify and an explicit AcquireNotify request is rewritten with a
+warning.  This dodges the BlueZ 5.72 AcquireNotify UAF.  An install older
+than 159536a lacks the parameter and takes the policy through the legacy
+``BCM_FORCE_START_NOTIFY`` environment instead.  The shim that used to
+export it is retired.  See ``hex_key_session._start_notify`` for the
+history and the open question, and CONSUMERS.md for the contract.
 
 This is *not* ``adapter-allowlist.conf``.  That file reserves adapters away
 from the advertisement scanner; this one bounds where GATT links may be
@@ -71,8 +74,12 @@ from __future__ import annotations
 import logging
 import os
 
+import inspect
+
 import adapter_identity
 import ble_ext_path
+import ble_stack
+import conf
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +159,29 @@ def link_adapter_names() -> set[str]:
     return names
 
 
+def _log_uncoordinated() -> None:
+    """The WARNING/ERROR the monitor greps when the catcher did not install.
+
+    Verbatim per CONSUMERS.md rule 6: "no shared install"
+    (normal on a box without one), "DIR empty" (misconfiguration), and
+    "present but unusable" (a fault) are different operator actions.
+    """
+    d = conf.BLUETOOTH_CONNECTION_MANAGER_DIR
+    if ble_stack.shared_failure:
+        logger.error(
+            "BLE coordination: shared install at %s is present but unusable, "
+            "running uncoordinated: %s", d, ble_stack.shared_failure)
+    elif not d:
+        logger.warning(
+            "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
+            "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated, "
+            "no claims, no adapter routing, no card recovery")
+    else:
+        logger.warning(
+            "BLE coordination: no shared install at %s; running uncoordinated, "
+            "no claims, no adapter routing, no card recovery", d)
+
+
 def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
     """Install the bcmv2 catcher.  Returns False if the stack is absent.
 
@@ -167,11 +197,23 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
     global _installed
     if _installed:
         return True
-    if not ble_ext_path.install():
+
+    # Manager deliberately off: the shared stack was still sourced early
+    # (ble_ext_path, which stands the sitewide autowire down), but install
+    # no catcher and emit no "loaded from" line -- that line would read as
+    # coordination-active for a process that has none.  CONSUMERS.md
+    # rule 6.
+    if not conf.BLUETOOTH_CONNECTION_MANAGER:
         return False
+
+    # Source the shared install (idempotent) so the import below resolves it.
+    ble_ext_path.install()
 
     try:
         from bleak_connection_manager import install_bleak_catcher
+    except ImportError:
+        _log_uncoordinated()
+        return False
     except Exception:
         logger.exception("bleak-connection-manager import failed — "
                          "GATT operations are unavailable")
@@ -179,6 +221,27 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
 
     adapters, link_caps = catcher_options()
     adapters = list(extra_adapters) + adapters
+
+    # StartNotify policy is passed when the shared install understands it;
+    # an install older than 159536a lacks the parameter, and takes the
+    # policy through the legacy environment instead.  CONSUMERS.md.
+    policy = {}
+    params = inspect.signature(install_bleak_catcher).parameters
+    if ("force_start_notify" in params
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values())):
+        policy["force_start_notify"] = (
+            conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY)
+    else:
+        os.environ["BCM_FORCE_START_NOTIFY"] = (
+            "true" if conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY
+            else "false")
+        logger.warning(
+            "BLE coordination: shared install at %s predates the "
+            "force_start_notify parameter; StartNotify policy passed "
+            "through the legacy BCM_FORCE_START_NOTIFY environment",
+            conf.BLUETOOTH_CONNECTION_MANAGER_DIR)
+
     try:
         install_bleak_catcher(
             owner,
@@ -189,12 +252,22 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
             # docstring for why the recurring sweeps stay off.
             wrap_scanner=True,
             scan_to_score=False,
+            **policy,
         )
-    except Exception:
-        logger.exception("bleak catcher install failed — "
-                         "GATT operations are unavailable")
+    except Exception as e:
+        # Import fine, catcher refused to install -- a bad kwarg, a
+        # validator that raised, a catcher bug.  Distinct from "present
+        # but unusable" (which is the install): the operator fixes the
+        # driver or catcher, not the shared tree.  CONSUMERS.md rule 6.
+        logger.error(
+            "BLE coordination: catcher would not install from %s, "
+            "running uncoordinated: %s",
+            conf.BLUETOOTH_CONNECTION_MANAGER_DIR, repr(e))
         return False
 
+    import bleak_connection_manager as _bcm
+    logger.info("BLE coordination: bleak_connection_manager loaded from %s",
+                os.path.dirname(getattr(_bcm, "__file__", "?")))
     logger.info("bcmv2 catcher installed (adapters=%s link_caps=%s); "
                 "advertisement scanning stays on the HCI tap",
                 adapters or "all", link_caps or "none")

@@ -52,8 +52,11 @@ def test_the_open_question_is_recorded_where_someone_will_look() -> None:
         "test of the empty-payload claim; record the boundary")
 
 
-def test_install_inherits_the_fleet_setting() -> None:
-    """Passing force_start_notify here would pin or override policy."""
+def test_install_passes_the_consumer_side_policy() -> None:
+    """Post-shim contract: StartNotify policy is a consumer-side setting
+    passed explicitly at install_bleak_catcher, not inherited from the
+    retired shim's BCM_FORCE_START_NOTIFY env export."""
     code = re.sub(r'"""[\s\S]*?"""', "", _src("ble_catcher.py"))
     code = re.sub(r"#.*", "", code)
-    assert "force_start_notify" not in code
+    assert "force_start_notify" in code and "inspect.signature" in code, (
+        "policy is passed explicitly, guarded by the install signature")
