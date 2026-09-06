@@ -76,7 +76,7 @@ def test_absent_shared_dir_returns_vendored_without_failure(ble_stack, tmp_path)
     assert state == "vendored" and ble_stack.shared_failure is None
 
 
-def test_all_five_coordination_strings_are_verbatim_in_the_catcher() -> None:
+def test_all_six_coordination_strings_are_verbatim_in_the_catcher() -> None:
     """The monitor greps these across the fleet; a refactor must not drift them.
 
     They live in ble_catcher (INFO on install, WARNING/ERROR when the
@@ -99,6 +99,8 @@ def test_all_five_coordination_strings_are_verbatim_in_the_catcher() -> None:
     assert ("BLE coordination: shared install at %s predates the "
             "force_start_notify parameter; StartNotify policy passed "
             "through the legacy BCM_FORCE_START_NOTIFY environment") in src
+    assert ("BLE coordination: catcher would not install from %s, "
+            "running uncoordinated: %s") in src
 
 
 def test_catcher_is_enable_gated_and_signature_guards_the_policy() -> None:

@@ -254,9 +254,15 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
             scan_to_score=False,
             **policy,
         )
-    except Exception:
-        logger.exception("bleak catcher install failed — "
-                         "GATT operations are unavailable")
+    except Exception as e:
+        # Import fine, catcher refused to install -- a bad kwarg, a
+        # validator that raised, a catcher bug.  Distinct from "present
+        # but unusable" (which is the install): the operator fixes the
+        # driver or catcher, not the shared tree.  CONSUMERS.md rule 6.
+        logger.error(
+            "BLE coordination: catcher would not install from %s, "
+            "running uncoordinated: %s",
+            conf.BLUETOOTH_CONNECTION_MANAGER_DIR, repr(e))
         return False
 
     import bleak_connection_manager as _bcm
