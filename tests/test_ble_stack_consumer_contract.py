@@ -113,10 +113,22 @@ def test_catcher_is_enable_gated_and_signature_guards_the_policy() -> None:
     assert "conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY" in catcher
 
 
-def test_run_script_is_a_plain_interpreter() -> None:
-    run = open(os.path.join(SRC, "start-dbus-ble-sensors-py.sh")).read()
-    assert "/data/bcm/python3" not in run, "the shim exec must be gone"
-    assert "exec python3 " in run, "run script must exec a plain interpreter"
+def test_the_launcher_prod_actually_execs_is_a_plain_interpreter() -> None:
+    """Guard the file /service really runs, not an adjacent one.
+
+    install.sh symlinks /service/<name> to the repo's ROOT-level service/
+    directory, so service/run is the launcher.  The in-tree
+    start-dbus-ble-sensors-py.sh is checked too, but a shim left in
+    service/run is the one that would silently keep prod on the shim.
+    """
+    repo = os.path.normpath(os.path.join(SRC, "..", "..", "..", ".."))
+    for rel in ("service/run", "service-launcher/run"):
+        run = open(os.path.join(repo, rel)).read()
+        assert "/data/bcm/python3" not in run, f"{rel}: the shim exec must be gone"
+    launcher = open(os.path.join(repo, "service", "run")).read()
+    assert "exec python3 " in launcher, "service/run must exec a plain interpreter"
+    start = open(os.path.join(SRC, "start-dbus-ble-sensors-py.sh")).read()
+    assert "/data/bcm/python3" not in start and "exec python3 " in start
 
 
 def test_config_keys_exist_with_the_contract_defaults() -> None:
