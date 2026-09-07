@@ -113,16 +113,33 @@ filter (or Phase 3's) does the whitelisting.
   and an HCI event before any filter). Dev softirq 2–3 % at 203/s. Unmeasured
   at the dense site; that is what the gate measures.
 
-### Phase 3 — kernel BPF (optional; the big win if Phase 2's floor is high)
-Generate a classic BPF program from (allowed adapter indices ∪ configured
-addresses ∪ learned addresses ∪ router addresses); attach to the tap socket;
-regenerate on any set change (adopt, enable/disable, router registration).
-`ContinuousScan ON` attaches a looser program (adapter-only) so
-manufacturer-based discovery runs in userspace.
-- Net: accept-all costs about the kernel floor; userspace sees only wanted
-  frames. The selective-filter demonstration already exists.
-- Effort: a tiny BPF assembler (`ldb`/`ldh`/`ld`, `jeq`, `ret`) ~100 lines
-  plus tests.
+### Phase 3 — kernel BPF, revised: a small static add-on, not the big win
+**Correction (2026-09-07, on reflection).** The first draft proposed
+generating a BPF program that whitelists advertiser addresses in the kernel.
+That does not survive batching: one datagram can carry many advertising
+reports (dev: 34 datagrams/s carried 203 reports/s, ~6 per datagram), and a
+loop-free BPF program can only inspect the FIRST report's address at a fixed
+offset — later reports sit at offsets that depend on the lengths before
+them. Dropping a datagram on its first report would discard our own device's
+report when it is the second or sixth in the batch. Unrolling does not fit
+the instruction budget for 46+ addresses, and batching is highest exactly at
+the dense sites the filter was meant for. **The address whitelist stays in
+userspace (Phase 1), where it is applied per report inside each datagram.**
+
+What does survive is everything that is a property of the whole datagram:
+- the **adapter index** (byte at offset 2 of the monitor header) — drop
+  frames from cards we do not scan; this fully removes the foreign
+  discovery-burst cost measured on prod (hci5 at 204/s);
+- the **frame type** (HCI event 0x3E at offset 6, sub-event at offset 8) —
+  drop commands, command-completes and ACL data, which removes the wakeups
+  our tap currently takes for GATT-session chatter and discards.
+
+That is a **static ~6-instruction program**: attached once at tap start,
+regenerated only when the set of scanning cards changes, never on adoption.
+It needs the same tiny assembler (`ldb`, `jeq`, `ret`) and is already
+demonstrated by the selective-adapter test above. Benefit: modest and
+certain. It does not touch the kernel's own cost of receiving every advert
+from the controller; that floor is Phase 2's gate, not Phase 3's.
 
 ## 5. What does not change
 GATT and claims (bcmv2), the PV poll, the adoption-gate semantics (`OFF` =
@@ -131,11 +148,11 @@ main-loop hop (PR #8).
 
 ## 6. Effort and recommendation
 Phase 1: half a day plus measurement. Phase 2: half a day plus a prod soak.
-Phase 3: a day for the generator and tests.
+Phase 3: a few hours for the static program and tests.
 
 **Recommendation:** do Phase 1 now (it pays for itself even if we keep the
-list). Gate Phase 2 on the dense-site measurement. Reach for Phase 3 if that
-measurement says the kernel floor is higher than we like.
+list). Gate Phase 2 on the dense-site measurement. Add Phase 3's static adapter/type filter alongside Phase 1; it is cheap and
+certain, but it is not a substitute for the userspace whitelist.
 
 ## Appendix — the "20 device limit"
 The limits are hardware-reported per card: **25 and 32** on prod's two
