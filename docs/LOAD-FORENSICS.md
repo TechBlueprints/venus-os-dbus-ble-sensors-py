@@ -18,8 +18,17 @@ can watch it. Source: `src/opt/victronenergy/load-forensics/load_forensics.py`.
   dbus-daemon, systemcalc, gui-v2, each pack, sensors-py, easytouch,
   watchdog, shyion, sshd): CPU %, state, threads, fd count, an **exact
   D-Bus connection count**, and the wait channel of every thread that is
-  running or blocked. A watch-list process whose pid changed is flagged
-  **RESTARTED**.
+  running or blocked. A watched process is flagged **RESTARTED** when it was
+  *replaced* — this pid is new for that name and a pid the name had before
+  is gone. A new pid alongside a living one is not a restart, because sshd
+  has one process per connection and every login would otherwise read as one.
+
+**What it costs.** Measured on dev over 264 tasks: **109 ms of CPU per
+sample**, which at the 30-second interval is **0.37 % of one core**. The
+walk reads one or two small files per task, so it uses a raw
+open/read/close rather than buffered IO, and each process's resolved name
+is cached for the life of that process. The tool warns in its own heartbeat
+if it ever averages more than 1 % of a core.
 - A global **bus** figure: live connections on the system bus, from the
   `/proc/net/unix` rows bound to the bus socket (listener excluded).
 
