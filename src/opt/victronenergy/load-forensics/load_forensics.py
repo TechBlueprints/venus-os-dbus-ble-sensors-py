@@ -26,13 +26,26 @@ Per sample (``/proc`` only, one pass, tens of milliseconds):
   - ``/proc/loadavg``; ``/proc/stat`` cpu split, ``ctxt``, ``processes``
     (the fork counter), ``procs_running``, ``procs_blocked``;
     ``/proc/meminfo`` MemAvailable; ``/proc/sys/fs/file-nr``;
-    ``/proc/diskstats`` for the eMMC (write and I/O milliseconds).
+    ``/proc/diskstats`` for the eMMC (write and I/O milliseconds); the
+    number of connections on the system bus (rows in ``/proc/net/unix``
+    bound to the bus socket, minus the listener).
   - Per process: CPU delta (utime+stime), state, thread count.  For the
-    top-N by CPU plus a fixed watch list: fd count, D-Bus connection count
-    (socket inodes matched against ``/proc/net/unix`` rows for the system
-    bus -- zero bus calls), and the wait channel of every thread that is
-    running or blocked (a USB/HCI stall names itself there).
+    top-N by CPU plus a fixed watch list: fd count, an EXACT D-Bus
+    connection count (see below), and the wait channel of every thread
+    that is running or blocked (a USB/HCI stall names itself there).
   - A watch-list process whose pid changed is flagged: a restart.
+
+The per-process bus count.  ``/proc/net/unix`` prints each socket's OWN
+bound path: the bus listener has it, dbus-daemon's accepted sockets
+inherit it, and a client's connected socket is unbound and shows nothing.
+Matching a process's fd inodes against the path rows therefore credits
+every connection to dbus-daemon and none to any client -- the opposite of
+the fan-out signature the count exists to show.  The exact rule needs
+each socket's PEER inode, which ``/proc`` does not print but the kernel's
+socket-diagnostics netlink interface does (``unix_diag`` with
+``UDIAG_SHOW_PEER``, no fork): a client socket whose peer is one of the
+daemon's accepted sockets is one bus connection.  When that interface is
+unavailable the per-process count is reported as unknown, never as zero.
 
 Triggers: own 1-minute crossing (early catch) and the same 5m/15m
 thresholds dbus-ble-sensors-py derives from ``/etc/watchdog.conf``, so a
@@ -59,6 +72,8 @@ import glob
 import logging
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -184,21 +199,105 @@ def read_disk_ms(root: str = "/proc", device: str = EMMC_DEVICE) -> tuple[int, i
     return 0, 0
 
 
-def read_bus_inodes(root: str = "/proc", paths=DBUS_SOCKET_PATHS) -> set[int]:
-    """Inodes of every unix socket bound or connected to the system bus."""
-    inodes: set[int] = set()
+# /proc/net/unix columns: Num RefCount Protocol Flags Type St Inode Path.
+# Flags 0x10000 marks a listening socket (__SO_ACCEPTCON); St 03 is connected.
+_UNIX_FLAG_ACCEPTCON = 0x10000
+_UNIX_ST_CONNECTED = 3
+
+
+def read_bus_rows(root: str = "/proc", paths=DBUS_SOCKET_PATHS) -> tuple[set[int], set[int]]:
+    """(listener inodes, accepted inodes) of the system bus, from the path rows.
+
+    Only the bus side of each connection carries the path (the listener and
+    the daemon's accepted sockets); client sockets are unbound and print no
+    path at all, so they are NOT in either set.  ``len(accepted)`` is the
+    number of live connections to the bus.
+    """
+    listeners: set[int] = set()
+    accepted: set[int] = set()
     try:
         lines = _read(f"{root}/net/unix").splitlines()[1:]
     except OSError:
-        return inodes
+        return listeners, accepted
     for line in lines:
         f = line.split()
-        if len(f) >= 8 and f[7] in paths:
-            try:
-                inodes.add(int(f[6]))
-            except ValueError:
-                pass
-    return inodes
+        if len(f) < 8 or f[7] not in paths:
+            continue
+        try:
+            flags, state, ino = int(f[3], 16), int(f[5], 16), int(f[6])
+        except ValueError:
+            continue
+        if flags & _UNIX_FLAG_ACCEPTCON:
+            listeners.add(ino)
+        elif state == _UNIX_ST_CONNECTED:
+            accepted.add(ino)
+    return listeners, accepted
+
+
+# unix_diag over NETLINK_SOCK_DIAG: each socket's peer inode, without a fork.
+_NETLINK_SOCK_DIAG = 4
+_SOCK_DIAG_BY_FAMILY = 20
+_NLM_F_REQUEST, _NLM_F_DUMP = 0x01, 0x300
+_NLMSG_ERROR, _NLMSG_DONE = 2, 3
+_AF_UNIX = 1
+_UDIAG_SHOW_PEER = 1 << 2
+_UNIX_DIAG_PEER = 2
+
+
+def parse_unix_diag(data: bytes) -> tuple[bool, dict[int, int]]:
+    """Parse one netlink datagram of ``unix_diag`` replies -> (done, {inode: peer inode}).
+
+    Messages are ``nlmsghdr`` (16 bytes) + ``unix_diag_msg`` (16 bytes) +
+    rtattrs, all 4-byte aligned.  Only ``UNIX_DIAG_PEER`` is read.
+    """
+    peers: dict[int, int] = {}
+    off = 0
+    done = False
+    while off + 16 <= len(data):
+        ln, typ, _flags, _seq, _pid = struct.unpack_from("=IHHII", data, off)
+        if ln < 16 or off + ln > len(data):
+            break
+        if typ in (_NLMSG_DONE, _NLMSG_ERROR):
+            done = True
+            break
+        body = data[off + 16:off + ln]
+        if len(body) >= 16:
+            _fam, _typ, _state, _pad, ino, _c0, _c1 = struct.unpack_from("=BBBBIII", body, 0)
+            a = 16
+            while a + 4 <= len(body):
+                rta_len, rta_type = struct.unpack_from("=HH", body, a)
+                if rta_len < 4:
+                    break
+                if rta_type == _UNIX_DIAG_PEER and rta_len >= 8:
+                    peers[ino] = struct.unpack_from("=I", body, a + 4)[0]
+                a += (rta_len + 3) & ~3
+        off += (ln + 3) & ~3
+    return done, peers
+
+
+def read_unix_peers() -> dict[int, int]:
+    """{socket inode: peer inode} for every unix socket, via ``unix_diag``; {} if unavailable."""
+    try:
+        s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, _NETLINK_SOCK_DIAG)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return {}
+    try:
+        s.settimeout(1.0)
+        # struct unix_diag_req: family u8, protocol u8, pad u16, states u32, ino u32, show u32, cookie u32[2]
+        req = struct.pack("=BBHIIIII", _AF_UNIX, 0, 0, 0xFFFFFFFF, 0, _UDIAG_SHOW_PEER, 0, 0)
+        hdr = struct.pack("=IHHII", 16 + len(req), _SOCK_DIAG_BY_FAMILY, _NLM_F_REQUEST | _NLM_F_DUMP, 1, 0)
+        s.send(hdr + req)
+        peers: dict[int, int] = {}
+        for _ in range(64):                     # bounded; a full table is a handful of datagrams
+            done, part = parse_unix_diag(s.recv(65536))
+            peers.update(part)
+            if done:
+                break
+        return peers
+    except OSError:
+        return {}
+    finally:
+        s.close()
 
 
 @dataclass
@@ -211,7 +310,7 @@ class Proc:
     threads: int
     cpu_pct: float = 0.0        # over the last interval, % of one core
     fds: int = -1
-    dbus: int = -1
+    dbus: int = -1              # bus connections; -1 = unknown (peer inodes unavailable)
     active_threads: list = field(default_factory=list)   # (tid, state, wchan) for R/D threads
     restarted: bool = False
 
@@ -247,8 +346,13 @@ def read_proc(root: str, pid: int) -> Optional[Proc]:
         return None
 
 
-def enrich_proc(root: str, p: Proc, bus_inodes: set[int]) -> None:
-    """fd count, D-Bus connections, and wait channels of running/blocked threads."""
+def enrich_proc(root: str, p: Proc, accepted: set[int], peers: Optional[dict[int, int]]) -> None:
+    """fd count, exact bus-connection count, and wait channels of running/blocked threads.
+
+    A socket counts as a bus connection when it IS one of the daemon's
+    accepted sockets (dbus-daemon itself) or when its PEER is one (every
+    client).  Without *peers* the count is unknown (-1), never zero.
+    """
     try:
         fds = os.listdir(f"{root}/{p.pid}/fd")
         p.fds = len(fds)
@@ -258,9 +362,12 @@ def enrich_proc(root: str, p: Proc, bus_inodes: set[int]) -> None:
                 tgt = os.readlink(f"{root}/{p.pid}/fd/{fd}")
             except OSError:
                 continue
-            if tgt.startswith("socket:[") and int(tgt[8:-1]) in bus_inodes:
+            if not tgt.startswith("socket:["):
+                continue
+            ino = int(tgt[8:-1])
+            if ino in accepted or (peers is not None and peers.get(ino) in accepted):
                 n += 1
-        p.dbus = n
+        p.dbus = n if peers is not None else -1
     except OSError:
         pass
     try:
@@ -298,17 +405,19 @@ class Sample:
     file_nr: int
     disk_write_ms: int          # since last sample
     disk_io_ms: int
+    bus_connections: int        # live connections on the system bus (accepted sockets); -1 unknown
     procs: list                 # of Proc, top-N + watched
     lean: bool = False          # taken while tripped: no fd/wchan/bus work
 
 
 class Sampler:
     def __init__(self, root: str = "/proc", clk_tck: Optional[int] = None,
-                 top_n: int = TOP_N, watch=WATCH_LIST):
+                 top_n: int = TOP_N, watch=WATCH_LIST, peers_reader=None):
         self.root = root
         self.clk_tck = clk_tck or os.sysconf("SC_CLK_TCK")
         self.top_n = top_n
         self.watch = watch
+        self.peers_reader = peers_reader or read_unix_peers
         self._prev_ticks: dict[int, tuple[int, int]] = {}    # pid -> (ticks, starttime)
         self._prev_sys: Optional[SysCounters] = None
         self._prev_disk: Optional[tuple[int, int]] = None
@@ -367,16 +476,20 @@ class Sampler:
                     p.restarted = True
                 self._watched_pids[p.name] = p.pid
 
+        bus_connections = -1
         if not lean:
-            bus = read_bus_inodes(self.root)
+            _listeners, accepted = read_bus_rows(self.root)
+            bus_connections = len(accepted)
+            peers = self.peers_reader() or None      # {} -> None: unknown, never zero
             for p in selected:
-                enrich_proc(self.root, p, bus)
+                enrich_proc(self.root, p, accepted, peers)
 
         self._prev_sys, self._prev_disk, self._prev_t = sysc, disk, now
         return Sample(t=now, load=load, cpu_pct=cpu_pct, forks=forks, ctxt=ctxt,
                       running=sysc.running, blocked=sysc.blocked,
                       memavail_kb=read_memavailable_kb(self.root), file_nr=read_file_nr(self.root),
-                      disk_write_ms=dwr, disk_io_ms=dio, procs=selected, lean=lean)
+                      disk_write_ms=dwr, disk_io_ms=dio, bus_connections=bus_connections,
+                      procs=selected, lean=lean)
 
 
 # --------------------------------------------------------------- triggers ---
@@ -509,7 +622,7 @@ def format_sample(s: Sample, t0: float) -> str:
     head = (f"t{s.t - t0:+8.0f}s {time.strftime('%H:%M:%S', time.gmtime(s.t))}Z "
             f"load {l1:.2f}/{l5:.2f}/{l15:.2f} run {s.running} blk {s.blocked} "
             f"forks +{s.forks} ctxt +{s.ctxt} memavail {s.memavail_kb // 1024} MB fds {s.file_nr} "
-            f"mmc wr +{s.disk_write_ms} ms io +{s.disk_io_ms} ms"
+            f"bus {s.bus_connections} mmc wr +{s.disk_write_ms} ms io +{s.disk_io_ms} ms"
             + (f" | cpu user {c.get('user', 0):.0f}% sys {c.get('system', 0):.0f}% iow {c.get('iowait', 0):.0f}% "
                f"sirq {c.get('softirq', 0):.0f}% idle {c.get('idle', 0):.0f}%" if c else "")
             + (" [LEAN]" if s.lean else ""))
@@ -517,8 +630,9 @@ def format_sample(s: Sample, t0: float) -> str:
     for p in s.procs:
         flags = " RESTARTED" if p.restarted else ""
         act = " ".join(f"{tid}:{st}:{w}" for tid, st, w in p.active_threads) if p.active_threads else ""
+        dbus = "?" if p.dbus < 0 else str(p.dbus)
         rows.append(f"    {p.pid:>6} {p.name[:28]:<28} {p.cpu_pct:5.1f}% {p.state} thr {p.threads:>3} "
-                    f"fds {p.fds:>4} dbus {p.dbus:>3}{flags}{('  ' + act) if act else ''}")
+                    f"fds {p.fds:>4} dbus {dbus:>3}{flags}{('  ' + act) if act else ''}")
     return head + "\n" + "\n".join(rows)
 
 
@@ -534,7 +648,8 @@ def write_dump(ring, reason: str, dump_dir: str = DUMP_DIR, keep: int = DUMP_KEE
            f"trigger: {reason} ===",
            f"self-cost: {cpu:.2f} s CPU since start (up {up / 3600:.2f} h, "
            f"{(100.0 * cpu / up) if up > 0 else 0:.2f}% avg of one core), RSS {rss} kB",
-           f"--- ring: {len(ring)} samples, oldest first (t relative to now) ---"]
+           f"--- ring: {len(ring)} samples, oldest first (t relative to now); "
+           f"dbus '?' = peer inodes unavailable, not zero ---"]
     for s in ring:
         out.append(format_sample(s, now))
     if deep:
@@ -557,10 +672,10 @@ def write_dump(ring, reason: str, dump_dir: str = DUMP_DIR, keep: int = DUMP_KEE
 # ------------------------------------------------------------------- main ---
 class Forensics:
     def __init__(self, root: str = "/proc", dump_dir: str = DUMP_DIR, interval: float = INTERVAL_S,
-                 th: Optional[Thresholds] = None, sensors_log: str = SENSORS_LOG):
+                 th: Optional[Thresholds] = None, sensors_log: str = SENSORS_LOG, peers_reader=None):
         self.root, self.dump_dir, self.interval = root, dump_dir, interval
         self.th = th or Thresholds()
-        self.sampler = Sampler(root)
+        self.sampler = Sampler(root, peers_reader=peers_reader)
         self.ring = collections.deque(maxlen=RING_LEN)
         self.event = EventState(self.th)
         self.tail = LogTail(sensors_log, TRIP_LINE)
@@ -591,18 +706,20 @@ class Forensics:
             pct = 100.0 * cpu / up if up > 0 else 0.0
             lvl = logging.WARNING if pct > SELF_COST_WARN_PCT else logging.INFO
             log.log(lvl, "alive: %d samples, %d dumps, self-cost %.2f s CPU (%.2f%% of one core), "
-                    "RSS %d kB, load %.2f/%.2f/%.2f",
-                    self.samples, self.dumps, cpu, pct, rss, l1, l5, l15)
+                    "RSS %d kB, load %.2f/%.2f/%.2f, bus %d",
+                    self.samples, self.dumps, cpu, pct, rss, l1, l5, l15, s.bus_connections)
             self._last_beat = now
         return path
 
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stop", True))
+        peers_ok = bool(read_unix_peers())
         log.info("load-forensics started: interval %.0f s, ring %d min, triggers 1m>=%.1f | 5m>=%.1f | "
-                 "15m>=%.1f (release 1m<%.1f 5m<%.1f 15m<%.1f), dumps -> %s (keep %d), watch: %s",
+                 "15m>=%.1f (release 1m<%.1f 5m<%.1f 15m<%.1f), dumps -> %s (keep %d), "
+                 "per-process bus count via unix_diag: %s, watch: %s",
                  self.interval, RING_MINUTES, self.th.trip_1m, self.th.trip_5m, self.th.trip_15m,
                  self.th.release_1m, self.th.release_5m, self.th.release_15m, self.dump_dir, DUMP_KEEP,
-                 ", ".join(WATCH_LIST))
+                 "available" if peers_ok else "UNAVAILABLE (reported as '?')", ", ".join(WATCH_LIST))
         next_t = time.monotonic()
         while not self._stop:
             try:

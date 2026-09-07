@@ -3,18 +3,29 @@
 /proc does not exist on the machine that runs these tests, so every reader
 takes a root directory.  The fake tree below carries exactly the files the
 sampler reads, with values chosen so the arithmetic is checkable by hand.
+
+The fake ``/proc/net/unix`` models the REAL kernel semantics, because the
+first version of this suite modelled an assumption instead and passed while
+the measurement would have read zero on the box: the path column is a
+socket's OWN bound address, so only the listener and the daemon's accepted
+sockets carry it; client sockets are unbound and print no path.  Per-process
+attribution needs each socket's peer, which comes from ``unix_diag`` and is
+injected here as a plain dict.
 """
 from __future__ import annotations
 
 import importlib.util
 import os
 import shutil
+import struct
 import sys
 
 import pytest
 
 SRC = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "..", "src", "opt", "victronenergy", "load-forensics"))
+
+BUS = "/var/run/dbus/system_bus_socket"
 
 
 @pytest.fixture(scope="module")
@@ -38,9 +49,22 @@ def _stat_line(pid, comm, state, utime, stime, threads, starttime):
     return f"{pid} ({comm}) " + " ".join(f) + "\n"
 
 
+# The bus, as the kernel prints it.  Listener 10 (flags 00010000 = accepting,
+# St 01).  Accepted (server-side) sockets 11..13 carry the path, St 03.  The
+# clients' own sockets 21..23 are unbound: NO path.  Their peers are the
+# accepted sockets -- knowledge that lives in unix_diag, not /proc/net/unix.
+UNIX_ROWS = [
+    ("00010000", "01", 10, BUS),
+    ("00000000", "03", 11, BUS), ("00000000", "03", 12, BUS), ("00000000", "03", 13, BUS),
+    ("00000000", "03", 21, ""), ("00000000", "03", 22, ""), ("00000000", "03", 23, ""),
+    ("00000000", "03", 99, "/tmp/other.sock"),
+]
+PEERS = {21: 11, 11: 21, 22: 12, 12: 22, 23: 13, 13: 23}
+
+
 def make_proc(root, procs, *, load="0.50 0.60 0.70 2/300 4242", cpu=(100, 0, 50, 800, 10, 2, 8, 0),
               ctxt=1000, processes=500, running=2, blocked=0, memavail=400000, file_nr=4500,
-              disk=(100, 200), bus_inodes=(11, 12, 13)):
+              disk=(100, 200), unix_rows=UNIX_ROWS):
     """procs: list of dicts {pid, comm, state, utime, stime, threads, starttime, cmdline?, fds?, tasks?}.
 
     Rebuilds the whole tree from scratch, so calling it again between two
@@ -61,9 +85,8 @@ def make_proc(root, procs, *, load="0.50 0.60 0.70 2/300 4242", cpu=(100, 0, 50,
         f" 179 0 mmcblk1 10 0 100 5 20 0 200 {disk[0]} 0 300 {disk[1]}\n"
         " 179 1 mmcblk1p1 1 0 1 1 1 0 1 1 0 1 1\n")
     rows = ["Num RefCount Protocol Flags Type St Inode Path"]
-    for ino in bus_inodes:
-        rows.append(f"0000: 00000003 00000000 00000000 0001 03 {ino} /var/run/dbus/system_bus_socket")
-    rows.append("0000: 00000002 00000000 00010000 0001 01 99 /tmp/other.sock")
+    for flags, st, ino, path in unix_rows:
+        rows.append(f"0000: 00000003 00000000 {flags} 0001 {st} {ino} {path}".rstrip())
     open(f"{root}/net/unix", "w").write("\n".join(rows) + "\n")
     open(f"{root}/self/stat", "w").write(_stat_line(999, "load_forensics", "S", 5, 3, 1, 10))
     open(f"{root}/self/status", "w").write("Name:\tpython3\nVmRSS:\t9000 kB\n")
@@ -83,13 +106,17 @@ def make_proc(root, procs, *, load="0.50 0.60 0.70 2/300 4242", cpu=(100, 0, 50,
 
 def _procs_v1():
     return [
+        # a client of the bus: two of its sockets (21, 22) are connected to the daemon; 99 is not
         dict(pid=100, comm="python3", cmdline="python3 /data/apps/x/dbus_ble_sensors.py", utime=100, stime=50,
-             threads=6, fds=["socket:[11]", "socket:[12]", "/dev/null", "socket:[99]"],
+             threads=6, fds=["socket:[21]", "socket:[22]", "/dev/null", "socket:[99]"],
              tasks=[(100, "S", "do_epoll_wait"), (101, "D", "usb_start_wait_urb")]),
-        dict(pid=200, comm="bluetoothd", utime=10, stime=5, threads=1, fds=["socket:[13]"]),
+        dict(pid=200, comm="bluetoothd", utime=10, stime=5, threads=1, fds=["socket:[23]"]),
         dict(pid=300, comm="python3", cmdline="python3 /opt/victronenergy/dbus-systemcalc-py/dbus_systemcalc.py",
              utime=1000, stime=100, threads=2),
         dict(pid=400, comm="idle-thing", utime=0, stime=0),
+        # the daemon itself: the listener and its three accepted sockets
+        dict(pid=837, comm="dbus-daemon", utime=50, stime=50,
+             fds=["socket:[10]", "socket:[11]", "socket:[12]", "socket:[13]"]),
     ]
 
 
@@ -104,7 +131,15 @@ def test_parsers_read_the_fake_tree(lf, tmp_path):
     assert lf.read_memavailable_kb(root) == 400000
     assert lf.read_file_nr(root) == 4500
     assert lf.read_disk_ms(root) == (100, 200)
-    assert lf.read_bus_inodes(root) == {11, 12, 13}, "only the system-bus rows, not /tmp/other.sock"
+
+
+def test_bus_rows_separate_listener_from_accepted_and_ignore_clients(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    listeners, accepted = lf.read_bus_rows(root)
+    assert listeners == {10}
+    assert accepted == {11, 12, 13}, "the daemon's accepted sockets, and only those"
+    assert not ({21, 22, 23} & accepted), "client sockets print no path and must not be counted here"
 
 
 def test_python_processes_are_named_by_their_script(lf, tmp_path):
@@ -118,7 +153,7 @@ def test_python_processes_are_named_by_their_script(lf, tmp_path):
 def test_cpu_delta_between_two_samples_and_pid_reuse_guard(lf, tmp_path):
     root = str(tmp_path / "proc")
     make_proc(root, _procs_v1())
-    sm = lf.Sampler(root, clk_tck=100)
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
     sm.sample(now=1000.0)
     procs = _procs_v1()
     procs[0]["utime"] = 100 + 150       # +150 ticks in 30 s at 100 Hz = 1.5 s = 5 % of one core
@@ -138,7 +173,7 @@ def test_top_n_plus_watchlist_and_restart_flag(lf, tmp_path):
     for i in range(12):
         procs.append(dict(pid=1000 + i, comm=f"busy{i}", utime=10, stime=0))
     make_proc(root, procs)
-    sm = lf.Sampler(root, clk_tck=100, top_n=3)
+    sm = lf.Sampler(root, clk_tck=100, top_n=3, peers_reader=lambda: PEERS)
     sm.sample(now=0.0)
     for p in procs:
         if p["comm"].startswith("busy"):
@@ -156,22 +191,61 @@ def test_top_n_plus_watchlist_and_restart_flag(lf, tmp_path):
     assert any(p.name == "dbus_ble_sensors.py" and p.restarted for p in s.procs)
 
 
-def test_enrichment_counts_bus_connections_and_names_blocked_threads(lf, tmp_path):
+def test_bus_connections_are_attributed_to_clients_by_peer(lf, tmp_path):
+    """The bug the first suite hid: with the path rule every client read 0."""
     root = str(tmp_path / "proc")
     make_proc(root, _procs_v1())
-    s = lf.Sampler(root, clk_tck=100).sample(now=0.0)
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS).sample(now=0.0)
     by = {p.pid: p for p in s.procs}
-    assert by[100].fds == 4 and by[100].dbus == 2, "two of its sockets are on the system bus, one is not"
+    assert by[100].fds == 4 and by[100].dbus == 2, "two client sockets whose peers are accepted bus sockets"
     assert by[200].dbus == 1
-    assert (101, "D", "usb_start_wait_urb") in by[100].active_threads, "a D-state thread names its wait channel"
+    assert by[837].dbus == 3, "the daemon counts its accepted sockets (the listener is not a connection)"
+    assert by[300].dbus == 0, "a process with no bus socket really is zero"
+    assert s.bus_connections == 3, "global: accepted rows, listener excluded"
+
+
+def test_without_peer_inodes_the_count_is_unknown_not_zero(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: {}).sample(now=0.0)
+    by = {p.pid: p for p in s.procs}
+    assert by[100].dbus == -1 and by[200].dbus == -1 and by[837].dbus == -1
+    assert s.bus_connections == 3, "the global count needs no peers"
+    text = lf.format_sample(s, 0.0)
+    assert "dbus   ?" in text and "dbus   0" not in text, "rendered as '?', never as a false zero"
+
+
+def test_unix_diag_reply_parser(lf):
+    """A hand-built netlink datagram: one unix_diag_msg with a PEER attr, then NLMSG_DONE."""
+    def msg(ino, peer):
+        body = struct.pack("=BBBBIII", 1, 1, 3, 0, ino, 0, 0)       # unix_diag_msg
+        rta = struct.pack("=HHI", 8, lf._UNIX_DIAG_PEER, peer)        # rtattr len=8 type=PEER
+        payload = body + rta
+        hdr = struct.pack("=IHHII", 16 + len(payload), lf._SOCK_DIAG_BY_FAMILY, 2, 1, 0)
+        return hdr + payload
+    done_hdr = struct.pack("=IHHII", 16, lf._NLMSG_DONE, 2, 1, 0)
+    data = msg(21, 11) + msg(22, 12) + done_hdr
+    done, peers = lf.parse_unix_diag(data)
+    assert done and peers == {21: 11, 22: 12}
+    # a truncated datagram must not raise
+    assert lf.parse_unix_diag(data[:20])[1] == {}
+
+
+def test_blocked_threads_name_their_wait_channel(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS).sample(now=0.0)
+    by = {p.pid: p for p in s.procs}
+    assert (101, "D", "usb_start_wait_urb") in by[100].active_threads
     assert all(st != "S" for _, st, _ in by[100].active_threads), "sleeping threads are not recorded"
 
 
 def test_lean_pass_does_nothing_beyond_one_proc_pass(lf, tmp_path):
     root = str(tmp_path / "proc")
     make_proc(root, _procs_v1())
-    s = lf.Sampler(root, clk_tck=100).sample(lean=True, now=0.0)
-    assert s.lean
+    calls = []
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: calls.append(1) or PEERS).sample(lean=True, now=0.0)
+    assert s.lean and s.bus_connections == -1 and calls == [], "no netlink, no fd walk, no wchan while tripped"
     for p in s.procs:
         assert p.fds == -1 and p.dbus == -1 and p.active_threads == []
 
@@ -211,26 +285,27 @@ def test_log_tail_starts_at_end_and_follows_rotation(lf, tmp_path):
 def test_write_dump_caps_the_directory_and_records_self_cost(lf, tmp_path):
     root = str(tmp_path / "proc")
     make_proc(root, _procs_v1())
-    ring = [lf.Sampler(root, clk_tck=100).sample(now=float(i)) for i in range(3)]
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    ring = [sm.sample(now=float(i)) for i in range(3)]
     d = str(tmp_path / "dumps")
-    paths = []
     for i in range(lf.DUMP_KEEP + 3):
-        paths.append(lf.write_dump(ring, f"test {i}", d, deep=False, proc_root=root, started_at=1.0))
-        os.utime(paths[-1], (i, i))
+        path = lf.write_dump(ring, f"test {i}", d, deep=False, proc_root=root, started_at=1.0)
         # distinct names: the timestamp resolution is a second
-        os.rename(paths[-1], os.path.join(d, f"dump-2026{i:04d}T000000Z.txt"))
+        os.rename(path, os.path.join(d, f"dump-2026{i:04d}T000000Z.txt"))
     remaining = sorted(os.listdir(d))
     assert len(remaining) == lf.DUMP_KEEP, "the directory keeps only the newest N dumps"
     text = open(os.path.join(d, remaining[-1])).read()
     assert "self-cost:" in text and "RSS 9000 kB" in text
     assert "dbus_ble_sensors.py" in text and "usb_start_wait_urb" in text, "the ring and the wait channel are in the dump"
+    assert "bus 3" in text
 
 
 def test_forensics_step_dumps_once_per_event(lf, tmp_path):
     root = str(tmp_path / "proc")
     make_proc(root, _procs_v1(), load="4.50 2.00 1.50 2/300 1")
     d = str(tmp_path / "dumps")
-    fx = lf.Forensics(root=root, dump_dir=d, th=lf.Thresholds(), sensors_log=str(tmp_path / "nolog"))
+    fx = lf.Forensics(root=root, dump_dir=d, th=lf.Thresholds(), sensors_log=str(tmp_path / "nolog"),
+                      peers_reader=lambda: PEERS)
     path = fx.step(now=1000.0, deep=False)
     assert path and os.path.exists(path) and fx.dumps == 1
     assert fx.step(now=1030.0, deep=False) is None and fx.dumps == 1, "still open: one event, one dump"
