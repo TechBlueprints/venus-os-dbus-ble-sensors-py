@@ -1,0 +1,6 @@
+#!/bin/sh
+exec 2>&1
+mkdir -p /var/log/load-forensics
+# Quiet by design: a startup line, one line per event, one heartbeat an
+# hour.  The dumps themselves go to /data/log/load-forensics, not here.
+exec multilog t s100000 n10 /var/log/load-forensics

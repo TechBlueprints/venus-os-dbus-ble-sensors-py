@@ -10,20 +10,21 @@ set -e
 INSTALL_DIR="/data/apps/dbus-ble-sensors-py"
 SERVICE_NAME="dbus-ble-sensors-py"
 LAUNCHER_NAME="dbus-ble-sensors-py-launcher"
+FORENSICS_NAME="load-forensics"
 
 echo ""
 echo "Disabling $SERVICE_NAME..."
 
 # --- Stop and remove service symlinks ---
 
-for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME"; do
+for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME" "$FORENSICS_NAME"; do
     if [ -e "/service/$svc_name" ]; then
         svc -d "/service/$svc_name" 2>/dev/null || true
     fi
 done
 sleep 1
 
-for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME"; do
+for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME" "$FORENSICS_NAME"; do
     rm -rf "/service/$svc_name" 2>/dev/null || true
 done
 
@@ -31,6 +32,9 @@ pkill -f "supervise $SERVICE_NAME" 2>/dev/null || true
 pkill -f "supervise $LAUNCHER_NAME" 2>/dev/null || true
 pkill -f "multilog .* /var/log/$SERVICE_NAME" 2>/dev/null || true
 pkill -f "multilog .* /var/log/$LAUNCHER_NAME" 2>/dev/null || true
+pkill -f "supervise $FORENSICS_NAME" 2>/dev/null || true
+pkill -f "multilog .* /var/log/$FORENSICS_NAME" 2>/dev/null || true
+pkill -f "python.*load_forensics" 2>/dev/null || true
 pkill -f "python.*dbus_ble_sensors" 2>/dev/null || true
 
 echo "  Services stopped and symlinks removed"
