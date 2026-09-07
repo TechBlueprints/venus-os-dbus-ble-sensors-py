@@ -244,21 +244,27 @@ _UDIAG_SHOW_PEER = 1 << 2
 _UNIX_DIAG_PEER = 2
 
 
-def parse_unix_diag(data: bytes) -> tuple[bool, dict[int, int]]:
-    """Parse one netlink datagram of ``unix_diag`` replies -> (done, {inode: peer inode}).
+def parse_unix_diag(data: bytes) -> tuple[bool, bool, dict[int, int]]:
+    """Parse one netlink datagram of ``unix_diag`` replies -> (done, error, {inode: peer inode}).
 
     Messages are ``nlmsghdr`` (16 bytes) + ``unix_diag_msg`` (16 bytes) +
-    rtattrs, all 4-byte aligned.  Only ``UNIX_DIAG_PEER`` is read.
+    rtattrs, all 4-byte aligned.  Only ``UNIX_DIAG_PEER`` is read.  An
+    ``NLMSG_ERROR`` (EOPNOTSUPP, EINVAL: the interface is not there) is
+    reported distinctly from a dump that is simply empty, because "unknown"
+    and "none" are different answers.
     """
     peers: dict[int, int] = {}
     off = 0
-    done = False
+    done = error = False
     while off + 16 <= len(data):
         ln, typ, _flags, _seq, _pid = struct.unpack_from("=IHHII", data, off)
         if ln < 16 or off + ln > len(data):
             break
-        if typ in (_NLMSG_DONE, _NLMSG_ERROR):
+        if typ == _NLMSG_DONE:
             done = True
+            break
+        if typ == _NLMSG_ERROR:
+            done = error = True
             break
         body = data[off + 16:off + ln]
         if len(body) >= 16:
@@ -272,15 +278,21 @@ def parse_unix_diag(data: bytes) -> tuple[bool, dict[int, int]]:
                     peers[ino] = struct.unpack_from("=I", body, a + 4)[0]
                 a += (rta_len + 3) & ~3
         off += (ln + 3) & ~3
-    return done, peers
+    return done, error, peers
 
 
-def read_unix_peers() -> dict[int, int]:
-    """{socket inode: peer inode} for every unix socket, via ``unix_diag``; {} if unavailable."""
+def read_unix_peers() -> Optional[dict[int, int]]:
+    """{socket inode: peer inode} for every unix socket via ``unix_diag``.
+
+    ``None`` when the interface is unavailable (no netlink, an OS error, or
+    an ``NLMSG_ERROR`` reply); a dict -- possibly empty -- when it answered.
+    The request asks for every state (``udiag_states`` all ones): a zero
+    mask returns an immediate DONE with no messages, which is not an error.
+    """
     try:
         s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, _NETLINK_SOCK_DIAG)  # type: ignore[attr-defined]
     except (AttributeError, OSError):
-        return {}
+        return None
     try:
         s.settimeout(1.0)
         # struct unix_diag_req: family u8, protocol u8, pad u16, states u32, ino u32, show u32, cookie u32[2]
@@ -289,13 +301,15 @@ def read_unix_peers() -> dict[int, int]:
         s.send(hdr + req)
         peers: dict[int, int] = {}
         for _ in range(64):                     # bounded; a full table is a handful of datagrams
-            done, part = parse_unix_diag(s.recv(65536))
+            done, error, part = parse_unix_diag(s.recv(65536))
+            if error:
+                return None
             peers.update(part)
             if done:
                 break
         return peers
     except OSError:
-        return {}
+        return None
     finally:
         s.close()
 
@@ -480,7 +494,7 @@ class Sampler:
         if not lean:
             _listeners, accepted = read_bus_rows(self.root)
             bus_connections = len(accepted)
-            peers = self.peers_reader() or None      # {} -> None: unknown, never zero
+            peers = self.peers_reader()              # None = unknown; {} = the kernel answered, none
             for p in selected:
                 enrich_proc(self.root, p, accepted, peers)
 
@@ -713,7 +727,7 @@ class Forensics:
 
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stop", True))
-        peers_ok = bool(read_unix_peers())
+        peers_ok = read_unix_peers() is not None
         log.info("load-forensics started: interval %.0f s, ring %d min, triggers 1m>=%.1f | 5m>=%.1f | "
                  "15m>=%.1f (release 1m<%.1f 5m<%.1f 15m<%.1f), dumps -> %s (keep %d), "
                  "per-process bus count via unix_diag: %s, watch: %s",

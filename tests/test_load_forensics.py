@@ -204,15 +204,30 @@ def test_bus_connections_are_attributed_to_clients_by_peer(lf, tmp_path):
     assert s.bus_connections == 3, "global: accepted rows, listener excluded"
 
 
-def test_without_peer_inodes_the_count_is_unknown_not_zero(lf, tmp_path):
+def test_unavailable_peer_lookup_is_unknown_not_zero(lf, tmp_path):
+    """None = the interface refused or is absent.  Never a false zero."""
     root = str(tmp_path / "proc")
     make_proc(root, _procs_v1())
-    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: {}).sample(now=0.0)
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: None).sample(now=0.0)
     by = {p.pid: p for p in s.procs}
     assert by[100].dbus == -1 and by[200].dbus == -1 and by[837].dbus == -1
     assert s.bus_connections == 3, "the global count needs no peers"
     text = lf.format_sample(s, 0.0)
     assert "dbus   ?" in text and "dbus   0" not in text, "rendered as '?', never as a false zero"
+
+
+def test_an_empty_but_successful_dump_is_zero_not_unknown(lf, tmp_path):
+    """{} = the kernel answered and there are no peers.  A real zero.
+
+    The two must not be conflated: a zero states mask returns an immediate
+    DONE with no messages, which is an answer, while NLMSG_ERROR is not.
+    """
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: {}).sample(now=0.0)
+    by = {p.pid: p for p in s.procs}
+    assert by[100].dbus == 0, "no peer matched, but the lookup worked"
+    assert by[837].dbus == 3, "the daemon's own accepted sockets need no peer lookup"
 
 
 def test_unix_diag_reply_parser(lf):
@@ -225,10 +240,16 @@ def test_unix_diag_reply_parser(lf):
         return hdr + payload
     done_hdr = struct.pack("=IHHII", 16, lf._NLMSG_DONE, 2, 1, 0)
     data = msg(21, 11) + msg(22, 12) + done_hdr
-    done, peers = lf.parse_unix_diag(data)
-    assert done and peers == {21: 11, 22: 12}
+    done, error, peers = lf.parse_unix_diag(data)
+    assert done and not error and peers == {21: 11, 22: 12}
     # a truncated datagram must not raise
-    assert lf.parse_unix_diag(data[:20])[1] == {}
+    assert lf.parse_unix_diag(data[:20])[2] == {}
+    # NLMSG_ERROR is distinct from an empty dump: the kernel refused, so the
+    # answer is "unknown", not "none".  A zero states mask returns an
+    # immediate DONE with no messages and must NOT read as an error.
+    err_hdr = struct.pack("=IHHII", 16, lf._NLMSG_ERROR, 2, 1, 0)
+    assert lf.parse_unix_diag(err_hdr) == (True, True, {})
+    assert lf.parse_unix_diag(done_hdr) == (True, False, {})
 
 
 def test_blocked_threads_name_their_wait_channel(lf, tmp_path):
