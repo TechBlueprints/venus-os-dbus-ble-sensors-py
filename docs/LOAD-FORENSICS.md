@@ -16,11 +16,24 @@ can watch it. Source: `src/opt/victronenergy/load-forensics/load_forensics.py`.
   `procs_blocked`; MemAvailable; open file handles; eMMC write and I/O ms.
 - Per process, for the top 8 by CPU plus a fixed watch list (bluetoothd,
   dbus-daemon, systemcalc, gui-v2, each pack, sensors-py, easytouch,
-  watchdog, shyion, sshd): CPU %, state, threads, fd count, **D-Bus
-  connection count** (fd socket inodes matched against `/proc/net/unix`
-  rows for the system bus — zero bus calls), and the wait channel of every
-  thread that is running or blocked. A watch-list process whose pid changed
-  is flagged **RESTARTED**.
+  watchdog, shyion, sshd): CPU %, state, threads, fd count, an **exact
+  D-Bus connection count**, and the wait channel of every thread that is
+  running or blocked. A watch-list process whose pid changed is flagged
+  **RESTARTED**.
+- A global **bus** figure: live connections on the system bus, from the
+  `/proc/net/unix` rows bound to the bus socket (listener excluded).
+
+**How the per-process bus count works, and why it is not the obvious rule.**
+`/proc/net/unix` prints each socket's *own* bound path, so only the bus
+listener and dbus-daemon's accepted sockets carry it; a client's connected
+socket is unbound and prints nothing. Matching a process's fd inodes against
+those rows credits every connection to dbus-daemon and none to any client,
+the opposite of the fan-out signature. The exact rule needs each socket's
+*peer* inode, which the kernel's socket-diagnostics netlink interface
+provides (`unix_diag` with `UDIAG_SHOW_PEER`, no fork): a client socket
+whose peer is one of the daemon's accepted sockets is one bus connection.
+When that interface is unavailable the per-process figure renders as `?`,
+never as a false zero, and the startup line says so.
 
 ## Triggers (one event = one dump)
 - own 1-minute average ≥ 4.0 — the early catch;
