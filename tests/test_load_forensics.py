@@ -183,12 +183,44 @@ def test_top_n_plus_watchlist_and_restart_flag(lf, tmp_path):
     names = {p.name for p in s.procs}
     assert "bluetoothd" in names and "dbus_ble_sensors.py" in names and "dbus_systemcalc.py" in names
     assert sum(1 for p in s.procs if p.name.startswith("busy")) == 3, "top-N is exactly N strangers"
-    # restart: the watched sensors process comes back as a new pid
+    # restart: the watched sensors process is REPLACED -- old pid gone, new one in its place
     procs = [p for p in procs if p["pid"] != 100]
     procs.append(dict(pid=100_000, comm="python3", cmdline="python3 /x/dbus_ble_sensors.py", utime=1, stime=1))
     make_proc(root, procs)
     s = sm.sample(now=60.0)
     assert any(p.name == "dbus_ble_sensors.py" and p.restarted for p in s.procs)
+
+
+def test_a_second_process_of_the_same_name_is_not_a_restart(lf, tmp_path):
+    """sshd has one process per connection: a new login must not read as a restart."""
+    root = str(tmp_path / "proc")
+    procs = _procs_v1() + [dict(pid=2091, comm="sshd", utime=1, stime=1)]
+    make_proc(root, procs)
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    sm.sample(now=0.0)
+    # a second connection: the first sshd is still alive
+    procs.append(dict(pid=2092, comm="sshd", utime=1, stime=1))
+    make_proc(root, procs)
+    s = sm.sample(now=30.0)
+    assert not any(p.name == "sshd" and p.restarted for p in s.procs), \
+        "a new pid alongside a living one is a new connection, not a restart"
+    # now the original goes away and only the new one remains: still not a restart
+    # for 2092 (it was already known), and 2091 is simply gone
+    procs = [p for p in procs if p["pid"] != 2091]
+    make_proc(root, procs)
+    s = sm.sample(now=60.0)
+    assert not any(p.name == "sshd" and p.restarted for p in s.procs)
+
+
+def test_the_name_cache_is_pruned_to_live_processes(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    sm.sample(now=0.0)
+    assert (100, 100) in sm._name_cache, "an interpreter's script name is cached by (pid, starttime)"
+    make_proc(root, [p for p in _procs_v1() if p["pid"] != 100])
+    sm.sample(now=30.0)
+    assert (100, 100) not in sm._name_cache, "a dead process's entry is dropped, so the cache cannot grow"
 
 
 def test_bus_connections_are_attributed_to_clients_by_peer(lf, tmp_path):

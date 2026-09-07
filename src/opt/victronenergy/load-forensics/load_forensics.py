@@ -143,6 +143,21 @@ def _read(path: str) -> str:
         return f.read()
 
 
+def _read_fast(path: str, size: int = 4096) -> str:
+    """One open/read/close, no buffered-IO layer.
+
+    The per-sample walk reads one or two small files for every task on the
+    box (264 on dev), so this is the hot path and the layer is worth
+    skipping.  Everything it is used for -- ``stat``, ``cmdline``, ``wchan``
+    -- is far under one page.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return os.read(fd, size).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
 def read_loadavg(root: str = "/proc") -> tuple[float, float, float, int, int, int]:
     """(1m, 5m, 15m, running, total, last_pid)."""
     p = _read(f"{root}/loadavg").split()
@@ -334,7 +349,7 @@ def _proc_name(root: str, pid: int, comm: str) -> str:
     if not (comm.startswith("python") or comm in ("sh", "bash")):
         return comm
     try:
-        argv = _read(f"{root}/{pid}/cmdline").split("\0")
+        argv = _read_fast(f"{root}/{pid}/cmdline").split("\0")
     except OSError:
         return comm
     for a in argv[1:]:
@@ -343,9 +358,15 @@ def _proc_name(root: str, pid: int, comm: str) -> str:
     return comm
 
 
-def read_proc(root: str, pid: int) -> Optional[Proc]:
+def read_proc(root: str, pid: int, name_cache: Optional[dict] = None) -> Optional[Proc]:
+    """One task's line.  *name_cache* maps (pid, starttime) -> name.
+
+    A live process never renames itself here, and resolving an interpreter's
+    script means a second file read, so the name is resolved once per
+    process life.  ``starttime`` is in the key because pids are reused.
+    """
     try:
-        stat = _read(f"{root}/{pid}/stat")
+        stat = _read_fast(f"{root}/{pid}/stat")
     except OSError:
         return None
     # comm may contain spaces/parens: split on the LAST ')'
@@ -354,8 +375,16 @@ def read_proc(root: str, pid: int) -> Optional[Proc]:
     f = stat[lp + 2:].split()
     # fields after comm: state(0) ppid(1) ... utime(11) stime(12) ... num_threads(17) ... starttime(19)
     try:
-        return Proc(pid=pid, name=_proc_name(root, pid, comm), state=f[0],
-                    ticks=int(f[11]) + int(f[12]), starttime=int(f[19]), threads=int(f[17]))
+        starttime = int(f[19])
+        key = (pid, starttime)
+        if name_cache is not None and key in name_cache:
+            name = name_cache[key]
+        else:
+            name = _proc_name(root, pid, comm)
+            if name_cache is not None:
+                name_cache[key] = name
+        return Proc(pid=pid, name=name, state=f[0],
+                    ticks=int(f[11]) + int(f[12]), starttime=starttime, threads=int(f[17]))
     except (IndexError, ValueError):
         return None
 
@@ -387,13 +416,13 @@ def enrich_proc(root: str, p: Proc, accepted: set[int], peers: Optional[dict[int
     try:
         for tid in os.listdir(f"{root}/{p.pid}/task"):
             try:
-                ts = _read(f"{root}/{p.pid}/task/{tid}/stat")
+                ts = _read_fast(f"{root}/{p.pid}/task/{tid}/stat")
                 st = ts[ts.rfind(")") + 2:].split()[0]
             except (OSError, IndexError):
                 continue
             if st in ("R", "D"):
                 try:
-                    wchan = _read(f"{root}/{p.pid}/task/{tid}/wchan").strip() or "-"
+                    wchan = _read_fast(f"{root}/{p.pid}/task/{tid}/wchan").strip() or "-"
                 except OSError:
                     wchan = "?"
                 p.active_threads.append((int(tid), st, wchan))
@@ -436,7 +465,8 @@ class Sampler:
         self._prev_sys: Optional[SysCounters] = None
         self._prev_disk: Optional[tuple[int, int]] = None
         self._prev_t: Optional[float] = None
-        self._watched_pids: dict[str, int] = {}                # name -> pid (restart detection)
+        self._watched_pids: dict[str, set] = {}                # name -> live pids (restart detection)
+        self._name_cache: dict[tuple, str] = {}                # (pid, starttime) -> name
 
     def sample(self, lean: bool = False, now: Optional[float] = None) -> Sample:
         now = time.time() if now is None else now
@@ -464,7 +494,7 @@ class Sampler:
         for entry in os.listdir(self.root):
             if not entry.isdigit():
                 continue
-            p = read_proc(self.root, int(entry))
+            p = read_proc(self.root, int(entry), self._name_cache)
             if p is None:
                 continue
             cur_ticks[p.pid] = (p.ticks, p.starttime)
@@ -473,6 +503,9 @@ class Sampler:
                 p.cpu_pct = 100.0 * (p.ticks - prev[0]) / self.clk_tck / dt
             procs.append(p)
         self._prev_ticks = cur_ticks
+        # keep the name cache to the live set, so it cannot grow without bound
+        live_keys = {(p.pid, p.starttime) for p in procs}
+        self._name_cache = {k: v for k, v in self._name_cache.items() if k in live_keys}
 
         # top-N by cpu, plus everything on the watch list
         procs.sort(key=lambda x: x.cpu_pct, reverse=True)
@@ -482,13 +515,22 @@ class Sampler:
                 chosen[p.pid] = p
         selected = sorted(chosen.values(), key=lambda x: x.cpu_pct, reverse=True)
 
-        # restart detection on watched names (a name's pid changed)
-        for p in selected:
+        # Restart detection.  A watched name can have several live processes
+        # -- sshd has one per connection -- so a NEW pid is not by itself a
+        # restart; treating it as one flags every ssh login.  A restart is a
+        # REPLACEMENT: this pid is new for the name AND some pid the name had
+        # before is now gone.
+        live: dict[str, set] = {}
+        for p in procs:
             if is_watched(p.name, self.watch):
-                old = self._watched_pids.get(p.name)
-                if old is not None and old != p.pid:
-                    p.restarted = True
-                self._watched_pids[p.name] = p.pid
+                live.setdefault(p.name, set()).add(p.pid)
+        for p in selected:
+            if not is_watched(p.name, self.watch):
+                continue
+            prev_pids = self._watched_pids.get(p.name)
+            if prev_pids and p.pid not in prev_pids and (prev_pids - live.get(p.name, set())):
+                p.restarted = True
+        self._watched_pids = live
 
         bus_connections = -1
         if not lean:
