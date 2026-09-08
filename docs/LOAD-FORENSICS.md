@@ -59,6 +59,16 @@ whose peer is one of the daemon's accepted sockets is one bus connection.
 When that interface is unavailable the per-process figure renders as `?`,
 never as a false zero, and the startup line says so.
 
+**Reading the sensors-py figure.** `dbus-ble-sensors-py` holds one system-bus
+connection per registered `VeDbusService` — one per published device role —
+plus its own main connection and the advertisement router. It is normal for
+it to own roughly a third of every connection on the bus: ~24 service names
+map to ~37 connections, because a single BLE device commonly backs several
+roles (a multi-sensor unit publishes tank + temperature, and so on). That is
+the baseline, not a leak. A leak shows as connections climbing without
+matching `registered com.victronenergy.*` lines in the service's log, or as
+un-registrations that never free their connection.
+
 ## Triggers (one event = one dump)
 - own 1-minute average ≥ 4.0 — the early catch;
 - 5-minute ≥ 6.0 or 15-minute ≥ 5.5 — the exact thresholds the BLE service
