@@ -1,0 +1,13 @@
+#!/bin/sh
+# load-forensics: explain WHY load went high, from a continuous /proc ring.
+# Its own process, outside dbus-ble-sensors-py, so it survives that
+# service's restarts and can watch it.  See docs/LOAD-FORENSICS.md.
+echo "*** starting load-forensics ***"
+exec 2>&1
+. /etc/profile.d/profile.sh 2>/dev/null || true
+INSTALL_DIR="/data/apps/dbus-ble-sensors-py"
+export PYTHONFAULTHANDLER=1
+# Plain interpreter; this tool reads /proc only and imports nothing from
+# the BLE stack.  Nice +10: the instrument must never compete with what it
+# is observing.
+exec nice -n 10 python3 "$INSTALL_DIR/src/opt/victronenergy/load-forensics/load_forensics.py"

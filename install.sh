@@ -15,6 +15,7 @@ BRANCH="${BRANCH:-main}"
 INSTALL_DIR="/data/apps/dbus-ble-sensors-py"
 SERVICE_NAME="dbus-ble-sensors-py"
 LAUNCHER_NAME="dbus-ble-sensors-py-launcher"
+FORENSICS_NAME="load-forensics"
 APP_DIR="src/opt/victronenergy/dbus-ble-sensors-py"
 VELIB_URL="https://raw.githubusercontent.com/victronenergy/velib_python/refs/heads/master"
 
@@ -380,6 +381,8 @@ chmod +x "$INSTALL_DIR"/service/run 2>/dev/null || true
 chmod +x "$INSTALL_DIR"/service/log/run 2>/dev/null || true
 chmod +x "$INSTALL_DIR"/service-launcher/run 2>/dev/null || true
 chmod +x "$INSTALL_DIR"/service-launcher/log/run 2>/dev/null || true
+chmod +x "$INSTALL_DIR"/service-load-forensics/run 2>/dev/null || true
+chmod +x "$INSTALL_DIR"/service-load-forensics/log/run 2>/dev/null || true
 chmod +x "$INSTALL_DIR"/*.sh 2>/dev/null || true
 
 # Take down a service tree cleanly before we replace it.
@@ -453,10 +456,12 @@ stop_service_tree() {
 }
 
 # Create or update service symlinks
-for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME"; do
+for svc_name in "$SERVICE_NAME" "$LAUNCHER_NAME" "$FORENSICS_NAME"; do
     link="/service/$svc_name"
     if [ "$svc_name" = "$SERVICE_NAME" ]; then
         target="$INSTALL_DIR/service"
+    elif [ "$svc_name" = "$FORENSICS_NAME" ]; then
+        target="$INSTALL_DIR/service-load-forensics"
     else
         target="$INSTALL_DIR/service-launcher"
     fi
@@ -511,10 +516,12 @@ echo "Step 8: Starting services..."
 # starts /service/x/run, not /service/x/log.  The log sub-service is
 # its own supervise instance and needs its own `svc -u` call,
 # otherwise multilog never starts and the log file stays stale.
-for svc_name in "$LAUNCHER_NAME" "$SERVICE_NAME"; do
+for svc_name in "$LAUNCHER_NAME" "$SERVICE_NAME" "$FORENSICS_NAME"; do
     svc -u "/service/$svc_name/log" 2>/dev/null || true
 done
 svc -u "/service/$LAUNCHER_NAME" 2>/dev/null || true
+# load-forensics is independent of the BLE service: start it directly.
+svc -u "/service/$FORENSICS_NAME" 2>/dev/null || true
 
 # Wait up to 10 seconds for the worker to be supervised "up (pid ...)".
 for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -646,6 +653,7 @@ echo ""
 echo "Service status:"
 svstat "/service/$SERVICE_NAME" 2>/dev/null || echo "  (not yet supervised)"
 svstat "/service/$LAUNCHER_NAME" 2>/dev/null || echo "  (not yet supervised)"
+svstat "/service/$FORENSICS_NAME" 2>/dev/null || echo "  (not yet supervised)"
 echo ""
 echo "View logs:"
 echo "  tail -f /var/log/$SERVICE_NAME/current | tai64nlocal"
