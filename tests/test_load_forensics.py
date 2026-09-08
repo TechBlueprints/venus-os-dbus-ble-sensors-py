@@ -348,17 +348,35 @@ def test_event_is_one_dump_with_hysteresis(lf):
     th = lf.Thresholds(trip_1m=4.0, trip_5m=6.0, trip_15m=5.5, release_1m=3.0, release_5m=5.0, release_15m=5.0)
     ev = lf.EventState(th, release_samples=2)
     assert ev.update(1.0, 1.0, 1.0, False, 0) is None
-    assert ev.update(4.2, 2.0, 1.5, False, 30) == "1m>=4.0"          # opens
+    assert ev.update(4.2, 2.0, 1.5, False, 30) == ("1m>=4.0", lf.CLASS_EARLY)   # opens
     assert ev.update(5.0, 3.0, 2.0, False, 60) is None                # still open: no second dump
     assert ev.update(2.0, 2.0, 2.0, False, 90) is None and ev.active  # one quiet sample: not yet
     assert ev.update(2.0, 2.0, 2.0, False, 120) is None and not ev.active  # two quiet: closed
-    assert ev.update(1.0, 6.5, 1.0, False, 150) == "5m>=6.0"         # a NEW event opens
+    assert ev.update(1.0, 6.5, 1.0, False, 150) == ("5m>=6.0", lf.CLASS_TRIP)   # a NEW event opens
     assert ev.peak[1] == 6.5
 
 
 def test_service_trip_line_is_a_trigger(lf):
     ev = lf.EventState(lf.Thresholds())
-    assert ev.update(1.0, 1.0, 1.0, True, 0) == "sensors-py tripped"
+    assert ev.update(1.0, 1.0, 1.0, True, 0) == ("sensors-py tripped", lf.CLASS_TRIP)
+
+
+def test_an_early_event_that_becomes_a_real_trip_dumps_again(lf):
+    """Otherwise the moment the box actually tripped is the one never captured,
+    because the early catch had already opened the event."""
+    ev = lf.EventState(lf.Thresholds())
+    assert ev.update(4.2, 2.0, 1.0, False, 0) == ("1m>=4.0", lf.CLASS_EARLY)
+    res = ev.update(4.5, 6.2, 2.0, False, 30)
+    assert res is not None and res[1] == lf.CLASS_TRIP, "the escalation must be captured"
+    assert ev.update(4.5, 6.3, 2.1, False, 60) is None, "but only once"
+
+
+def test_classification_puts_a_real_threshold_above_the_early_catch(lf):
+    c = lf.EventState.classify
+    assert c(["1m>=4.0"]) == lf.CLASS_EARLY
+    assert c(["1m>=4.0", "5m>=6.0"]) == lf.CLASS_TRIP
+    assert c(["15m>=5.5"]) == lf.CLASS_TRIP
+    assert c(["sensors-py tripped"]) == lf.CLASS_TRIP
 
 
 def test_log_tail_starts_at_end_and_follows_rotation(lf, tmp_path):
@@ -376,22 +394,60 @@ def test_log_tail_starts_at_end_and_follows_rotation(lf, tmp_path):
     assert t.poll() is True
 
 
-def test_write_dump_caps_the_directory_and_records_self_cost(lf, tmp_path):
+def test_write_dump_records_the_ring_and_its_own_cost(lf, tmp_path):
     root = str(tmp_path / "proc")
     make_proc(root, _procs_v1())
     sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
     ring = [sm.sample(now=float(i)) for i in range(3)]
     d = str(tmp_path / "dumps")
-    for i in range(lf.DUMP_KEEP + 3):
-        path = lf.write_dump(ring, f"test {i}", d, deep=False, proc_root=root, started_at=1.0)
-        # distinct names: the timestamp resolution is a second
-        os.rename(path, os.path.join(d, f"dump-2026{i:04d}T000000Z.txt"))
-    remaining = sorted(os.listdir(d))
-    assert len(remaining) == lf.DUMP_KEEP, "the directory keeps only the newest N dumps"
-    text = open(os.path.join(d, remaining[-1])).read()
-    assert "self-cost:" in text and "RSS 9000 kB" in text
-    assert "dbus_ble_sensors.py" in text and "usb_start_wait_urb" in text, "the ring and the wait channel are in the dump"
+    path = lf.write_dump(ring, "5m>=6.0", d, deep=False, proc_root=root, started_at=1.0,
+                         cls=lf.CLASS_TRIP)
+    assert path.endswith("-trip.txt"), "the class is in the filename, so pools can be capped apart"
+    text = open(path).read()
+    assert "class: trip" in text and "self-cost:" in text and "RSS 9000 kB" in text
+    assert "dbus_ble_sensors.py" in text and "usb_start_wait_urb" in text, "the ring and the wait channel"
     assert "bus 3" in text
+
+
+def test_an_early_catch_burst_cannot_evict_a_trip_dump(lf, tmp_path):
+    """On prod the early catch fires constantly and a real trip is rare.
+    One shared pool would rotate away the only dump that matters."""
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    ring = [lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS).sample(now=0.0)]
+    d = str(tmp_path / "dumps")
+    keep = lf.DUMP_KEEP[lf.CLASS_EARLY]
+    trip = lf.write_dump(ring, "5m>=6.0", d, deep=False, proc_root=root, cls=lf.CLASS_TRIP)
+    trip_name = "dump-20260101T000000Z-trip.txt"
+    os.rename(trip, os.path.join(d, trip_name))
+    for i in range(keep + 5):
+        p = lf.write_dump(ring, "1m>=4.0", d, deep=False, proc_root=root, cls=lf.CLASS_EARLY)
+        os.rename(p, os.path.join(d, f"dump-2026{i:04d}T000000Z-early.txt"))
+    names = os.listdir(d)
+    assert trip_name in names, "the trip dump survived a burst well past the early cap"
+    assert sum(1 for n in names if n.endswith("-early.txt")) <= keep + 1, "the early pool is capped"
+
+
+def test_early_catch_cooldown_holds_but_a_real_trip_never_waits(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    d = str(tmp_path / "dumps")
+    hot = "4.50 1.00 1.00 2/300 1"
+    calm = "0.50 0.50 0.50 2/300 1"
+    make_proc(root, _procs_v1(), load=hot)
+    fx = lf.Forensics(root=root, dump_dir=d, sensors_log=str(tmp_path / "nolog"),
+                      peers_reader=lambda: PEERS)
+    assert fx.step(now=1000.0, deep=False), "first early catch dumps"
+    make_proc(root, _procs_v1(), load=calm)
+    fx.step(now=1030.0, deep=False)
+    fx.step(now=1060.0, deep=False)
+    assert not fx.event.active, "two quiet samples close it"
+    make_proc(root, _procs_v1(), load=hot)
+    assert fx.step(now=1090.0, deep=False) is None, "inside the cooldown: event opens, no dump"
+    assert fx.dumps == 1
+    # a REAL trip during that same cooldown is never withheld
+    make_proc(root, _procs_v1(), load="4.50 6.50 2.00 2/300 1")
+    assert fx.step(now=1120.0, deep=False), "a threshold trip ignores the early cooldown"
+    assert fx.dumps == 2
 
 
 def test_forensics_step_dumps_once_per_event(lf, tmp_path):

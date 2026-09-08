@@ -94,7 +94,19 @@ TOP_N = 8
 # mixes two kinds of artifact in one place and invites a cleanup of "the log
 # directory" to take the evidence with it.  multilog ignores subdirectories.
 DUMP_DIR = "/data/log/load-forensics/dumps"
-DUMP_KEEP = 20                                      # ring of dump files
+# Dumps are kept in two SEPARATE pools, by what opened the event.  On prod
+# the early catch fires often -- every pack restart, every GUI session --
+# while a real 5m/15m throttle trip is rare and is the whole point.  A single
+# pool would let a burst of routine early-catch dumps rotate out the one dump
+# that matters, so a "trip" dump is never evicted to make room for an "early"
+# one.  The two pools also make the cooldowns independent.
+CLASS_EARLY = "early"                               # our own 1-minute crossing
+CLASS_TRIP = "trip"                                 # the service's own 5m/15m thresholds
+DUMP_KEEP = {CLASS_EARLY: 10, CLASS_TRIP: 10}
+# After an early-catch dump, wait before writing another: a 1-minute average
+# hovering around the threshold would otherwise open and close an event every
+# minute.  A real trip is never cooled down.
+COOLDOWN_S = {CLASS_EARLY: 300.0, CLASS_TRIP: 0.0}
 TAIL_LINES = 40
 TRIGGER_1M = 4.0                                    # early catch, own rule
 RELEASE_1M = 3.0
@@ -601,6 +613,7 @@ class EventState:
         self.opened_at: Optional[float] = None
         self.peak: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.reason = ""
+        self.cls = CLASS_EARLY
 
     def reasons(self, l1: float, l5: float, l15: float, log_tripped: bool) -> list[str]:
         r = []
@@ -614,11 +627,31 @@ class EventState:
             r.append("sensors-py tripped")
         return r
 
-    def update(self, l1: float, l5: float, l15: float, log_tripped: bool, now: float) -> Optional[str]:
-        """Returns a reason string when a NEW event opens (dump now); None otherwise."""
+    @staticmethod
+    def classify(reasons: list) -> str:
+        """A real threshold trip outranks our own early catch."""
+        for r in reasons:
+            if r.startswith("5m") or r.startswith("15m") or "tripped" in r:
+                return CLASS_TRIP
+        return CLASS_EARLY
+
+    def update(self, l1: float, l5: float, l15: float, log_tripped: bool,
+               now: float) -> 'Optional[tuple[str, str]]':
+        """Returns (reason, class) when a dump should be written; None otherwise.
+
+        A dump is written when an event opens, and once more if an event that
+        opened on the early catch ESCALATES into a real threshold trip --
+        otherwise the moment the box actually tripped would be the one moment
+        never captured, because the event was already open.
+        """
         rs = self.reasons(l1, l5, l15, log_tripped)
         if self.active:
             self.peak = tuple(max(a, b) for a, b in zip(self.peak, (l1, l5, l15)))
+            if rs and self.cls == CLASS_EARLY and self.classify(rs) == CLASS_TRIP:
+                self.cls = CLASS_TRIP
+                self.reason = " | ".join(rs)
+                self.quiet = 0
+                return self.reason, CLASS_TRIP
             quiet = (l1 < self.th.release_1m and l5 < self.th.release_5m and l15 < self.th.release_15m)
             self.quiet = self.quiet + 1 if quiet else 0
             if self.quiet >= self.release_samples:
@@ -626,8 +659,9 @@ class EventState:
             return None
         if rs:
             self.active, self.quiet, self.opened_at = True, 0, now
+            self.cls = self.classify(rs)
             self.peak, self.reason = (l1, l5, l15), " | ".join(rs)
-            return self.reason
+            return self.reason, self.cls
         return None
 
 
@@ -723,16 +757,18 @@ def format_sample(s: Sample, t0: float) -> str:
     return head + "\n" + "\n".join(rows)
 
 
-def write_dump(ring, reason: str, dump_dir: str = DUMP_DIR, keep: int = DUMP_KEEP,
+def write_dump(ring, reason: str, dump_dir: str = DUMP_DIR, keep: Optional[dict] = None,
                tails=TAIL_LOGS, tail_globs=TAIL_LOG_GLOBS, deep: bool = True,
-               proc_root: str = "/proc", started_at: float = 0.0) -> str:
+               proc_root: str = "/proc", started_at: float = 0.0,
+               cls: str = CLASS_EARLY) -> str:
+    """Write the ring plus a deep snapshot, and cap only *cls*'s own pool."""
     os.makedirs(dump_dir, exist_ok=True)
     now = time.time()
-    path = os.path.join(dump_dir, time.strftime("dump-%Y%m%dT%H%M%SZ.txt", time.gmtime(now)))
+    path = os.path.join(dump_dir, time.strftime(f"dump-%Y%m%dT%H%M%SZ-{cls}.txt", time.gmtime(now)))
     cpu, rss = self_cost(proc_root)
     up = now - started_at if started_at else 0.0
     out = [f"=== load-forensics dump {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))} "
-           f"trigger: {reason} ===",
+           f"class: {cls}  trigger: {reason} ===",
            f"self-cost: {cpu:.2f} s CPU since start (up {up / 3600:.2f} h, "
            f"{(100.0 * cpu / up) if up > 0 else 0:.2f}% avg of one core), RSS {rss} kB",
            f"--- ring: {len(ring)} samples, oldest first (t relative to now); "
@@ -746,9 +782,11 @@ def write_dump(ring, reason: str, dump_dir: str = DUMP_DIR, keep: int = DUMP_KEE
             out += [f"--- {t} (tail) ---", _tail_file(t)]
     with open(path, "w") as f:
         f.write("\n".join(out) + "\n")
-    # cap the directory
-    dumps = sorted(glob.glob(os.path.join(dump_dir, "dump-*.txt")))
-    for old in (dumps[:-keep] if len(dumps) > keep else []):
+    # Cap THIS class's pool only, so an early-catch burst can never evict a
+    # threshold-trip dump.
+    n = (keep or DUMP_KEEP).get(cls, 10)
+    mine = sorted(glob.glob(os.path.join(dump_dir, f"dump-*-{cls}.txt")))
+    for old in (mine[:-n] if len(mine) > n else []):
         try:
             os.remove(old)
         except OSError:
@@ -771,6 +809,7 @@ class Forensics:
         self.dumps = 0
         self._stop = False
         self._last_beat = self.started_at
+        self._last_dump_at: dict = {}          # class -> when we last wrote one
 
     def step(self, now: Optional[float] = None, deep: bool = True) -> Optional[str]:
         """One sample; returns the dump path if an event opened."""
@@ -780,13 +819,22 @@ class Forensics:
         self.ring.append(s)
         self.samples += 1
         l1, l5, l15 = s.load[0], s.load[1], s.load[2]
-        reason = self.event.update(l1, l5, l15, self.tail.poll(), now)
+        res = self.event.update(l1, l5, l15, self.tail.poll(), now)
         path = None
-        if reason:
-            path = write_dump(self.ring, reason, self.dump_dir, proc_root=self.root,
-                              started_at=self.started_at, deep=deep)
-            self.dumps += 1
-            log.warning("event opened: %s (load %.2f/%.2f/%.2f) -> %s", reason, l1, l5, l15, path)
+        if res:
+            reason, cls = res
+            since = now - self._last_dump_at.get(cls, 0.0)
+            if self._last_dump_at.get(cls) and since < COOLDOWN_S.get(cls, 0.0):
+                log.info("event (%s): %s (load %.2f/%.2f/%.2f) -- no dump, %.0f s "
+                         "into the %.0f s cooldown for this class",
+                         cls, reason, l1, l5, l15, since, COOLDOWN_S[cls])
+            else:
+                path = write_dump(self.ring, reason, self.dump_dir, proc_root=self.root,
+                                  started_at=self.started_at, deep=deep, cls=cls)
+                self._last_dump_at[cls] = now
+                self.dumps += 1
+                log.warning("event (%s): %s (load %.2f/%.2f/%.2f) -> %s",
+                            cls, reason, l1, l5, l15, path)
         if now - self._last_beat >= HEARTBEAT_S:
             cpu, rss = self_cost(self.root)
             up = now - self.started_at
@@ -802,10 +850,12 @@ class Forensics:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stop", True))
         peers_ok = read_unix_peers() is not None
         log.info("load-forensics started: interval %.0f s, ring %d min, triggers 1m>=%.1f | 5m>=%.1f | "
-                 "15m>=%.1f (release 1m<%.1f 5m<%.1f 15m<%.1f), dumps -> %s (keep %d), "
+                 "15m>=%.1f (release 1m<%.1f 5m<%.1f 15m<%.1f), dumps -> %s "
+                 "(keep %d early / %d trip, separate pools; early cooldown %.0f s), "
                  "per-process bus count via unix_diag: %s, watch: %s",
                  self.interval, RING_MINUTES, self.th.trip_1m, self.th.trip_5m, self.th.trip_15m,
-                 self.th.release_1m, self.th.release_5m, self.th.release_15m, self.dump_dir, DUMP_KEEP,
+                 self.th.release_1m, self.th.release_5m, self.th.release_15m, self.dump_dir,
+                 DUMP_KEEP[CLASS_EARLY], DUMP_KEEP[CLASS_TRIP], COOLDOWN_S[CLASS_EARLY],
                  "available" if peers_ok else "UNAVAILABLE (reported as '?')", ", ".join(WATCH_LIST))
         next_t = time.monotonic()
         while not self._stop:
@@ -839,7 +889,9 @@ def main(argv=None) -> int:
         for _ in range(3):
             fx.step()
             time.sleep(2)
-        path = write_dump(fx.ring, "manual --dump-now", a.dump_dir, started_at=fx.started_at)
+        # its own class, so a soak check never evicts a real event's dump
+        path = write_dump(fx.ring, "manual --dump-now", a.dump_dir,
+                          started_at=fx.started_at, cls="manual")
         print(path)
         return 0
     fx.run()

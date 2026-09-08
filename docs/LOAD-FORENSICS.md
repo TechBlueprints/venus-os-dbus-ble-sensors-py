@@ -52,14 +52,28 @@ never as a false zero, and the startup line says so.
 - the service's own `load_throttle: tripped` line, tailed from `current`
   only (rotated logs are never read).
 An event closes after two consecutive samples under the release levels.
+
+**Two classes, kept apart.** A dump is *early* when only our own 1-minute
+rule fired, and *trip* when a real threshold or the service's own trip line
+did. On prod the early catch fires often — every pack restart, every GUI
+session — while a real trip is rare and is the entire point, so the two are
+kept in **separate pools of 10** and a trip dump is never evicted to make
+room for an early one. An early-catch dump also waits out a 5-minute
+cooldown, so a 1-minute average hovering at the threshold cannot open and
+close an event every minute; a real trip never waits.
+
+**Escalation.** If an event opened on the early catch and the load then
+crosses a real threshold, a second dump is written and the event is
+promoted. Without that, the moment the box actually tripped would be the one
+moment never captured, because the event was already open.
 While an event is open, each sample is a **lean** pass (no fd walk, no wait
 channels, no bus inodes): nothing beyond one `/proc` pass while tripped.
 
 ## What a dump adds (on trigger only; two forks: `dmesg`, `hciconfig -a`)
 The ring (oldest first), `dmesg` tail, adapter link/scan state, and the
 last 40 lines of the sensors, systemcalc, sshd and pack logs, read directly
-from each `current`. Written to `/data/log/load-forensics/dumps/dump-<UTC>.txt`;
-that directory keeps the newest 20, about 96 kB each.
+from each `current`. Written to
+`/data/log/load-forensics/dumps/dump-<UTC>-<class>.txt`, about 96 kB each.
 
 Dumps go in a **subdirectory** on purpose. On Venus `/var/log` is a symlink
 to `/data/log`, so the multilog carrying this service's own log owns
