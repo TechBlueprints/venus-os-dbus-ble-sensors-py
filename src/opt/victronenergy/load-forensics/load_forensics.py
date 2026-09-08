@@ -124,10 +124,14 @@ DBUS_SOCKET_PATHS = ("/var/run/dbus/system_bus_socket", "/run/dbus/system_bus_so
 EMMC_DEVICE = "mmcblk1"
 
 # Multicast DNS.  Venus's dbus-modbus-client binds this port, joins this
-# group, and parses EVERY packet on the LAN with a pure-Python DNS parser,
-# so its CPU tracks mDNS traffic rather than anything Modbus.  Counting the
-# packets it has to parse is what turns "modbus-client at 21 %" into
-# "modbus-client at 21 % while mDNS ran at N packets/s from host X".
+# group, and parses EVERY packet on the LAN with a pure-Python DNS parser.
+# Its steady ~0.3-0.4 % of a core is NOT that parsing -- measured on prod
+# against an almost silent LAN (0.3 packets/s), it is the process's own
+# 100 ms update loop.  Parsing is the SPIKE term: it is what took the same
+# process to 21 % of a core during dev's two load events.  So this column
+# is the denominator for the spikes, not for the baseline, and it turns
+# "modbus-client at 21 %" into "modbus-client at 21 % while mDNS ran at N
+# packets/s from host X".
 MDNS_GROUP = "224.0.0.251"
 MDNS_PORT = 5353
 MDNS_RCVBUF = 4 * 1024 * 1024      # hold a burst between two 30 s samples
@@ -360,10 +364,14 @@ def read_unix_peers() -> Optional[dict[int, int]]:
 class MdnsCounter:
     """Count multicast-DNS packets and bytes.  Never parse them.
 
-    Parsing is the very cost being measured -- it is what makes
-    dbus-modbus-client expensive -- so doing it here would turn the
-    instrument into the thing it is watching.  We take the length and the
-    source address, both of which ``recvfrom`` hands over for free.
+    Parsing is the very cost being measured -- it is what takes
+    dbus-modbus-client from its 0.3 % idle loop to 21 % of a core during a
+    burst -- so doing it here would turn the instrument into the thing it is
+    watching.  A parsing census of this same traffic undercounted it about
+    fivefold on this hardware, dropping what it could not keep up with,
+    which is the same failure the Modbus client pays for in CPU.  We take
+    the length and the source address, both of which ``recvfrom`` hands
+    over for free.
 
     The socket is a passive listener: joining a group the host has already
     joined adds no traffic to the network, and nothing is ever sent.  If the
