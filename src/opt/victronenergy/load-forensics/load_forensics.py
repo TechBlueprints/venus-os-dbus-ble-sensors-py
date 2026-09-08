@@ -87,7 +87,13 @@ INTERVAL_S = 30.0
 RING_MINUTES = 30
 RING_LEN = int(RING_MINUTES * 60 / INTERVAL_S)     # 60 samples
 TOP_N = 8
-DUMP_DIR = "/data/log/load-forensics"
+# A SUBDIRECTORY of the service's log directory, not the directory itself.
+# On Venus ``/var/log`` is a symlink to ``/data/log``, so the multilog that
+# writes this service's own log owns ``/data/log/load-forensics`` -- its
+# ``current``, ``state`` and ``lock`` live there.  Writing dumps beside them
+# mixes two kinds of artifact in one place and invites a cleanup of "the log
+# directory" to take the evidence with it.  multilog ignores subdirectories.
+DUMP_DIR = "/data/log/load-forensics/dumps"
 DUMP_KEEP = 20                                      # ring of dump files
 TAIL_LINES = 40
 TRIGGER_1M = 4.0                                    # early catch, own rule

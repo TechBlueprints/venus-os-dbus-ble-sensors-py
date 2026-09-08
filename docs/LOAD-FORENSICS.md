@@ -58,8 +58,14 @@ channels, no bus inodes): nothing beyond one `/proc` pass while tripped.
 ## What a dump adds (on trigger only; two forks: `dmesg`, `hciconfig -a`)
 The ring (oldest first), `dmesg` tail, adapter link/scan state, and the
 last 40 lines of the sensors, systemcalc, sshd and pack logs, read directly
-from each `current`. Written to `/data/log/load-forensics/dump-<UTC>.txt`;
-the directory keeps the newest 20.
+from each `current`. Written to `/data/log/load-forensics/dumps/dump-<UTC>.txt`;
+that directory keeps the newest 20, about 96 kB each.
+
+Dumps go in a **subdirectory** on purpose. On Venus `/var/log` is a symlink
+to `/data/log`, so the multilog carrying this service's own log owns
+`/data/log/load-forensics` and keeps its `current`, `state` and `lock`
+there. Writing dumps beside them would mix two kinds of artifact in one
+place, and a cleanup of "the log directory" would take the evidence with it.
 
 Every dump and every hourly heartbeat carries the instrument's **own
 cost** (CPU seconds since start and RSS). It runs at nice +10.

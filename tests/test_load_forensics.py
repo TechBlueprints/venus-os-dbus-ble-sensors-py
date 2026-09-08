@@ -410,6 +410,15 @@ def test_ring_is_thirty_minutes_of_thirty_second_samples(lf):
     assert lf.RING_LEN == 60 and lf.INTERVAL_S == 30.0 and lf.RING_MINUTES == 30
 
 
+def test_dumps_do_not_share_a_directory_with_the_service_log(lf):
+    """On Venus /var/log is a symlink to /data/log, so the service's multilog
+    owns /data/log/load-forensics.  Dumps must not land among its files."""
+    assert lf.DUMP_DIR.rstrip("/") != "/data/log/load-forensics", \
+        "that is multilog's directory: its current/state/lock live there"
+    assert lf.DUMP_DIR.startswith("/data/log/load-forensics/"), \
+        "keep dumps under the tool's own name, in a subdirectory"
+
+
 def test_tail_file_reads_only_the_tail(lf, tmp_path):
     p = tmp_path / "log"
     p.write_text("".join(f"line {i}\n" for i in range(100)))
