@@ -191,6 +191,47 @@ def test_top_n_plus_watchlist_and_restart_flag(lf, tmp_path):
     assert any(p.name == "dbus_ble_sensors.py" and p.restarted for p in s.procs)
 
 
+def test_two_processes_of_one_script_are_told_apart_by_their_mac_argument(lf, tmp_path):
+    """Prod runs both packs as `dbus-serialbattery.py HumsiENK_Ble <MAC>`.
+
+    Sharing a name would collapse them into one watched entry, so a restart
+    could not say which pack went -- and the restart rule would see one name
+    holding two pids.
+    """
+    root = str(tmp_path / "proc")
+    packs = [
+        dict(pid=9827, comm="python", utime=1, stime=1,
+             cmdline="python /data/apps/dbus-serialbattery/dbus-serialbattery.py HumsiENK_Ble 53:20:B7:D7:F9:E7"),
+        dict(pid=10737, comm="python", utime=1, stime=1,
+             cmdline="python /data/apps/dbus-serialbattery/dbus-serialbattery.py HumsiENK_Ble AB:80:72:54:E0:B4"),
+    ]
+    make_proc(root, _procs_v1() + packs)
+    names = {p.pid: p.name for p in lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS).sample(now=0.0).procs}
+    assert names[9827] == "dbus-serialbattery.py:f9e7"
+    assert names[10737] == "dbus-serialbattery.py:e0b4"
+    assert names[9827] != names[10737], "two packs must not collapse into one watched name"
+    assert lf.is_watched(names[9827]), "the tag must not break watch-list matching"
+    # a script with no MAC argument keeps its plain name
+    assert names[100] == "dbus_ble_sensors.py"
+
+
+def test_one_pack_restarting_is_flagged_and_the_other_is_not(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    pack_a = dict(pid=9827, comm="python", utime=1, stime=1,
+                  cmdline="python /x/dbus-serialbattery.py HumsiENK_Ble 53:20:B7:D7:F9:E7")
+    pack_b = dict(pid=10737, comm="python", utime=1, stime=1,
+                  cmdline="python /x/dbus-serialbattery.py HumsiENK_Ble AB:80:72:54:E0:B4")
+    make_proc(root, _procs_v1() + [pack_a, pack_b])
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    sm.sample(now=0.0)
+    pack_b["pid"] = 10800                      # pack B is replaced; pack A untouched
+    make_proc(root, _procs_v1() + [pack_a, pack_b])
+    s = sm.sample(now=30.0)
+    by = {p.name: p for p in s.procs}
+    assert by["dbus-serialbattery.py:e0b4"].restarted, "the pack that was replaced"
+    assert not by["dbus-serialbattery.py:f9e7"].restarted, "the pack that was not"
+
+
 def test_a_second_process_of_the_same_name_is_not_a_restart(lf, tmp_path):
     """sshd has one process per connection: a new login must not read as a restart."""
     root = str(tmp_path / "proc")

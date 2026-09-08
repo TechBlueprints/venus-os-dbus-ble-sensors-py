@@ -344,17 +344,42 @@ class Proc:
     restarted: bool = False
 
 
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def _disambiguator(rest: list) -> str:
+    """A short tag telling two processes of the same script apart.
+
+    On prod both battery packs run ``dbus-serialbattery.py`` and differ only
+    in a MAC argument.  Without this they share one name, and the RESTARTED
+    signature -- whose whole job is to say a pack was replaced -- cannot say
+    WHICH pack, while the restart rule sees one name carrying two pids.
+    The last four hex digits of a MAC-shaped argument are enough, and are
+    what the logs already call these devices by.
+    """
+    for a in reversed(rest):
+        if not a or a.startswith("-"):
+            continue
+        compact = a.replace(":", "")
+        if len(compact) == 12 and all(c in _HEX for c in compact):
+            return compact[-4:].lower()
+    return ""
+
+
 def _proc_name(root: str, pid: int, comm: str) -> str:
-    """comm, or for an interpreter the script's basename (packs, sensors, easytouch are all python3)."""
+    """comm, or for an interpreter the script's basename plus, when two
+    processes run the same script, a short tag from its arguments."""
     if not (comm.startswith("python") or comm in ("sh", "bash")):
         return comm
     try:
         argv = _read_fast(f"{root}/{pid}/cmdline").split("\0")
     except OSError:
         return comm
-    for a in argv[1:]:
+    for i, a in enumerate(argv[1:], start=1):
         if a.endswith(".py") or a.endswith(".sh"):
-            return os.path.basename(a)
+            base = os.path.basename(a)
+            tag = _disambiguator(argv[i + 1:])
+            return f"{base}:{tag}" if tag else base
     return comm
 
 
