@@ -10,6 +10,7 @@ set -e
 INSTALL_DIR="/data/apps/dbus-ble-sensors-py"
 SERVICE_NAME="dbus-ble-sensors-py"
 LAUNCHER_NAME="dbus-ble-sensors-py-launcher"
+FORENSICS_NAME="load-forensics"
 APP_DIR="$INSTALL_DIR/src/opt/victronenergy/dbus-ble-sensors-py"
 
 echo ""
@@ -159,6 +160,33 @@ RC_ENTRY="bash $INSTALL_DIR/enable.sh > $INSTALL_DIR/startup.log 2>&1 &"
 if ! grep -qF "dbus-ble-sensors-py" "$RC_LOCAL"; then
     echo "$RC_ENTRY" >> "$RC_LOCAL"
     echo "  Added to rc.local"
+fi
+
+# --- load-forensics: brought up independently of the BLE service ------
+#
+# /service is a tmpfs, so its symlink does NOT survive a reboot, while the
+# service directory under /data does.  Nothing else recreates it, and this
+# is the tool whose whole purpose is explaining the load spikes that reboot
+# this box -- so being silently absent after exactly such a reboot is the
+# one failure that would matter most.  install.sh creates the link; this is
+# what puts it back on every boot.
+#
+# Handled in its own block, deliberately.  Folding it into the symlink
+# check above would mean a missing forensics link dragged the two BLE
+# services through a stop-and-recreate cycle, restarting sensors-py for a
+# reason that has nothing to do with it.  The directory test keeps a clone
+# that does not carry the tool completely unaffected.
+if [ -d "$INSTALL_DIR/service-load-forensics" ]; then
+    chmod +x "$INSTALL_DIR"/service-load-forensics/run 2>/dev/null || true
+    chmod +x "$INSTALL_DIR"/service-load-forensics/log/run 2>/dev/null || true
+    if [ "$(readlink "/service/$FORENSICS_NAME" 2>/dev/null)" \
+         != "$INSTALL_DIR/service-load-forensics" ]; then
+        rm -rf "/service/$FORENSICS_NAME" 2>/dev/null || true
+        ln -s "$INSTALL_DIR/service-load-forensics" "/service/$FORENSICS_NAME"
+        echo "  load-forensics symlink created"
+    fi
+    svc -u "/service/$FORENSICS_NAME/log" 2>/dev/null || true
+    svc -u "/service/$FORENSICS_NAME" 2>/dev/null || true
 fi
 
 # --- Start services ---

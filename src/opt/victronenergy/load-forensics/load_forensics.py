@@ -123,6 +123,20 @@ WATCH_LIST = (
 DBUS_SOCKET_PATHS = ("/var/run/dbus/system_bus_socket", "/run/dbus/system_bus_socket")
 EMMC_DEVICE = "mmcblk1"
 
+# Multicast DNS.  Venus's dbus-modbus-client binds this port, joins this
+# group, and parses EVERY packet on the LAN with a pure-Python DNS parser.
+# Its steady ~0.3-0.4 % of a core is NOT that parsing -- measured on prod
+# against an almost silent LAN (0.3 packets/s), it is the process's own
+# 100 ms update loop.  Parsing is the SPIKE term: it is what took the same
+# process to 21 % of a core during dev's two load events.  So this column
+# is the denominator for the spikes, not for the baseline, and it turns
+# "modbus-client at 21 %" into "modbus-client at 21 % while mDNS ran at N
+# packets/s from host X".
+MDNS_GROUP = "224.0.0.251"
+MDNS_PORT = 5353
+MDNS_RCVBUF = 4 * 1024 * 1024      # hold a burst between two 30 s samples
+MDNS_DRAIN_CAP = 20000             # bound the work one sample can be handed
+
 # Logs tailed into a dump (direct file reads of ``current`` only, no forks).
 TAIL_LOGS = (
     "/var/log/dbus-ble-sensors-py/current",
@@ -347,6 +361,89 @@ def read_unix_peers() -> Optional[dict[int, int]]:
         s.close()
 
 
+class MdnsCounter:
+    """Count multicast-DNS packets and bytes.  Never parse them.
+
+    Parsing is the very cost being measured -- it is what takes
+    dbus-modbus-client from its 0.3 % idle loop to 21 % of a core during a
+    burst -- so doing it here would turn the instrument into the thing it is
+    watching.  A parsing census of this same traffic undercounted it about
+    fivefold on this hardware, dropping what it could not keep up with,
+    which is the same failure the Modbus client pays for in CPU.  We take
+    the length and the source address, both of which ``recvfrom`` hands
+    over for free.
+
+    The socket is a passive listener: joining a group the host has already
+    joined adds no traffic to the network, and nothing is ever sent.  If the
+    port cannot be opened the counter reports "unavailable" and the rest of
+    the sample is unaffected.
+    """
+
+    def __init__(self, sock=None, group: str = MDNS_GROUP, port: int = MDNS_PORT,
+                 cap: int = MDNS_DRAIN_CAP):
+        self.cap = cap
+        self.error: Optional[str] = None
+        self.sock = sock
+        if sock is None:
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MDNS_RCVBUF)
+                except OSError:
+                    pass
+                s.bind(("", port))
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                             struct.pack("4sL", socket.inet_aton(group), socket.INADDR_ANY))
+                s.setblocking(False)
+                self.sock = s
+            except OSError as e:
+                self.error = repr(e)
+                self.sock = None
+                if s is not None:
+                    try:
+                        s.close()          # never leak the half-set-up socket
+                    except OSError:
+                        pass
+
+    @property
+    def available(self) -> bool:
+        return self.sock is not None
+
+    def drain(self) -> tuple:
+        """(packets, bytes, saturated, top sources) since the last call.
+
+        *saturated* means the drain hit its cap, so the counts are a lower
+        bound -- which is itself the signal that a flood is under way.
+        """
+        if self.sock is None:
+            return -1, -1, False, []
+        n = nbytes = 0
+        src: collections.Counter = collections.Counter()
+        saturated = False
+        while n < self.cap:
+            try:
+                pkt, addr = self.sock.recvfrom(9000)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            n += 1
+            nbytes += len(pkt)
+            src[addr[0]] += 1
+        else:
+            saturated = True
+        return n, nbytes, saturated, src.most_common(3)
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            finally:
+                self.sock = None
+
+
 @dataclass
 class Proc:
     pid: int
@@ -492,13 +589,20 @@ class Sample:
     disk_write_ms: int          # since last sample
     disk_io_ms: int
     bus_connections: int        # live connections on the system bus (accepted sockets); -1 unknown
+    mdns_pkts: int              # multicast-DNS packets since the last sample; -1 unavailable
+    mdns_bytes: int
+    mdns_saturated: bool        # the drain hit its cap: the counts are a lower bound
+    mdns_top: list              # [(source ip, packets)], at most three
     procs: list                 # of Proc, top-N + watched
     lean: bool = False          # taken while tripped: no fd/wchan/bus work
 
 
 class Sampler:
     def __init__(self, root: str = "/proc", clk_tck: Optional[int] = None,
-                 top_n: int = TOP_N, watch=WATCH_LIST, peers_reader=None):
+                 top_n: int = TOP_N, watch=WATCH_LIST, peers_reader=None, mdns=None):
+        # *mdns* is supplied by the caller rather than opened here, so a unit
+        # test of the sampler never touches the network.
+        self.mdns = mdns
         self.root = root
         self.clk_tck = clk_tck or os.sysconf("SC_CLK_TCK")
         self.top_n = top_n
@@ -575,6 +679,13 @@ class Sampler:
                 p.restarted = True
         self._watched_pids = live
 
+        # Drained even in lean mode: it is a counter, not a parse, and the
+        # samples taken DURING an event are exactly the ones whose mDNS rate
+        # explains it.  Skipping it would also let the socket buffer overflow
+        # and lose the count for those samples.
+        mdns_pkts, mdns_bytes, mdns_sat, mdns_top = (
+            self.mdns.drain() if self.mdns is not None else (-1, -1, False, []))
+
         bus_connections = -1
         if not lean:
             _listeners, accepted = read_bus_rows(self.root)
@@ -588,6 +699,8 @@ class Sampler:
                       running=sysc.running, blocked=sysc.blocked,
                       memavail_kb=read_memavailable_kb(self.root), file_nr=read_file_nr(self.root),
                       disk_write_ms=dwr, disk_io_ms=dio, bus_connections=bus_connections,
+                      mdns_pkts=mdns_pkts, mdns_bytes=mdns_bytes,
+                      mdns_saturated=mdns_sat, mdns_top=mdns_top,
                       procs=selected, lean=lean)
 
 
@@ -737,13 +850,25 @@ def self_cost(root: str = "/proc", clk_tck: Optional[int] = None) -> tuple[float
     return cpu, rss
 
 
+def _mdns_text(s: Sample) -> str:
+    """The mDNS column: what dbus-modbus-client had to parse this interval."""
+    if s.mdns_pkts < 0:
+        return ""
+    out = f" mdns +{s.mdns_pkts} pkt/{s.mdns_bytes // 1024} kB"
+    if s.mdns_saturated:
+        out += " SATURATED"
+    if s.mdns_top:
+        out += " from " + ",".join(f"{ip}={n}" for ip, n in s.mdns_top)
+    return out
+
+
 def format_sample(s: Sample, t0: float) -> str:
     l1, l5, l15, run, tot, _ = s.load
     c = s.cpu_pct
     head = (f"t{s.t - t0:+8.0f}s {time.strftime('%H:%M:%S', time.gmtime(s.t))}Z "
             f"load {l1:.2f}/{l5:.2f}/{l15:.2f} run {s.running} blk {s.blocked} "
             f"forks +{s.forks} ctxt +{s.ctxt} memavail {s.memavail_kb // 1024} MB fds {s.file_nr} "
-            f"bus {s.bus_connections} mmc wr +{s.disk_write_ms} ms io +{s.disk_io_ms} ms"
+            f"bus {s.bus_connections}{_mdns_text(s)} mmc wr +{s.disk_write_ms} ms io +{s.disk_io_ms} ms"
             + (f" | cpu user {c.get('user', 0):.0f}% sys {c.get('system', 0):.0f}% iow {c.get('iowait', 0):.0f}% "
                f"sirq {c.get('softirq', 0):.0f}% idle {c.get('idle', 0):.0f}%" if c else "")
             + (" [LEAN]" if s.lean else ""))
@@ -797,10 +922,12 @@ def write_dump(ring, reason: str, dump_dir: str = DUMP_DIR, keep: Optional[dict]
 # ------------------------------------------------------------------- main ---
 class Forensics:
     def __init__(self, root: str = "/proc", dump_dir: str = DUMP_DIR, interval: float = INTERVAL_S,
-                 th: Optional[Thresholds] = None, sensors_log: str = SENSORS_LOG, peers_reader=None):
+                 th: Optional[Thresholds] = None, sensors_log: str = SENSORS_LOG, peers_reader=None,
+                 mdns=None):
         self.root, self.dump_dir, self.interval = root, dump_dir, interval
         self.th = th or Thresholds()
-        self.sampler = Sampler(root, peers_reader=peers_reader)
+        self.mdns = mdns
+        self.sampler = Sampler(root, peers_reader=peers_reader, mdns=mdns)
         self.ring = collections.deque(maxlen=RING_LEN)
         self.event = EventState(self.th)
         self.tail = LogTail(sensors_log, TRIP_LINE)
@@ -852,11 +979,14 @@ class Forensics:
         log.info("load-forensics started: interval %.0f s, ring %d min, triggers 1m>=%.1f | 5m>=%.1f | "
                  "15m>=%.1f (release 1m<%.1f 5m<%.1f 15m<%.1f), dumps -> %s "
                  "(keep %d early / %d trip, separate pools; early cooldown %.0f s), "
-                 "per-process bus count via unix_diag: %s, watch: %s",
+                 "per-process bus count via unix_diag: %s, mDNS counter: %s, watch: %s",
                  self.interval, RING_MINUTES, self.th.trip_1m, self.th.trip_5m, self.th.trip_15m,
                  self.th.release_1m, self.th.release_5m, self.th.release_15m, self.dump_dir,
                  DUMP_KEEP[CLASS_EARLY], DUMP_KEEP[CLASS_TRIP], COOLDOWN_S[CLASS_EARLY],
-                 "available" if peers_ok else "UNAVAILABLE (reported as '?')", ", ".join(WATCH_LIST))
+                 "available" if peers_ok else "UNAVAILABLE (reported as '?')",
+                 "listening on %s:%d" % (MDNS_GROUP, MDNS_PORT) if (self.mdns and self.mdns.available)
+                 else "unavailable (%s)" % (getattr(self.mdns, "error", "not enabled")),
+                 ", ".join(WATCH_LIST))
         next_t = time.monotonic()
         while not self._stop:
             try:
@@ -884,7 +1014,12 @@ def main(argv=None) -> int:
                         format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
     t15, t5, r15, r5 = sensors_py_thresholds()
     th = Thresholds(trip_5m=t5, trip_15m=t15, release_5m=r5, release_15m=r15)
-    fx = Forensics(dump_dir=a.dump_dir, interval=a.interval, th=th)
+    # Opened here, not in a constructor, so every unit test stays off the network.
+    mdns = MdnsCounter()
+    if not mdns.available:
+        log.warning("mDNS counter unavailable (%s); the modbus-client load "
+                    "signature will have no packet-rate column", mdns.error)
+    fx = Forensics(dump_dir=a.dump_dir, interval=a.interval, th=th, mdns=mdns)
     if a.dump_now:
         for _ in range(3):
             fx.step()

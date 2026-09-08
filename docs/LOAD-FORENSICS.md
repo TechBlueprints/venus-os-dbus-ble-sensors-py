@@ -31,6 +31,21 @@ is cached for the life of that process. The tool warns in its own heartbeat
 if it ever averages more than 1 % of a core.
 - A global **bus** figure: live connections on the system bus, from the
   `/proc/net/unix` rows bound to the bus socket (listener excluded).
+- An **mdns** figure: multicast-DNS packets and bytes this interval, with the
+  top three source addresses. Venus's `dbus-modbus-client` binds port 5353,
+  joins the mDNS group and parses *every* packet on the LAN with a
+  pure-Python DNS parser. Its steady 0.3–0.4 % of a core is **not** that
+  parsing — measured against an almost silent LAN it is the process's own
+  100 ms update loop. Parsing is the **spike** term, and it is what took the
+  same process to 21 % of a core during dev's two load events. So this
+  column is the denominator for the spikes rather than the baseline, and it
+  turns "modbus-client at 21 %" into "modbus-client at 21 % while mDNS ran
+  at N packets/s from host X". We
+  **count only, never parse** — parsing is the very cost being measured. A
+  drain is capped, and a capped drain is flagged `SATURATED`, which is
+  itself the signal that a flood is under way. It is counted even while
+  tripped: those are the samples whose rate explains the event, and an
+  undrained socket would overflow and lose exactly them.
 
 **How the per-process bus count works, and why it is not the obvious rule.**
 `/proc/net/unix` prints each socket's *own* bound path, so only the bus
