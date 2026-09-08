@@ -19,6 +19,7 @@ import os
 import shutil
 import struct
 import sys
+import time
 
 import pytest
 
@@ -460,6 +461,83 @@ def test_forensics_step_dumps_once_per_event(lf, tmp_path):
     assert path and os.path.exists(path) and fx.dumps == 1
     assert fx.step(now=1030.0, deep=False) is None and fx.dumps == 1, "still open: one event, one dump"
     assert fx.ring[-1].lean, "while the event is open, samples are lean"
+
+
+def test_mdns_counter_counts_without_parsing(lf):
+    """It must never parse: parsing is the cost being measured."""
+    import socket as sk
+    rx = sk.socket(sk.AF_INET, sk.SOCK_DGRAM)
+    rx.bind(("127.0.0.1", 0))
+    rx.setblocking(False)
+    port = rx.getsockname()[1]
+    tx = sk.socket(sk.AF_INET, sk.SOCK_DGRAM)
+    c = lf.MdnsCounter(sock=rx)
+    assert c.available
+    assert c.drain() == (0, 0, False, []), "nothing sent yet"
+    for _ in range(3):
+        tx.sendto(b"x" * 100, ("127.0.0.1", port))
+    tx.sendto(b"y" * 50, ("127.0.0.1", port))
+    time.sleep(0.2)
+    pkts, nbytes, sat, top = c.drain()
+    assert pkts == 4 and nbytes == 350 and not sat
+    assert top and top[0][0] == "127.0.0.1" and top[0][1] == 4
+    assert c.drain()[0] == 0, "counts are per-interval, not cumulative"
+    c.close(); tx.close()
+    assert not c.available
+
+
+def test_mdns_drain_is_capped_and_says_so(lf):
+    import socket as sk
+    rx = sk.socket(sk.AF_INET, sk.SOCK_DGRAM)
+    rx.bind(("127.0.0.1", 0)); rx.setblocking(False)
+    rx.setsockopt(sk.SOL_SOCKET, sk.SO_RCVBUF, 1 << 20)
+    tx = sk.socket(sk.AF_INET, sk.SOCK_DGRAM)
+    port = rx.getsockname()[1]
+    for _ in range(20):
+        tx.sendto(b"z" * 20, ("127.0.0.1", port))
+    time.sleep(0.2)
+    pkts, _b, sat, _t = lf.MdnsCounter(sock=rx, cap=5).drain()
+    assert pkts == 5 and sat, "a flood is bounded, and the lower bound is flagged"
+    rx.close(); tx.close()
+
+
+def test_an_unavailable_mdns_socket_does_not_break_a_sample(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    # an unjoinable group: deterministic on every platform, unlike a
+    # privileged port, which this machine turned out to allow
+    c = lf.MdnsCounter(sock=None, group="not-a-multicast-address", port=0)
+    assert not c.available and c.error
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS, mdns=c).sample(now=0.0)
+    assert s.mdns_pkts == -1 and "mdns" not in lf.format_sample(s, 0.0)
+
+
+def test_the_mdns_column_reaches_the_sample_and_the_dump(lf, tmp_path):
+    class FakeMdns:
+        available = True
+        def drain(self):
+            return 1200, 480000, True, [("10.0.0.5", 900), ("10.0.0.9", 300)]
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS, mdns=FakeMdns()).sample(now=0.0)
+    assert (s.mdns_pkts, s.mdns_bytes, s.mdns_saturated) == (1200, 480000, True)
+    text = lf.format_sample(s, 0.0)
+    assert "mdns +1200 pkt/468 kB SATURATED from 10.0.0.5=900,10.0.0.9=300" in text
+
+
+def test_mdns_is_counted_even_while_tripped(lf, tmp_path):
+    """The samples DURING an event are the ones whose mDNS rate explains it,
+    and an undrained socket would overflow and lose exactly those."""
+    class FakeMdns:
+        available = True
+        def drain(self):
+            return 7, 700, False, [("10.0.0.5", 7)]
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    s = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS,
+                   mdns=FakeMdns()).sample(lean=True, now=0.0)
+    assert s.lean and s.mdns_pkts == 7, "counted in lean mode too"
+    assert s.bus_connections == -1, "but the expensive work is still skipped"
 
 
 def test_ring_is_thirty_minutes_of_thirty_second_samples(lf):
