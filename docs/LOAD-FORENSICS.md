@@ -75,7 +75,13 @@ matching `registered com.victronenergy.*` lines in the service's log, or as
 un-registrations that never free their connection.
 
 ## Triggers (one event = one dump)
-- own 1-minute average ≥ 4.0 — the early catch;
+- own 1-minute average ≥ **max(4.0, 5-minute + 1.5)** — the early catch,
+  relative to the box's own baseline with an absolute floor. A fixed bar
+  measures the machine rather than an event: prod idles near a 1-minute
+  load of 3 while charging with the GUI up, where 4.0 fired 48 times in
+  17 hours on excursions of a few tenths and rotated the interesting
+  dumps away within hours; dev idles near 0.3, where 4.0 is a real event.
+  The reason recorded in each dump says which bound applied;
 - 5-minute ≥ 6.0 or 15-minute ≥ 5.5 — the exact thresholds the BLE service
   derives from `/etc/watchdog.conf`, imported from it, so a dump lands beside
   the throttle line;

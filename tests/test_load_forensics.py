@@ -347,15 +347,51 @@ def test_lean_pass_does_nothing_beyond_one_proc_pass(lf, tmp_path):
 
 
 def test_event_is_one_dump_with_hysteresis(lf):
-    th = lf.Thresholds(trip_1m=4.0, trip_5m=6.0, trip_15m=5.5, release_1m=3.0, release_5m=5.0, release_15m=5.0)
+    th = lf.Thresholds()
     ev = lf.EventState(th, release_samples=2)
     assert ev.update(1.0, 1.0, 1.0, False, 0) is None
-    assert ev.update(4.2, 2.0, 1.5, False, 30) == ("1m>=4.0", lf.CLASS_EARLY)   # opens
+    r = ev.update(4.2, 2.0, 1.5, False, 30)                           # opens on the floor
+    assert r == ("1m>=4.00 (floor)", lf.CLASS_EARLY)
     assert ev.update(5.0, 3.0, 2.0, False, 60) is None                # still open: no second dump
-    assert ev.update(2.0, 2.0, 2.0, False, 90) is None and ev.active  # one quiet sample: not yet
-    assert ev.update(2.0, 2.0, 2.0, False, 120) is None and not ev.active  # two quiet: closed
+    assert ev.update(1.0, 2.0, 2.0, False, 90) is None and ev.active  # one quiet sample: not yet
+    assert ev.update(1.0, 2.0, 2.0, False, 120) is None and not ev.active  # two quiet: closed
     assert ev.update(1.0, 6.5, 1.0, False, 150) == ("5m>=6.0", lf.CLASS_TRIP)   # a NEW event opens
     assert ev.peak[1] == 6.5
+
+
+def test_the_early_catch_is_relative_to_the_box_it_runs_on(lf):
+    """An absolute-only bar measures the machine, not an event.
+
+    Prod idles near a 1-minute load of 3 while charging with the GUI up, so a
+    fixed 4.0 fired 48 times in 17 hours on excursions of a few tenths.  Dev
+    idles near 0.3, where 4.0 is a real event.  One number cannot serve both.
+    """
+    ev = lf.EventState(lf.Thresholds())
+    # PROD: baseline 3.0, a few tenths over the old fixed bar -> NOT an event
+    assert ev.update(4.04, 3.0, 2.8, False, 0) is None, \
+        "a tenth above a 3-baseline is the baseline, not an excursion"
+    assert ev.update(4.40, 3.0, 2.8, False, 30) is None, "still under 5m+1.5"
+    # PROD: a genuine excursion above that same baseline -> an event
+    r = ev.update(5.10, 3.0, 2.8, False, 60)
+    assert r == ("1m>=4.50 (5m+1.5)", lf.CLASS_EARLY)
+
+    # DEV: a near-idle box, where the absolute floor is what matters
+    ev2 = lf.EventState(lf.Thresholds())
+    assert ev2.update(2.00, 0.4, 0.4, False, 0) is None
+    r2 = ev2.update(4.20, 0.4, 0.4, False, 30)
+    assert r2 == ("1m>=4.00 (floor)", lf.CLASS_EARLY), \
+        "0.4+1.5 is below the floor, so the floor applies"
+
+
+def test_release_is_relative_too(lf):
+    """An absolute release floor is almost never reached on a box whose
+    baseline already sits near it -- the event would never close."""
+    ev = lf.EventState(lf.Thresholds(), release_samples=2)
+    assert ev.update(5.10, 3.0, 2.8, False, 0) is not None      # opens, bar 4.50
+    # back to the box's own baseline: 3.0 < 4.50 - 1.0, so this is quiet
+    assert ev.update(3.00, 3.0, 2.8, False, 30) is None and ev.active
+    assert ev.update(3.00, 3.0, 2.8, False, 60) is None
+    assert not ev.active, "returning to baseline closes the event"
 
 
 def test_service_trip_line_is_a_trigger(lf):
@@ -367,7 +403,7 @@ def test_an_early_event_that_becomes_a_real_trip_dumps_again(lf):
     """Otherwise the moment the box actually tripped is the one never captured,
     because the early catch had already opened the event."""
     ev = lf.EventState(lf.Thresholds())
-    assert ev.update(4.2, 2.0, 1.0, False, 0) == ("1m>=4.0", lf.CLASS_EARLY)
+    assert ev.update(4.2, 2.0, 1.0, False, 0) == ("1m>=4.00 (floor)", lf.CLASS_EARLY)
     res = ev.update(4.5, 6.2, 2.0, False, 30)
     assert res is not None and res[1] == lf.CLASS_TRIP, "the escalation must be captured"
     assert ev.update(4.5, 6.3, 2.1, False, 60) is None, "but only once"
@@ -375,8 +411,9 @@ def test_an_early_event_that_becomes_a_real_trip_dumps_again(lf):
 
 def test_classification_puts_a_real_threshold_above_the_early_catch(lf):
     c = lf.EventState.classify
-    assert c(["1m>=4.0"]) == lf.CLASS_EARLY
-    assert c(["1m>=4.0", "5m>=6.0"]) == lf.CLASS_TRIP
+    assert c(["1m>=4.00 (floor)"]) == lf.CLASS_EARLY
+    assert c(["1m>=4.50 (5m+1.5)", "5m>=6.0"]) == lf.CLASS_TRIP
+    assert c(["1m>=4.50 (5m+1.5)"]) == lf.CLASS_EARLY, "the tag names 5m but the rule is the early one"
     assert c(["15m>=5.5"]) == lf.CLASS_TRIP
     assert c(["sensors-py tripped"]) == lf.CLASS_TRIP
 
