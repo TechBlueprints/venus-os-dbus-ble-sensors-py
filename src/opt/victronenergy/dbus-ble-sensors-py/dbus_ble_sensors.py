@@ -283,7 +283,13 @@ class DbusBleSensors(object):
         # Name-identified devices (no manufacturer data; e.g. EasyStart).
         # The tap decodes and forwards local names only for these
         # prefixes; everything else's name is never even parsed.
-        self._name_prefixes: tuple = tuple(BleDevice.NAME_CLASSES.keys())
+        # Advertised-name prefixes the tap matches.  Internal drivers
+        # (EasyStart) are fixed; external name_prefix registrations
+        # (power-watchdog) are folded in by _on_registrations_changed, which
+        # mutates this SET IN PLACE so the running tap thread -- which holds
+        # this same object by reference -- picks them up without a restart.
+        self._internal_name_prefixes = frozenset(BleDevice.NAME_CLASSES.keys())
+        self._name_prefixes: set = set(self._internal_name_prefixes)
         self._last_name_adv: dict[str, float] = {}
         self._name_accept_all_logged: bool = False
         # identity -> (tap_mac, address_type): the current address of
@@ -1108,8 +1114,6 @@ class DbusBleSensors(object):
             if adv_name.startswith(prefix):
                 device_class = cls
                 break
-        if device_class is None:
-            return
 
         # Only act on advertisements from scans WE run.  The tap is
         # HCI_CHANNEL_MONITOR: it sees every adapter's traffic and stamps
@@ -1137,6 +1141,21 @@ class DbusBleSensors(object):
                     f"advertisements heard via this adapter — we do not "
                     f"scan on it, so another process does; link placement "
                     f"follows our own cards only")
+            return
+
+        # Feed external name-prefix consumers (e.g. dbus-power-watchdog) every
+        # allowlisted name advertisement, whether or not we have an internal
+        # driver for it -- the gate above already dropped foreign-card
+        # hearings.  The consumer connects via bcmv2 on the mac + adapter the
+        # signal carries.
+        try:
+            self._router.process_name_advertisement(
+                tap_mac, adv_name, rssi, adapter_key)
+        except Exception:
+            logging.exception("Error routing name advertisement from %s",
+                              tap_mac)
+
+        if device_class is None:
             return
 
         identity = device_class.identity_from_name(adv_name)
@@ -1453,6 +1472,16 @@ class DbusBleSensors(object):
         logging.info("Tap mfg filter updated: %d IDs (%d internal + %d external)",
                      len(self._known_mfg_ids), len(self._internal_mfg_ids),
                      len(external_ids))
+
+        external_prefixes = self._router.get_registered_name_prefixes()
+        desired_prefixes = self._internal_name_prefixes | external_prefixes
+        if desired_prefixes != self._name_prefixes:
+            self._name_prefixes.clear()
+            self._name_prefixes.update(desired_prefixes)
+            logging.info(
+                "Tap name-prefix filter updated: %d (%d internal + %d external)",
+                len(self._name_prefixes), len(self._internal_name_prefixes),
+                len(external_prefixes))
 
         registered_macs = self._router.get_registered_macs()
         if not registered_macs:
