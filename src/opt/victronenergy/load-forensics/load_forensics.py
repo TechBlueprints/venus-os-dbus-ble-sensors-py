@@ -108,8 +108,18 @@ DUMP_KEEP = {CLASS_EARLY: 10, CLASS_TRIP: 10}
 # minute.  A real trip is never cooled down.
 COOLDOWN_S = {CLASS_EARLY: 300.0, CLASS_TRIP: 0.0}
 TAIL_LINES = 40
-TRIGGER_1M = 4.0                                    # early catch, own rule
-RELEASE_1M = 3.0
+# The early catch is RELATIVE to the box's own recent baseline, with an
+# absolute floor.  An absolute-only rule measures the machine, not an event:
+# prod idles near a 1-minute load of 3 under a charging regime with the GUI
+# up, so a fixed 4.0 fired 48 times in 17 hours on excursions of a few
+# tenths -- every one of them early-class, none of them anomalies, and the
+# ten-deep pool rotated a genuinely interesting one away within hours.  Dev
+# idles near 0.3, where the same 4.0 is a real event.  One number cannot be
+# right for both, so the bar is "4.0, or 1.5 above the 5-minute average,
+# whichever is higher".
+TRIGGER_1M = 4.0                                    # absolute floor
+TRIGGER_1M_OVER_5M = 1.5                            # ...and this far above the baseline
+RELEASE_1M_BELOW_BAR = 1.0                          # hysteresis band under whichever bar applied
 RELEASE_SAMPLES = 2                                 # consecutive quiet samples close an event
 HEARTBEAT_S = 3600.0
 SELF_COST_WARN_PCT = 1.0                            # average % of one core; the instrument must not be the load
@@ -237,13 +247,24 @@ def read_file_nr(root: str = "/proc") -> int:
     return int(_read(f"{root}/sys/fs/file-nr").split()[0])
 
 
-def read_disk_ms(root: str = "/proc", device: str = EMMC_DEVICE) -> tuple[int, int]:
-    """(ms writing, weighted ms doing I/O) for *device*, or (0, 0)."""
+def read_disk_ms(root: str = "/proc", device: str = EMMC_DEVICE) -> tuple:
+    """(ms writing, weighted ms doing I/O, writes completed, sectors written).
+
+    Time AND volume, because on their own they cannot be told apart.  A
+    dev flood showed the write-time column jumping to 272-304 ms per sample
+    while the service logs wrote no more than in the quiet minutes before
+    it -- so the eMMC was not busier, its completions were simply slower
+    behind a loaded CPU.  With only milliseconds recorded, a reader cannot
+    distinguish "wrote much more" from "same writes, queued longer", and
+    those call for opposite responses.
+    """
     for line in _read(f"{root}/diskstats").splitlines():
         f = line.split()
         if len(f) >= 14 and f[2] == device:
-            return int(f[10]), int(f[13])
-    return 0, 0
+            # after major/minor/name: reads(3) merged(4) sectors(5) ms(6)
+            # writes(7) merged(8) sectors(9) ms(10) inflight(11) io_ms(12) weighted(13)
+            return int(f[10]), int(f[13]), int(f[7]), int(f[9])
+    return 0, 0, 0, 0
 
 
 # /proc/net/unix columns: Num RefCount Protocol Flags Type St Inode Path.
@@ -588,6 +609,8 @@ class Sample:
     file_nr: int
     disk_write_ms: int          # since last sample
     disk_io_ms: int
+    disk_writes: int            # write operations completed, since last sample
+    disk_kb: int                # kB written, since last sample
     bus_connections: int        # live connections on the system bus (accepted sockets); -1 unknown
     mdns_pkts: int              # multicast-DNS packets since the last sample; -1 unavailable
     mdns_bytes: int
@@ -634,6 +657,8 @@ class Sampler:
         ctxt = (sysc.ctxt - self._prev_sys.ctxt) if self._prev_sys else 0
         dwr = (disk[0] - self._prev_disk[0]) if self._prev_disk else 0
         dio = (disk[1] - self._prev_disk[1]) if self._prev_disk else 0
+        dwn = (disk[2] - self._prev_disk[2]) if self._prev_disk else 0
+        dkb = ((disk[3] - self._prev_disk[3]) // 2) if self._prev_disk else 0   # 512 B sectors
 
         # one pass over processes
         procs: list[Proc] = []
@@ -698,7 +723,8 @@ class Sampler:
         return Sample(t=now, load=load, cpu_pct=cpu_pct, forks=forks, ctxt=ctxt,
                       running=sysc.running, blocked=sysc.blocked,
                       memavail_kb=read_memavailable_kb(self.root), file_nr=read_file_nr(self.root),
-                      disk_write_ms=dwr, disk_io_ms=dio, bus_connections=bus_connections,
+                      disk_write_ms=dwr, disk_io_ms=dio, disk_writes=dwn, disk_kb=dkb,
+                      bus_connections=bus_connections,
                       mdns_pkts=mdns_pkts, mdns_bytes=mdns_bytes,
                       mdns_saturated=mdns_sat, mdns_top=mdns_top,
                       procs=selected, lean=lean)
@@ -707,12 +733,17 @@ class Sampler:
 # --------------------------------------------------------------- triggers ---
 @dataclass
 class Thresholds:
-    trip_1m: float = TRIGGER_1M
+    trip_1m: float = TRIGGER_1M                     # absolute floor for the early catch
+    trip_1m_over_5m: float = TRIGGER_1M_OVER_5M     # ...or this far above the 5-min baseline
     trip_5m: float = 6.0
     trip_15m: float = 5.5
-    release_1m: float = RELEASE_1M
+    release_below_bar: float = RELEASE_1M_BELOW_BAR
     release_5m: float = 5.0
     release_15m: float = 5.0
+
+    def early_bar(self, l5: float) -> float:
+        """The 1-minute level that counts as an excursion on THIS box."""
+        return max(self.trip_1m, l5 + self.trip_1m_over_5m)
 
 
 class EventState:
@@ -730,8 +761,11 @@ class EventState:
 
     def reasons(self, l1: float, l5: float, l15: float, log_tripped: bool) -> list[str]:
         r = []
-        if l1 >= self.th.trip_1m:
-            r.append(f"1m>={self.th.trip_1m}")
+        bar = self.th.early_bar(l5)
+        if l1 >= bar:
+            # say which bound applied, so a dump explains its own trigger
+            how = "floor" if bar <= self.th.trip_1m else f"5m+{self.th.trip_1m_over_5m:g}"
+            r.append(f"1m>={bar:.2f} ({how})")
         if l5 >= self.th.trip_5m:
             r.append(f"5m>={self.th.trip_5m}")
         if l15 >= self.th.trip_15m:
@@ -765,7 +799,11 @@ class EventState:
                 self.reason = " | ".join(rs)
                 self.quiet = 0
                 return self.reason, CLASS_TRIP
-            quiet = (l1 < self.th.release_1m and l5 < self.th.release_5m and l15 < self.th.release_15m)
+            # Release under whichever bar applied, minus a hysteresis band --
+            # an absolute release floor would almost never be reached on a
+            # box whose baseline already sits near it.
+            quiet = (l1 < self.th.early_bar(l5) - self.th.release_below_bar
+                     and l5 < self.th.release_5m and l15 < self.th.release_15m)
             self.quiet = self.quiet + 1 if quiet else 0
             if self.quiet >= self.release_samples:
                 self.active = False
@@ -868,7 +906,8 @@ def format_sample(s: Sample, t0: float) -> str:
     head = (f"t{s.t - t0:+8.0f}s {time.strftime('%H:%M:%S', time.gmtime(s.t))}Z "
             f"load {l1:.2f}/{l5:.2f}/{l15:.2f} run {s.running} blk {s.blocked} "
             f"forks +{s.forks} ctxt +{s.ctxt} memavail {s.memavail_kb // 1024} MB fds {s.file_nr} "
-            f"bus {s.bus_connections}{_mdns_text(s)} mmc wr +{s.disk_write_ms} ms io +{s.disk_io_ms} ms"
+            f"bus {'?' if s.bus_connections < 0 else s.bus_connections}{_mdns_text(s)} "
+            f"mmc wr +{s.disk_write_ms} ms/+{s.disk_writes} w/+{s.disk_kb} kB io +{s.disk_io_ms} ms"
             + (f" | cpu user {c.get('user', 0):.0f}% sys {c.get('system', 0):.0f}% iow {c.get('iowait', 0):.0f}% "
                f"sirq {c.get('softirq', 0):.0f}% idle {c.get('idle', 0):.0f}%" if c else "")
             + (" [LEAN]" if s.lean else ""))
@@ -968,20 +1007,25 @@ class Forensics:
             pct = 100.0 * cpu / up if up > 0 else 0.0
             lvl = logging.WARNING if pct > SELF_COST_WARN_PCT else logging.INFO
             log.log(lvl, "alive: %d samples, %d dumps, self-cost %.2f s CPU (%.2f%% of one core), "
-                    "RSS %d kB, load %.2f/%.2f/%.2f, bus %d",
-                    self.samples, self.dumps, cpu, pct, rss, l1, l5, l15, s.bus_connections)
+                    "RSS %d kB, load %.2f/%.2f/%.2f, bus %s",
+                    self.samples, self.dumps, cpu, pct, rss, l1, l5, l15,
+                    # '?' not -1: a lean sample during an open event does not
+                    # count bus connections, and -1 reads as a failure
+                    "?" if s.bus_connections < 0 else s.bus_connections)
             self._last_beat = now
         return path
 
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stop", True))
         peers_ok = read_unix_peers() is not None
-        log.info("load-forensics started: interval %.0f s, ring %d min, triggers 1m>=%.1f | 5m>=%.1f | "
-                 "15m>=%.1f (release 1m<%.1f 5m<%.1f 15m<%.1f), dumps -> %s "
+        log.info("load-forensics started: interval %.0f s, ring %d min, triggers "
+                 "1m>=max(%.1f, 5m+%.1f) | 5m>=%.1f | "
+                 "15m>=%.1f (release 1m below that bar by %.1f, 5m<%.1f 15m<%.1f), dumps -> %s "
                  "(keep %d early / %d trip, separate pools; early cooldown %.0f s), "
                  "per-process bus count via unix_diag: %s, mDNS counter: %s, watch: %s",
-                 self.interval, RING_MINUTES, self.th.trip_1m, self.th.trip_5m, self.th.trip_15m,
-                 self.th.release_1m, self.th.release_5m, self.th.release_15m, self.dump_dir,
+                 self.interval, RING_MINUTES, self.th.trip_1m, self.th.trip_1m_over_5m,
+                 self.th.trip_5m, self.th.trip_15m,
+                 self.th.release_below_bar, self.th.release_5m, self.th.release_15m, self.dump_dir,
                  DUMP_KEEP[CLASS_EARLY], DUMP_KEEP[CLASS_TRIP], COOLDOWN_S[CLASS_EARLY],
                  "available" if peers_ok else "UNAVAILABLE (reported as '?')",
                  "listening on %s:%d" % (MDNS_GROUP, MDNS_PORT) if (self.mdns and self.mdns.available)

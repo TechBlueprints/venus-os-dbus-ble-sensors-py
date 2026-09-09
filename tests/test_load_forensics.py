@@ -131,7 +131,8 @@ def test_parsers_read_the_fake_tree(lf, tmp_path):
     assert s.running == 2 and s.blocked == 0
     assert lf.read_memavailable_kb(root) == 400000
     assert lf.read_file_nr(root) == 4500
-    assert lf.read_disk_ms(root) == (100, 200)
+    # (ms writing, weighted io ms, writes completed, sectors written)
+    assert lf.read_disk_ms(root) == (100, 200, 20, 200)
 
 
 def test_bus_rows_separate_listener_from_accepted_and_ignore_clients(lf, tmp_path):
@@ -346,15 +347,51 @@ def test_lean_pass_does_nothing_beyond_one_proc_pass(lf, tmp_path):
 
 
 def test_event_is_one_dump_with_hysteresis(lf):
-    th = lf.Thresholds(trip_1m=4.0, trip_5m=6.0, trip_15m=5.5, release_1m=3.0, release_5m=5.0, release_15m=5.0)
+    th = lf.Thresholds()
     ev = lf.EventState(th, release_samples=2)
     assert ev.update(1.0, 1.0, 1.0, False, 0) is None
-    assert ev.update(4.2, 2.0, 1.5, False, 30) == ("1m>=4.0", lf.CLASS_EARLY)   # opens
+    r = ev.update(4.2, 2.0, 1.5, False, 30)                           # opens on the floor
+    assert r == ("1m>=4.00 (floor)", lf.CLASS_EARLY)
     assert ev.update(5.0, 3.0, 2.0, False, 60) is None                # still open: no second dump
-    assert ev.update(2.0, 2.0, 2.0, False, 90) is None and ev.active  # one quiet sample: not yet
-    assert ev.update(2.0, 2.0, 2.0, False, 120) is None and not ev.active  # two quiet: closed
+    assert ev.update(1.0, 2.0, 2.0, False, 90) is None and ev.active  # one quiet sample: not yet
+    assert ev.update(1.0, 2.0, 2.0, False, 120) is None and not ev.active  # two quiet: closed
     assert ev.update(1.0, 6.5, 1.0, False, 150) == ("5m>=6.0", lf.CLASS_TRIP)   # a NEW event opens
     assert ev.peak[1] == 6.5
+
+
+def test_the_early_catch_is_relative_to_the_box_it_runs_on(lf):
+    """An absolute-only bar measures the machine, not an event.
+
+    Prod idles near a 1-minute load of 3 while charging with the GUI up, so a
+    fixed 4.0 fired 48 times in 17 hours on excursions of a few tenths.  Dev
+    idles near 0.3, where 4.0 is a real event.  One number cannot serve both.
+    """
+    ev = lf.EventState(lf.Thresholds())
+    # PROD: baseline 3.0, a few tenths over the old fixed bar -> NOT an event
+    assert ev.update(4.04, 3.0, 2.8, False, 0) is None, \
+        "a tenth above a 3-baseline is the baseline, not an excursion"
+    assert ev.update(4.40, 3.0, 2.8, False, 30) is None, "still under 5m+1.5"
+    # PROD: a genuine excursion above that same baseline -> an event
+    r = ev.update(5.10, 3.0, 2.8, False, 60)
+    assert r == ("1m>=4.50 (5m+1.5)", lf.CLASS_EARLY)
+
+    # DEV: a near-idle box, where the absolute floor is what matters
+    ev2 = lf.EventState(lf.Thresholds())
+    assert ev2.update(2.00, 0.4, 0.4, False, 0) is None
+    r2 = ev2.update(4.20, 0.4, 0.4, False, 30)
+    assert r2 == ("1m>=4.00 (floor)", lf.CLASS_EARLY), \
+        "0.4+1.5 is below the floor, so the floor applies"
+
+
+def test_release_is_relative_too(lf):
+    """An absolute release floor is almost never reached on a box whose
+    baseline already sits near it -- the event would never close."""
+    ev = lf.EventState(lf.Thresholds(), release_samples=2)
+    assert ev.update(5.10, 3.0, 2.8, False, 0) is not None      # opens, bar 4.50
+    # back to the box's own baseline: 3.0 < 4.50 - 1.0, so this is quiet
+    assert ev.update(3.00, 3.0, 2.8, False, 30) is None and ev.active
+    assert ev.update(3.00, 3.0, 2.8, False, 60) is None
+    assert not ev.active, "returning to baseline closes the event"
 
 
 def test_service_trip_line_is_a_trigger(lf):
@@ -366,7 +403,7 @@ def test_an_early_event_that_becomes_a_real_trip_dumps_again(lf):
     """Otherwise the moment the box actually tripped is the one never captured,
     because the early catch had already opened the event."""
     ev = lf.EventState(lf.Thresholds())
-    assert ev.update(4.2, 2.0, 1.0, False, 0) == ("1m>=4.0", lf.CLASS_EARLY)
+    assert ev.update(4.2, 2.0, 1.0, False, 0) == ("1m>=4.00 (floor)", lf.CLASS_EARLY)
     res = ev.update(4.5, 6.2, 2.0, False, 30)
     assert res is not None and res[1] == lf.CLASS_TRIP, "the escalation must be captured"
     assert ev.update(4.5, 6.3, 2.1, False, 60) is None, "but only once"
@@ -374,8 +411,9 @@ def test_an_early_event_that_becomes_a_real_trip_dumps_again(lf):
 
 def test_classification_puts_a_real_threshold_above_the_early_catch(lf):
     c = lf.EventState.classify
-    assert c(["1m>=4.0"]) == lf.CLASS_EARLY
-    assert c(["1m>=4.0", "5m>=6.0"]) == lf.CLASS_TRIP
+    assert c(["1m>=4.00 (floor)"]) == lf.CLASS_EARLY
+    assert c(["1m>=4.50 (5m+1.5)", "5m>=6.0"]) == lf.CLASS_TRIP
+    assert c(["1m>=4.50 (5m+1.5)"]) == lf.CLASS_EARLY, "the tag names 5m but the rule is the early one"
     assert c(["15m>=5.5"]) == lf.CLASS_TRIP
     assert c(["sensors-py tripped"]) == lf.CLASS_TRIP
 
@@ -538,6 +576,37 @@ def test_mdns_is_counted_even_while_tripped(lf, tmp_path):
                    mdns=FakeMdns()).sample(lean=True, now=0.0)
     assert s.lean and s.mdns_pkts == 7, "counted in lean mode too"
     assert s.bus_connections == -1, "but the expensive work is still skipped"
+
+
+def test_disk_column_separates_volume_from_latency(lf, tmp_path):
+    """A dev flood showed write TIME tripling while the logs wrote no more
+    than in the quiet minutes before it.  Time alone cannot tell 'wrote much
+    more' from 'same writes, queued longer', and those want opposite fixes."""
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1(), disk=(100, 200))
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    sm.sample(now=0.0)
+    # same number of writes and sectors, but three times the milliseconds:
+    # the disk is not busier, its completions are slower
+    make_proc(root, _procs_v1(), disk=(400, 900))
+    s = sm.sample(now=30.0)
+    assert s.disk_write_ms == 300, "time tripled"
+    assert s.disk_writes == 0 and s.disk_kb == 0, "no extra writes: this is latency, not volume"
+    text = lf.format_sample(s, 0.0)
+    assert "mmc wr +300 ms/+0 w/+0 kB" in text, "a reader can see both at once"
+
+
+def test_disk_column_shows_real_volume_when_there_is_some(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    procs = _procs_v1()
+    make_proc(root, procs, disk=(100, 200))
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    sm.sample(now=0.0)
+    # 40 more writes, 4096 more sectors = 2048 kB
+    open(f"{root}/diskstats", "w").write(
+        " 179 0 mmcblk1 10 0 100 5 60 0 4296 150 0 300 250\n")
+    s = sm.sample(now=30.0)
+    assert s.disk_writes == 40 and s.disk_kb == 2048, "sectors are 512 B"
 
 
 def test_ring_is_thirty_minutes_of_thirty_second_samples(lf):
