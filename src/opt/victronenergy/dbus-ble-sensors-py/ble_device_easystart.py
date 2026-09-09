@@ -67,11 +67,21 @@ READ_TIMEOUT_S = 15.0
 MAX_POLL_FAILURES = 3
 
 # Wait between sessions.  A session usually ends because the A/C shut
-# off; the next advertisement is what says it is back, but the unit
-# also advertises while refusing connections (observed on prod: the
-# idle unit adopts fine, then fails the connect instantly), so failures
-# back off exponentially up to the cap — otherwise an idle A/C draws a
-# connect attempt every 30 s all night.
+# off, and a settled idle unit is silent — with both A/Cs off the device
+# does not advertise at all (see :meth:`survives_silence`), so nothing
+# triggers a connect and there is no all-night retry to tame.  The
+# backoff exists for the TRANSITION: the compressor cycles, we catch one
+# advertisement during a brief wake, and the unit sleeps again before our
+# connect finishes discovery — a fail-before-telemetry that must not
+# hammer the radio while the A/C is stopping.  Only failures that never
+# produced data back off (see :meth:`_on_session_done`); a mid-poll drop
+# on a live session does not.  Verified on prod 2026-09-09: A/C off, a
+# 120 s tap census heard 0 advertisements from either unit while 16 other
+# devices were delivered, and the log shows zero session attempts across
+# the 11 h idle stretch before it — impossible if an idle unit advertised
+# and was retried even at the 600 s cap.  (The earlier note here claimed
+# the idle unit "advertises while refusing connections"; the field
+# evidence disproves it, the same way the rotating-MAC claim was.)
 SESSION_COOLDOWN_S = 30.0
 SESSION_COOLDOWN_MAX_S = 600.0
 
