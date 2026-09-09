@@ -237,13 +237,24 @@ def read_file_nr(root: str = "/proc") -> int:
     return int(_read(f"{root}/sys/fs/file-nr").split()[0])
 
 
-def read_disk_ms(root: str = "/proc", device: str = EMMC_DEVICE) -> tuple[int, int]:
-    """(ms writing, weighted ms doing I/O) for *device*, or (0, 0)."""
+def read_disk_ms(root: str = "/proc", device: str = EMMC_DEVICE) -> tuple:
+    """(ms writing, weighted ms doing I/O, writes completed, sectors written).
+
+    Time AND volume, because on their own they cannot be told apart.  A
+    dev flood showed the write-time column jumping to 272-304 ms per sample
+    while the service logs wrote no more than in the quiet minutes before
+    it -- so the eMMC was not busier, its completions were simply slower
+    behind a loaded CPU.  With only milliseconds recorded, a reader cannot
+    distinguish "wrote much more" from "same writes, queued longer", and
+    those call for opposite responses.
+    """
     for line in _read(f"{root}/diskstats").splitlines():
         f = line.split()
         if len(f) >= 14 and f[2] == device:
-            return int(f[10]), int(f[13])
-    return 0, 0
+            # after major/minor/name: reads(3) merged(4) sectors(5) ms(6)
+            # writes(7) merged(8) sectors(9) ms(10) inflight(11) io_ms(12) weighted(13)
+            return int(f[10]), int(f[13]), int(f[7]), int(f[9])
+    return 0, 0, 0, 0
 
 
 # /proc/net/unix columns: Num RefCount Protocol Flags Type St Inode Path.
@@ -588,6 +599,8 @@ class Sample:
     file_nr: int
     disk_write_ms: int          # since last sample
     disk_io_ms: int
+    disk_writes: int            # write operations completed, since last sample
+    disk_kb: int                # kB written, since last sample
     bus_connections: int        # live connections on the system bus (accepted sockets); -1 unknown
     mdns_pkts: int              # multicast-DNS packets since the last sample; -1 unavailable
     mdns_bytes: int
@@ -634,6 +647,8 @@ class Sampler:
         ctxt = (sysc.ctxt - self._prev_sys.ctxt) if self._prev_sys else 0
         dwr = (disk[0] - self._prev_disk[0]) if self._prev_disk else 0
         dio = (disk[1] - self._prev_disk[1]) if self._prev_disk else 0
+        dwn = (disk[2] - self._prev_disk[2]) if self._prev_disk else 0
+        dkb = ((disk[3] - self._prev_disk[3]) // 2) if self._prev_disk else 0   # 512 B sectors
 
         # one pass over processes
         procs: list[Proc] = []
@@ -698,7 +713,8 @@ class Sampler:
         return Sample(t=now, load=load, cpu_pct=cpu_pct, forks=forks, ctxt=ctxt,
                       running=sysc.running, blocked=sysc.blocked,
                       memavail_kb=read_memavailable_kb(self.root), file_nr=read_file_nr(self.root),
-                      disk_write_ms=dwr, disk_io_ms=dio, bus_connections=bus_connections,
+                      disk_write_ms=dwr, disk_io_ms=dio, disk_writes=dwn, disk_kb=dkb,
+                      bus_connections=bus_connections,
                       mdns_pkts=mdns_pkts, mdns_bytes=mdns_bytes,
                       mdns_saturated=mdns_sat, mdns_top=mdns_top,
                       procs=selected, lean=lean)
@@ -868,7 +884,8 @@ def format_sample(s: Sample, t0: float) -> str:
     head = (f"t{s.t - t0:+8.0f}s {time.strftime('%H:%M:%S', time.gmtime(s.t))}Z "
             f"load {l1:.2f}/{l5:.2f}/{l15:.2f} run {s.running} blk {s.blocked} "
             f"forks +{s.forks} ctxt +{s.ctxt} memavail {s.memavail_kb // 1024} MB fds {s.file_nr} "
-            f"bus {s.bus_connections}{_mdns_text(s)} mmc wr +{s.disk_write_ms} ms io +{s.disk_io_ms} ms"
+            f"bus {s.bus_connections}{_mdns_text(s)} "
+            f"mmc wr +{s.disk_write_ms} ms/+{s.disk_writes} w/+{s.disk_kb} kB io +{s.disk_io_ms} ms"
             + (f" | cpu user {c.get('user', 0):.0f}% sys {c.get('system', 0):.0f}% iow {c.get('iowait', 0):.0f}% "
                f"sirq {c.get('softirq', 0):.0f}% idle {c.get('idle', 0):.0f}%" if c else "")
             + (" [LEAN]" if s.lean else ""))

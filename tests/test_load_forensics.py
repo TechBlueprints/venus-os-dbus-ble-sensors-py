@@ -131,7 +131,8 @@ def test_parsers_read_the_fake_tree(lf, tmp_path):
     assert s.running == 2 and s.blocked == 0
     assert lf.read_memavailable_kb(root) == 400000
     assert lf.read_file_nr(root) == 4500
-    assert lf.read_disk_ms(root) == (100, 200)
+    # (ms writing, weighted io ms, writes completed, sectors written)
+    assert lf.read_disk_ms(root) == (100, 200, 20, 200)
 
 
 def test_bus_rows_separate_listener_from_accepted_and_ignore_clients(lf, tmp_path):
@@ -538,6 +539,37 @@ def test_mdns_is_counted_even_while_tripped(lf, tmp_path):
                    mdns=FakeMdns()).sample(lean=True, now=0.0)
     assert s.lean and s.mdns_pkts == 7, "counted in lean mode too"
     assert s.bus_connections == -1, "but the expensive work is still skipped"
+
+
+def test_disk_column_separates_volume_from_latency(lf, tmp_path):
+    """A dev flood showed write TIME tripling while the logs wrote no more
+    than in the quiet minutes before it.  Time alone cannot tell 'wrote much
+    more' from 'same writes, queued longer', and those want opposite fixes."""
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1(), disk=(100, 200))
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    sm.sample(now=0.0)
+    # same number of writes and sectors, but three times the milliseconds:
+    # the disk is not busier, its completions are slower
+    make_proc(root, _procs_v1(), disk=(400, 900))
+    s = sm.sample(now=30.0)
+    assert s.disk_write_ms == 300, "time tripled"
+    assert s.disk_writes == 0 and s.disk_kb == 0, "no extra writes: this is latency, not volume"
+    text = lf.format_sample(s, 0.0)
+    assert "mmc wr +300 ms/+0 w/+0 kB" in text, "a reader can see both at once"
+
+
+def test_disk_column_shows_real_volume_when_there_is_some(lf, tmp_path):
+    root = str(tmp_path / "proc")
+    procs = _procs_v1()
+    make_proc(root, procs, disk=(100, 200))
+    sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
+    sm.sample(now=0.0)
+    # 40 more writes, 4096 more sectors = 2048 kB
+    open(f"{root}/diskstats", "w").write(
+        " 179 0 mmcblk1 10 0 100 5 60 0 4296 150 0 300 250\n")
+    s = sm.sample(now=30.0)
+    assert s.disk_writes == 40 and s.disk_kb == 2048, "sectors are 512 B"
 
 
 def test_ring_is_thirty_minutes_of_thirty_second_samples(lf):

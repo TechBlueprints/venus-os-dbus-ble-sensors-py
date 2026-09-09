@@ -13,7 +13,12 @@ can watch it. Source: `src/opt/victronenergy/load-forensics/load_forensics.py`.
 ## What a sample holds (every 30 s, one pass over /proc, no forks)
 - `/proc/loadavg`; CPU split (user/system/iowait/softirq/idle) over the
   interval; `ctxt` and `processes` (fork counter) deltas; `procs_running`,
-  `procs_blocked`; MemAvailable; open file handles; eMMC write and I/O ms.
+  `procs_blocked`; MemAvailable; open file handles; and eMMC writes as
+  **both** time and volume — milliseconds, operations and kB. Time alone
+  is ambiguous: a dev flood tripled the write-time column while the
+  service logs wrote no more than in the quiet minutes before it, so the
+  disk was not busier, its completions were queued behind a loaded CPU.
+  "Wrote much more" and "same writes, slower" want opposite responses.
 - Per process, for the top 8 by CPU plus a fixed watch list (bluetoothd,
   dbus-daemon, systemcalc, gui-v2, each pack, sensors-py, easytouch,
   watchdog, shyion, sshd): CPU %, state, threads, fd count, an **exact
