@@ -11,6 +11,7 @@ External services register by exposing introspectable D-Bus objects at:
   /ble_advertisements/{service}/mfgr_product/{mfg}_{pid}
   /ble_advertisements/{service}/mfgr_product_range/{mfg}_{min}_{max}
   /ble_advertisements/{service}/addr/{mac}
+  /ble_advertisements/{service}/name_prefix/{prefix}
 
 The router emits Advertisement signals on those same paths.  Multiple
 services can register for the same manufacturer ID and each receives its
@@ -123,6 +124,10 @@ class BleAdvertisementRouter:
         self._mac_registrations: dict[str, set[str]] = {}
         self._pid_registrations: dict[tuple[int, int], set[str]] = {}
         self._pid_range_registrations: dict[tuple[int, int, int], set[str]] = {}
+        # Name-prefix registrations (e.g. Power Watchdog "WD_"/"PM"): the
+        # device is identified by advertised local-name prefix, not a
+        # manufacturer id.  prefix -> set of full object paths.
+        self._name_prefix_registrations: dict[str, set[str]] = {}
 
         # Emitters keyed by full object path
         self._emitters: dict[str, AdvertisementEmitter] = {}
@@ -210,6 +215,10 @@ class BleAdvertisementRouter:
             result.add(mac.replace(':', '').lower())
         return result
 
+    def get_registered_name_prefixes(self) -> set[str]:
+        """Advertised-name prefixes with active registrations (for the tap)."""
+        return set(self._name_prefix_registrations.keys())
+
     def has_registrations(self) -> bool:
         """True if any registrations exist."""
         return bool(
@@ -217,6 +226,7 @@ class BleAdvertisementRouter:
             or self._mac_registrations
             or self._pid_registrations
             or self._pid_range_registrations
+            or self._name_prefix_registrations
         )
 
     # ------------------------------------------------------------------
@@ -322,6 +332,42 @@ class BleAdvertisementRouter:
             log.debug("Routed %s mfg=%#06x to %d path(s)", mac, mfg_id, emitted)
         return emitted > 0
 
+    def process_name_advertisement(self, tap_mac: str, name: str, rssi: int,
+                                   interface: str, mfg_id: int = 0,
+                                   data: bytes = b'') -> bool:
+        """Route a name-identified advertisement to name_prefix consumers.
+
+        The Watchdog and other name-routed devices carry no distinctive
+        manufacturer id; they are matched by advertised local-name prefix.
+        The emitted signal carries the full *name* so the consumer can tell
+        model variants apart, plus the mac and the card that heard it.  A
+        manufacturer payload present in the same advert is passed through in
+        *mfg_id*/*data*; a pure name beacon leaves them 0/empty.
+        """
+        self._root.update_heartbeat()
+        if not name or not self._name_prefix_registrations:
+            return False
+        mac = _tap_mac_to_colon(tap_mac)
+        data_array = dbus.Array(data, signature='y')
+        mac_dbus = dbus.String(mac)
+        mfg_dbus = dbus.UInt16(mfg_id)
+        rssi_dbus = dbus.Int16(rssi)
+        iface_dbus = dbus.String(interface)
+        name_dbus = dbus.String(name)
+        emitted = 0
+        for prefix, paths in self._name_prefix_registrations.items():
+            if not name.startswith(prefix):
+                continue
+            for path in paths:
+                if path in self._emitters:
+                    self._emitters[path].Advertisement(
+                        mac_dbus, mfg_dbus, data_array, rssi_dbus,
+                        iface_dbus, name_dbus)
+                    emitted += 1
+        if emitted:
+            log.debug("Routed name %r (%s) to %d path(s)", name, mac, emitted)
+        return emitted > 0
+
     # ------------------------------------------------------------------
     # Registration discovery
     # ------------------------------------------------------------------
@@ -351,9 +397,10 @@ class BleAdvertisementRouter:
     def _scan_next_service(self):
         """Process one queued service, then reschedule if more remain."""
         if not self._pending_scan_services:
-            log.info("Registration scan complete: mfgr=%d mac=%d pid=%d range=%d",
+            log.info("Registration scan complete: mfgr=%d mac=%d pid=%d range=%d name_prefix=%d",
                      len(self._mfg_registrations), len(self._mac_registrations),
-                     len(self._pid_registrations), len(self._pid_range_registrations))
+                     len(self._pid_registrations), len(self._pid_range_registrations),
+                       len(self._name_prefix_registrations))
             return False
 
         service = self._pending_scan_services.pop(0)
@@ -365,9 +412,10 @@ class BleAdvertisementRouter:
         if self._pending_scan_services:
             GLib.timeout_add(100, self._scan_next_service)
         else:
-            log.info("Registration scan complete: mfgr=%d mac=%d pid=%d range=%d",
+            log.info("Registration scan complete: mfgr=%d mac=%d pid=%d range=%d name_prefix=%d",
                      len(self._mfg_registrations), len(self._mac_registrations),
-                     len(self._pid_registrations), len(self._pid_range_registrations))
+                     len(self._pid_registrations), len(self._pid_range_registrations),
+                       len(self._name_prefix_registrations))
         return False
 
     def _on_name_owner_changed(self, name, old_owner, new_owner):
@@ -466,6 +514,15 @@ class BleAdvertisementRouter:
                     self._mac_registrations.setdefault(mac_str, set()).add(path)
                     log.info("Registered addr %s (MAC=%s)", path, mac_str)
 
+            elif '/name_prefix/' in path:
+                m = re.search(r'/name_prefix/([A-Za-z0-9_]+)$', path)
+                if m:
+                    prefix = m.group(1)
+                    self._name_prefix_registrations.setdefault(
+                        prefix, set()).add(path)
+                    log.info("Registered name_prefix %s (prefix=%r)",
+                             path, prefix)
+
         for node in root.findall('node'):
             child_name = node.get('name')
             if not child_name:
@@ -494,7 +551,8 @@ class BleAdvertisementRouter:
         for collection in (self._mfg_registrations,
                            self._mac_registrations,
                            self._pid_registrations,
-                           self._pid_range_registrations):
+                           self._pid_range_registrations,
+                           self._name_prefix_registrations):
             for key, paths in list(collection.items()):
                 to_remove = {p for p in paths if service_name in p}
                 if to_remove:
@@ -530,6 +588,8 @@ class BleAdvertisementRouter:
         for paths in self._pid_registrations.values():
             active.update(paths)
         for paths in self._pid_range_registrations.values():
+            active.update(paths)
+        for paths in self._name_prefix_registrations.values():
             active.update(paths)
 
         for path in active:
