@@ -609,6 +609,24 @@ def test_disk_column_shows_real_volume_when_there_is_some(lf, tmp_path):
     assert s.disk_writes == 40 and s.disk_kb == 2048, "sectors are 512 B"
 
 
+def test_self_cost_does_not_cry_wolf_on_a_fresh_process(lf, tmp_path):
+    """Self-cost is CPU-since-start over uptime, so a young process reads high:
+    a prod dump 3.6 min in showed 1.26 %, which is startup amortised, not a
+    rate.  Warning on that fires at every restart -- exactly when an operator
+    is already looking -- and teaches them to ignore the line that matters."""
+    root = str(tmp_path / "proc")
+    make_proc(root, _procs_v1())
+    d = str(tmp_path / "dumps")
+    ring = [lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS).sample(now=0.0)]
+    young = lf.write_dump(ring, "t", d, deep=False, proc_root=root,
+                          started_at=time.time() - 60, cls="manual")
+    assert "startup-dominated" in open(young).read(), "a 1-minute-old process says so"
+    old = lf.write_dump(ring, "t2", d, deep=False, proc_root=root,
+                        started_at=time.time() - 7200, cls="trip")
+    assert "startup-dominated" not in open(old).read(), "a settled process does not"
+    assert lf.SELF_COST_SETTLE_S == 600.0
+
+
 def test_ring_is_thirty_minutes_of_thirty_second_samples(lf):
     assert lf.RING_LEN == 60 and lf.INTERVAL_S == 30.0 and lf.RING_MINUTES == 30
 

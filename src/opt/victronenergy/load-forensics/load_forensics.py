@@ -123,6 +123,13 @@ RELEASE_1M_BELOW_BAR = 1.0                          # hysteresis band under whic
 RELEASE_SAMPLES = 2                                 # consecutive quiet samples close an event
 HEARTBEAT_S = 3600.0
 SELF_COST_WARN_PCT = 1.0                            # average % of one core; the instrument must not be the load
+# ...but only once the average means something.  Self-cost is CPU-since-start
+# over uptime, and a fresh process has paid its interpreter startup and its
+# first full /proc walk against a few minutes of life: a prod dump 3.6 min
+# in read 1.26 %, which is startup amortised, not a rate.  Warning on that
+# would cry wolf at every restart -- the one moment an operator is already
+# looking -- and teach them to ignore the line that matters.
+SELF_COST_SETTLE_S = 600.0
 
 # Processes always reported, matched as substrings of comm or the script name.
 WATCH_LIST = (
@@ -934,7 +941,10 @@ def write_dump(ring, reason: str, dump_dir: str = DUMP_DIR, keep: Optional[dict]
     out = [f"=== load-forensics dump {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))} "
            f"class: {cls}  trigger: {reason} ===",
            f"self-cost: {cpu:.2f} s CPU since start (up {up / 3600:.2f} h, "
-           f"{(100.0 * cpu / up) if up > 0 else 0:.2f}% avg of one core), RSS {rss} kB",
+           f"{(100.0 * cpu / up) if up > 0 else 0:.2f}% avg of one core"
+           # the same caveat the heartbeat carries: early in a life this
+           # average is interpreter startup and the first full walk, not a rate
+           f"{'' if up >= SELF_COST_SETTLE_S else ', startup-dominated'}), RSS {rss} kB",
            f"--- ring: {len(ring)} samples, oldest first (t relative to now); "
            f"dbus '?' = peer inodes unavailable, not zero ---"]
     for s in ring:
@@ -1005,10 +1015,13 @@ class Forensics:
             cpu, rss = self_cost(self.root)
             up = now - self.started_at
             pct = 100.0 * cpu / up if up > 0 else 0.0
-            lvl = logging.WARNING if pct > SELF_COST_WARN_PCT else logging.INFO
-            log.log(lvl, "alive: %d samples, %d dumps, self-cost %.2f s CPU (%.2f%% of one core), "
+            settled = up >= SELF_COST_SETTLE_S
+            lvl = logging.WARNING if (settled and pct > SELF_COST_WARN_PCT) else logging.INFO
+            log.log(lvl, "alive: %d samples, %d dumps, self-cost %.2f s CPU (%.2f%% of one core%s), "
                     "RSS %d kB, load %.2f/%.2f/%.2f, bus %s",
-                    self.samples, self.dumps, cpu, pct, rss, l1, l5, l15,
+                    self.samples, self.dumps, cpu, pct,
+                    "" if settled else ", startup-dominated",
+                    rss, l1, l5, l15,
                     # '?' not -1: a lean sample during an open event does not
                     # count bus connections, and -1 reads as a failure
                     "?" if s.bus_connections < 0 else s.bus_connections)
