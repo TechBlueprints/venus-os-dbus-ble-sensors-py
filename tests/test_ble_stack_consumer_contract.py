@@ -113,6 +113,11 @@ def test_catcher_is_enable_gated_and_signature_guards_the_policy() -> None:
         "the policy pass must be guarded by the install's signature")
     assert 'policy["force_start_notify"]' in catcher
     assert "conf.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY" in catcher
+    # We program our own accept list, so we opt out of BCM's kernel-list
+    # leftover detector -- signature-guarded like force_start_notify so it
+    # is a no-op on an install that predates the switch.
+    assert 'policy["kernel_list_check"] = False' in catcher
+    assert '"kernel_list_check" in params' in catcher
 
 
 def test_the_launcher_prod_actually_execs_is_a_plain_interpreter() -> None:

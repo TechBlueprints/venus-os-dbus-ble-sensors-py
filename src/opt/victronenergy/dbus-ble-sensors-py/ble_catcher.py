@@ -242,6 +242,18 @@ def install(owner: str = CLAIM_OWNER, extra_adapters=()) -> bool:
             "through the legacy BCM_FORCE_START_NOTIFY environment",
             conf.BLUETOOTH_CONNECTION_MANAGER_DIR)
 
+    # We program the controller's accept list ourselves -- each name-routed
+    # EasyStart's last-heard address is injected deliberately (see
+    # hci_scan_control), and a unit sits silent while its A/C is off.  BCM's
+    # kernel-list leftover detector reads such an address as a BlueZ leftover
+    # and would warn on it.  Opt out on installs that support the switch;
+    # older installs have no such detector, so there is nothing to do.  This
+    # drops away with the accept list when PR #15 Phase 2 lands.
+    if ("kernel_list_check" in params
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values())):
+        policy["kernel_list_check"] = False
+
     try:
         install_bleak_catcher(
             owner,
