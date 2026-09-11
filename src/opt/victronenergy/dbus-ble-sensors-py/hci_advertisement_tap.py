@@ -304,6 +304,7 @@ def parse_monitor_frame(raw: bytes,
                         mfg_filter: frozenset[int] | set[int] | None = None,
                         ignored_macs: set[str] | None = None,
                         name_prefixes: 'tuple[str, ...] | None' = None,
+                        allowed_adapters: 'set[int] | None' = None,
                         ) -> list[TappedAdvertisement]:
     """Parse one monitor channel datagram into advertisement(s).
 
@@ -329,6 +330,16 @@ def parse_monitor_frame(raw: bytes,
     if opcode != _OP_HCI_EVENT_RX:
         return []
 
+    # Early-drop frames from adapters we do not scan, BEFORE parsing the
+    # report body.  The monitor channel (HCI_DEV_NONE) delivers every
+    # card's traffic, so another service's active discovery scan on a card
+    # we don't own floods us with strangers we would otherwise fully parse
+    # (~67 us/report on the Cerbo) only to discard at the mfg/name filter.
+    # Empty/None means "no restriction" -- the safe default before any
+    # adapter is known.  See dbus_ble_sensors._scan_adapter_indices.
+    if allowed_adapters and adapter_idx not in allowed_adapters:
+        return []
+
     subevent = raw[8]
     payload = raw[_FRAME_HDR_SIZE:]
 
@@ -345,7 +356,8 @@ def parse_monitor_frame(raw: bytes,
 def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
                  mfg_filter: frozenset[int] | set[int] | None = None,
                  ignored_macs: set[str] | None = None,
-                 name_prefixes: 'tuple[str, ...] | None' = None):
+                 name_prefixes: 'tuple[str, ...] | None' = None,
+                 allowed_adapters: 'set[int] | None' = None):
     """Read monitor frames and invoke callback for each parsed advertisement.
 
     Blocks until stop_event is set.  The callback receives a single
@@ -374,7 +386,7 @@ def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
         if not raw:
             break
         for adv in parse_monitor_frame(raw, mfg_filter, ignored_macs,
-                                       name_prefixes):
+                                       name_prefixes, allowed_adapters):
             try:
                 callback(adv)
             except Exception:
