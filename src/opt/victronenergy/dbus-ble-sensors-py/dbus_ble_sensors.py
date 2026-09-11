@@ -34,6 +34,7 @@ import threading
 import time
 from conf import IGNORED_DEVICES_TIMEOUT, DEVICE_SERVICES_TIMEOUT, PROCESS_VERSION
 from hci_advertisement_tap import (
+    attach_adapter_filter,
     create_tap_socket, run_tap_loop, TappedAdvertisement,
 )
 from ble_advertisement_router import BleAdvertisementRouter
@@ -277,6 +278,12 @@ class DbusBleSensors(object):
         # reassigned) so the running tap sees changes; kept in step with
         # _adapters by _refresh_scan_adapter_indices.
         self._scan_adapter_indices: set[int] = set()
+        # The live monitor socket, so _refresh_scan_adapter_indices can
+        # re-attach the kernel adapter filter when a card is added,
+        # removed or RENUMBERED.  Renumbering is the safety-critical case:
+        # a stale filter would drop our own card's traffic in-kernel and
+        # leave us deaf.  None while no tap is running.
+        self._tap_sock = None
 
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
@@ -449,6 +456,15 @@ class DbusBleSensors(object):
         if indices != self._scan_adapter_indices:
             self._scan_adapter_indices.clear()
             self._scan_adapter_indices.update(indices)
+            sock = self._tap_sock
+            if sock is not None:
+                # Re-attach for the new set (a card added, removed, or
+                # renumbered).  A failed attach leaves the PREVIOUS program in
+                # the kernel, which for a renumber means dropping our own
+                # card -- so on failure fall back to no kernel filter and let
+                # the userspace early-drop carry it.
+                if not attach_adapter_filter(sock, self._scan_adapter_indices):
+                    attach_adapter_filter(sock, None)
 
     def _adapter_allowed(self, key, name):
         """Whether this adapter may be scanned on.
@@ -1242,6 +1258,13 @@ class DbusBleSensors(object):
             logging.error(f"Cannot open HCI monitor socket: {exc}")
             logging.error("No advertisement source available — service cannot function")
             return
+        self._tap_sock = tap_sock
+        # Kernel-side adapter filter: frames from cards we do not scan, and
+        # anything that is not an LE Meta event, are dropped before they are
+        # queued to us -- the tap thread never wakes for them.  Attached
+        # before the thread starts so nothing unfiltered is ever queued.
+        # parse_monitor_frame keeps its own early-drop as the fallback.
+        attach_adapter_filter(tap_sock, self._scan_adapter_indices)
 
         known_mfg_ids = self._known_mfg_ids
         last_mfg_data = self._last_mfg_data
@@ -1425,6 +1448,7 @@ class DbusBleSensors(object):
         # event between recvs and returns cleanly; the socket closes
         # when the thread exits.
         self._tap_stop.set()
+        self._tap_sock = None
         # _prune_tick will not restart the tap while _throttled is True
         # (see the change in _prune_tick below).
         self._tap_thread = None
