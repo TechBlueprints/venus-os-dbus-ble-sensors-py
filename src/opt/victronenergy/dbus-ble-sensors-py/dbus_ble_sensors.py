@@ -497,6 +497,16 @@ class DbusBleSensors(object):
                 logging.info("Tap MAC gate: closed, %d known address(es) pass "
                              "the walk; strangers dropped before parsing",
                              len(desired))
+            # The same set drives the kernel address gate: a stranger that
+            # the kernel drops never wakes the tap thread at all, which is
+            # where an accept-all radio's cost actually lives.  Re-attach
+            # so the kernel program tracks this set; a failed attach falls
+            # back inside attach_adapter_filter and this userspace gate
+            # still carries the strangers.
+            sock = self._tap_sock
+            if sock is not None and self._scan_adapter_indices:
+                attach_adapter_filter(sock, self._scan_adapter_indices,
+                                      self._tap_known_macs)
 
     def _refresh_scan_adapter_indices(self) -> None:
         """Rebuild _scan_adapter_indices in place from the cards we scan."""
@@ -515,7 +525,8 @@ class DbusBleSensors(object):
                 # the kernel, which for a renumber means dropping our own
                 # card -- so on failure fall back to no kernel filter and let
                 # the userspace early-drop carry it.
-                if not attach_adapter_filter(sock, self._scan_adapter_indices):
+                if not attach_adapter_filter(sock, self._scan_adapter_indices,
+                                             self._tap_known_macs):
                     attach_adapter_filter(sock, None)
 
     def _adapter_allowed(self, key, name):
@@ -1172,14 +1183,19 @@ class DbusBleSensors(object):
             logging.error(f"Cannot open HCI monitor socket: {exc}")
             logging.error("No advertisement source available — service cannot function")
             return
-        self._tap_sock = tap_sock
-        # Kernel-side adapter filter: frames from cards we do not scan, and
-        # anything that is not an LE Meta event, are dropped before they are
-        # queued to us -- the tap thread never wakes for them.  Attached
-        # before the thread starts so nothing unfiltered is ever queued.
-        # parse_monitor_frame keeps its own early-drop as the fallback.
-        attach_adapter_filter(tap_sock, self._scan_adapter_indices)
+        # Seed the known-address set before the socket is published, so the
+        # refresh does not attach on its own; the single attach below then
+        # installs adapter filter and address gate together.
         self._refresh_tap_known_macs()
+        self._tap_sock = tap_sock
+        # Kernel-side filter: frames from cards we do not scan, anything that
+        # is not an LE Meta event, and (gate closed) single-report frames
+        # from unknown addresses are dropped before they are queued to us --
+        # the tap thread never wakes for them.  Attached before the thread
+        # starts so nothing unfiltered is ever queued.  parse_monitor_frame
+        # keeps its own early-drop and pre-walk gate as the fallback.
+        attach_adapter_filter(tap_sock, self._scan_adapter_indices,
+                              self._tap_known_macs)
 
         known_mfg_ids = self._known_mfg_ids
         last_mfg_data = self._last_mfg_data

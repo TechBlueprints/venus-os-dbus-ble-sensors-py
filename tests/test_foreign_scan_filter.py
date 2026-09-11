@@ -67,6 +67,10 @@ def _sensors(allowed_keys):
     # code tolerate their absence.
     s._tap_known_macs = set()
     s._configured_macs = set()
+    # ...and the kernel-filter plumbing the refresh re-attaches through:
+    # no socket published yet, so a refresh here changes no kernel state.
+    s._tap_sock = None
+    s._scan_adapter_indices = set()
 
     class _Router:
         def process_name_advertisement(self, *a, **k):
