@@ -353,6 +353,83 @@ def parse_monitor_frame(raw: bytes,
     return []
 
 
+# ── Kernel-side adapter filter (classic BPF on the monitor socket) ─────────
+#
+# The monitor channel delivers EVERY adapter's traffic.  parse_monitor_frame
+# drops foreign-adapter frames in ~1 us, but each one still costs a recv()
+# wakeup and a GIL acquisition on the tap thread.  A classic BPF program
+# attached with SO_ATTACH_FILTER makes the kernel drop those frames before
+# they are queued to our socket, so we never wake for them at all.
+#
+# Built ONLY from byte loads (BPF_LD|BPF_B|BPF_ABS): the monitor header and
+# HCI fields are little-endian while BPF's halfword load is big-endian, and
+# a wrong-endian compare would drop everything.  Byte loads have no
+# endianness.  The program replicates parse_monitor_frame's own gates
+# (opcode == event-rx, event == LE Meta) plus "adapter in our set"; its only
+# possible error direction is passing a frame the parser then discards,
+# never dropping one we need.  Proven on dev-cerbo 2026-09-06 with
+# pass-all / drop-all / selective-adapter controls.
+_BPF_LD_B_ABS = 0x30   # A = byte at [k]
+_BPF_JMP_JEQ_K = 0x15  # if A == k: pc += jt+1 else pc += jf+1
+_BPF_RET_K = 0x06      # return k  (0 = drop, 0xFFFF = accept whole frame)
+_SO_ATTACH_FILTER = 26
+_SO_DETACH_FILTER = 27
+
+
+def _bpf_insn(code: int, jt: int = 0, jf: int = 0, k: int = 0) -> bytes:
+    return struct.pack("HBBI", code, jt, jf, k)
+
+
+def build_adapter_filter(allowed: 'set[int] | frozenset[int]') -> bytes:
+    """Classic-BPF program bytes: accept LE-Meta event frames from *allowed*
+    adapter indices, drop everything else.  Deterministic; unit-tested."""
+    idx = sorted(int(i) for i in allowed)
+    n = len(idx)
+    if n == 0 or n > 200:
+        raise ValueError("adapter set must be 1..200 entries")
+    prog = [
+        _bpf_insn(_BPF_LD_B_ABS, k=0),                        # 0: opcode lo
+        _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=3 + n, k=_OP_HCI_EVENT_RX),  # 1
+        _bpf_insn(_BPF_LD_B_ABS, k=6),                        # 2: event code
+        _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=1 + n, k=_EVT_LE_META),      # 3
+        _bpf_insn(_BPF_LD_B_ABS, k=2),                        # 4: adapter idx
+    ]
+    for j, i in enumerate(idx):                               # 5..5+n-1
+        prog.append(_bpf_insn(_BPF_JMP_JEQ_K, jt=n - j, jf=0, k=i))
+    prog.append(_bpf_insn(_BPF_RET_K, k=0))                   # 5+n: DROP
+    prog.append(_bpf_insn(_BPF_RET_K, k=0xFFFF))              # 6+n: ACCEPT
+    return b"".join(prog)
+
+
+def attach_adapter_filter(sock: socket.socket,
+                          allowed: 'set[int] | frozenset[int] | None') -> bool:
+    """Install (or, for an empty/None set, remove) the kernel adapter filter.
+
+    Returns True if the kernel accepted the change.  A failure is logged
+    and returns False; parse_monitor_frame's own early-drop still applies,
+    so the tap stays correct either way -- this is an optimisation layered
+    on an already-safe path.
+    """
+    try:
+        if not allowed:
+            sock.setsockopt(socket.SOL_SOCKET, _SO_DETACH_FILTER,
+                            struct.pack("I", 0))
+            _log.info("tap kernel adapter filter: removed (no restriction)")
+            return True
+        prog = build_adapter_filter(allowed)
+        buf = ctypes.create_string_buffer(prog)
+        fprog = struct.pack("HL", len(prog) // 8, ctypes.addressof(buf))
+        sock.setsockopt(socket.SOL_SOCKET, _SO_ATTACH_FILTER, fprog)
+        _log.info("tap kernel adapter filter: attached for hci%s "
+                  "(LE-Meta events only; other adapters dropped in-kernel)",
+                  sorted(allowed))
+        return True
+    except (OSError, ValueError) as e:
+        _log.warning("tap kernel adapter filter not applied (%r); "
+                     "falling back to the userspace early-drop", e)
+        return False
+
+
 def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
                  mfg_filter: frozenset[int] | set[int] | None = None,
                  ignored_macs: set[str] | None = None,
