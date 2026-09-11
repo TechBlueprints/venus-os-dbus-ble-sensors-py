@@ -68,7 +68,6 @@ NAME_ADV_MIN_INTERVAL = 5.0
 #
 # After a restart no current address is known; listen wide until one
 # is heard, but never longer than this.
-NAME_STARTUP_GRACE_S = 600.0
 # Byte-level identical-advertisement re-forward interval comes from the
 # SensorRoundingPolicy setting at /Settings/SensorRounding/HeartbeatSeconds
 # so this and the publish-level dedup in SensorPublisher share one knob.
@@ -284,6 +283,11 @@ class DbusBleSensors(object):
         # a stale filter would drop our own card's traffic in-kernel and
         # leave us deaf.  None while no tap is running.
         self._tap_sock = None
+        # The tap's pre-walk MAC gate.  EMPTY = discovery open (walk every
+        # report so new devices can be adopted); otherwise every address
+        # we would act on.  The tap thread holds this same object; it is
+        # mutated in place by _refresh_tap_known_macs, never reassigned.
+        self._tap_known_macs: set[str] = set()
 
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
@@ -306,7 +310,6 @@ class DbusBleSensors(object):
         self._internal_name_prefixes = frozenset(BleDevice.NAME_CLASSES.keys())
         self._name_prefixes: set = set(self._internal_name_prefixes)
         self._last_name_adv: dict[str, float] = {}
-        self._name_accept_all_logged: bool = False
         # identity -> (tap_mac, address_type): the current address of
         # each name-identified device, refreshed on every matched
         # advertisement and injected into every adapter's accept list
@@ -445,6 +448,55 @@ class DbusBleSensors(object):
         """The hci<N> BlueZ last used for this card, for log lines only."""
         record = self._adapters.get(key)
         return record['name'] if record else None
+
+    def _refresh_tap_known_macs(self) -> None:
+        """Rebuild the tap's pre-walk MAC gate in place.
+
+        With the hardware accept list retired the radio is accept-all, so
+        our own cards deliver every neighbour.  When adoption is CLOSED a
+        stranger would be refused at the adoption gate anyway, so the tap
+        drops it before the AD walk -- but only if we can prove it is a
+        stranger, hence the known set: configured devices, learned
+        name-device addresses, router-registered addresses.
+
+        The gate is OPEN (empty set, walk everything) when:
+          * ``ContinuousScan`` is ON -- discovery needs every report;
+          * any external service registered by manufacturer id / product
+            rather than address -- it wants every device of that maker,
+            strangers included, so nothing may be dropped unseen;
+          * the setting cannot be read -- fail OPEN, never gate blind.
+        """
+        try:
+            open_ = bool(self._dbus_ble_service.get_continuous_scan())
+        except Exception:
+            open_ = True
+        why = "discovery on" if open_ else None
+        if not open_:
+            try:
+                if self._router.get_registered_mfg_ids():
+                    open_ = True
+                    why = "an external mfg-id registration needs every report"
+            except Exception:
+                open_ = True
+                why = "router state unreadable"
+        if open_:
+            desired: set[str] = set()
+        else:
+            desired = set(self._configured_macs)
+            desired.update(entry[0] for entry in self._name_device_macs.values())
+            try:
+                desired.update(self._router.get_registered_macs())
+            except Exception:
+                pass
+        if desired != self._tap_known_macs:
+            self._tap_known_macs.clear()
+            self._tap_known_macs.update(desired)
+            if open_:
+                logging.info("Tap MAC gate: open (%s)", why)
+            else:
+                logging.info("Tap MAC gate: closed, %d known address(es) pass "
+                             "the walk; strangers dropped before parsing",
+                             len(desired))
 
     def _refresh_scan_adapter_indices(self) -> None:
         """Rebuild _scan_adapter_indices in place from the cards we scan."""
@@ -593,26 +645,28 @@ class DbusBleSensors(object):
                 "on next throttle release", new_value)
             return
         logging.info("ContinuousScan changed to %r — re-applying scan policy", new_value)
+        self._refresh_tap_known_macs()
         # Defer the actual re-apply to the periodic tick implementation
         # so all the per-adapter loop / failure-streak / policy-diff
         # logic stays in one place.
         self._scan_reenable_tick()
 
     def _desired_filter_policy(self) -> int:
-        """Return the controller filter policy that matches the current
-        ``/Settings/BleSensors/ContinuousScan`` setting.
+        """The controller filter policy: always ``FILTER_POLICY_ACCEPT_ALL``.
 
-        ON  (default) → ``FILTER_POLICY_ACCEPT_ALL`` — the controller
-                        passes every advertisement up, just like before
-                        the accept-list refactor.
-        OFF           → ``FILTER_POLICY_ACCEPT_LIST_ONLY`` — the
-                        controller drops advertisements whose MAC
-                        isn't in the accept list we apply alongside.
+        The radio no longer uses the controller's hardware accept list.
+        That table is 25 entries on one of prod's cards, was full, silently
+        dropped the devices that fell off its end, and coupled the
+        ``ContinuousScan`` setting to the radio.  Filtering moved to where
+        it has no capacity limit: the kernel BPF filter on the monitor
+        socket keeps other adapters' traffic out, and the tap's pre-walk
+        MAC gate drops a stranger before parsing it whenever adoption is
+        closed.  ``/Settings/BleSensors/ContinuousScan`` now means exactly
+        one thing -- whether we ADOPT something new -- and is read at the
+        adoption gate, not here.
         """
         try:
-            return (hci_scan_control.FILTER_POLICY_ACCEPT_ALL
-                    if self._dbus_ble_service.get_continuous_scan()
-                    else hci_scan_control.FILTER_POLICY_ACCEPT_LIST_ONLY)
+            return hci_scan_control.FILTER_POLICY_ACCEPT_ALL
         except Exception:
             # Service init might not have populated the setting yet —
             # err on the safe side so we don't accidentally hide every
@@ -712,56 +766,6 @@ class DbusBleSensors(object):
                 logging.debug(
                     f"{label}: scan enable failed (streak={streak})")
 
-    def _accept_list_capacity(self, key: str) -> 'int | None':
-        """Controller accept-list size for an adapter, read once and cached."""
-        if key in self._accept_list_size:
-            return self._accept_list_size[key]
-        idx = adapter_identity.index_for(key)
-        size = None
-        if idx is not None:
-            try:
-                size = hci_scan_control.read_accept_list_size(idx)
-            except Exception:
-                logging.exception("%s: accept-list size read failed",
-                                  adapter_identity.label(key))
-        if not size:
-            size = None
-        self._accept_list_size[key] = size
-        return size
-
-    def _accept_list_for(self, key: str, devices: list) -> list:
-        """The slice of *devices* this adapter should watch for.
-
-        Falls back to the whole list if any adapter's capacity is unknown
-        — that is exactly the historical behaviour, and it is better to
-        overlap than to leave a device assigned to no card at all.
-        """
-        keys = sorted(self._adapters)
-        if key not in keys:
-            return devices
-        capacities = {k: self._accept_list_capacity(k) for k in keys}
-        if any(capacities[k] is None for k in keys):
-            return devices
-        slices = hci_scan_control.accept_list_slices(
-            keys, capacities, len(devices))
-        covered = sum(count for _off, count in slices.values())
-        if covered < len(devices):
-            state = (len(devices), covered)
-            if self._accept_list_warned != state:
-                self._accept_list_warned = state
-                detail = ", ".join(
-                    f"{adapter_identity.label(k)}={capacities[k]}" for k in keys)
-                logging.warning(
-                    f"accept-list capacity exceeded: {len(devices)} known "
-                    f"devices, room for {covered} across the adapters we scan "
-                    f"on ({detail}).  {len(devices) - covered} device(s) will "
-                    "not be heard while Continuous scanning is OFF — turn it "
-                    "on, or scan on another adapter, or prune the cache.")
-        else:
-            self._accept_list_warned = None
-        offset, count = slices[key]
-        return devices[offset:offset + count]
-
     def _policy_label(self, policy: int) -> str:
         """Human label for what a policy request actually puts on the radio.
 
@@ -770,108 +774,16 @@ class DbusBleSensors(object):
         label must describe the radio, not the request, or the log
         claims a filter that is not in force.
         """
-        if policy == hci_scan_control.FILTER_POLICY_ACCEPT_ALL:
-            return "accept-all"
-        if self._has_configured_name_devices():
-            return "accept-list-only (+name-device addresses)"
-        return "accept-list-only"
-
-    def _name_grace_active(self) -> bool:
-        """Whether the post-restart wide-listening grace is in force.
-
-        After a restart no current address is known for any name device;
-        idle units advertise, so listening wide briefly converges in
-        seconds.  Once an address is learned (or the grace expires) the
-        radios stay accept-list — there is no periodic wide listening,
-        by choice: the field units hold fixed public addresses, and the
-        rotation insurance is deferred until rotation is ever observed.
-        """
-        return (not self._name_device_macs
-                and time.monotonic() - self._started_at
-                < NAME_STARTUP_GRACE_S)
-
-    def _has_configured_name_devices(self) -> bool:
-        """Whether any name-identified (rotating-MAC) device is configured.
-
-        Matches stored dev_ids against the DEV_ID_PREFIXES each
-        name-identified device class declares.  Devices adopted during
-        this run are included — their dev_id is added to
-        ``_configured_dev_ids`` at adoption.
-        """
-        prefixes = tuple(
-            prefix
-            for cls in BleDevice.NAME_CLASSES.values()
-            for prefix in getattr(cls, 'DEV_ID_PREFIXES', ()))
-        if not prefixes:
-            return False
-        return any(dev_id.startswith(prefixes)
-                   for dev_id in self._configured_dev_ids)
+        return "accept-all"
 
     def _apply_scan_policy(self, key: str, adapter_index: int,
                            policy: int) -> bool:
-        """Apply a scan filter policy on the given adapter.
+        """Put the adapter into passive scan with the given filter policy.
 
-        ``FILTER_POLICY_ACCEPT_ALL`` is just the plain enable; the
-        accept list is irrelevant.  ``FILTER_POLICY_ACCEPT_LIST_ONLY``
-        rebuilds the accept list from our persisted MAC cache and
-        applies it atomically with the policy change.
-
-        If accept-list mode is requested but the cache is empty, we
-        log a warning and fall back to ``FILTER_POLICY_ACCEPT_ALL``
-        rather than leave the controller refusing every advertisement
-        — the user can always run with ``ContinuousScan = ON`` long
-        enough to populate the cache.
+        Only ``FILTER_POLICY_ACCEPT_ALL`` is ever requested now (see
+        :meth:`_desired_filter_policy`); the hardware accept list, its
+        per-card slicing, and the name-device address injection are gone.
         """
-        if policy == hci_scan_control.FILTER_POLICY_ACCEPT_LIST_ONLY:
-            # Name-identified devices (EasyStart) ride in the accept
-            # list by their last-heard address, injected on every
-            # adapter below.  After a restart no address is known yet,
-            # so listen wide until one is heard (bounded grace).
-            # ContinuousScan OFF still closes the ADOPTION gate
-            # throughout.  See NAME_STARTUP_GRACE_S for why there is
-            # deliberately no periodic wide listening beyond the grace.
-            named = self._has_configured_name_devices()
-            if named and self._name_grace_active():
-                logging.debug(
-                    "%s: startup grace — listening wide until a "
-                    "name-device address is learned",
-                    adapter_identity.label(key))
-                return hci_scan_control.enable_scan(
-                    adapter_index,
-                    filter_policy=hci_scan_control.FILTER_POLICY_ACCEPT_ALL,
-                    scan_type=self._desired_scan_type(),
-                )
-            if named and not self._name_accept_all_logged:
-                self._name_accept_all_logged = True
-                logging.info(
-                    "configured name-identified device(s): accept list "
-                    "includes their last-heard address on every adapter; "
-                    "discovery/adoption stays off per ContinuousScan")
-            devices = sorted(self._mac_address_types.items())
-            if not devices and not self._name_device_macs:
-                logging.warning(
-                    f"hci{adapter_index}: accept-list mode requested but cache "
-                    "is empty — falling back to accept-all.  Re-enable "
-                    "Continuous Scanning briefly to populate."
-                )
-                return hci_scan_control.enable_scan(
-                    adapter_index,
-                    filter_policy=hci_scan_control.FILTER_POLICY_ACCEPT_ALL,
-                    scan_type=self._desired_scan_type(),
-                )
-            mine = self._accept_list_for(key, devices)
-            if named and self._name_device_macs:
-                # Name-device addresses go on EVERY adapter, after the
-                # capacity slicing: a 1-2 m device sliced onto the far
-                # radio would never be heard at all.
-                have = {mac for mac, _t in mine}
-                mine = mine + sorted(
-                    entry for entry in self._name_device_macs.values()
-                    if entry[0] not in have)
-            logging.debug("%s: accept list %d of %d known devices",
-                          adapter_identity.label(key), len(mine), len(devices))
-            return hci_scan_control.apply_accept_list(
-                adapter_index, mine, scan_type=self._desired_scan_type())
         return hci_scan_control.enable_scan(
             adapter_index, filter_policy=policy,
             scan_type=self._desired_scan_type())
@@ -1067,6 +979,7 @@ class DbusBleSensors(object):
                     dev_instance.init()
                     self._known_mac[dev_mac] = dev_instance
                     self._configured_macs.add(dev_mac)
+                    self._refresh_tap_known_macs()
                     self._refresh_tap_disabled(dev_instance)
                     # Newly-configured device — remember its BLE
                     # address type so we can put it in the controller's
@@ -1238,6 +1151,7 @@ class DbusBleSensors(object):
         if self._name_device_macs.get(identity) != entry:
             self._name_device_macs[identity] = entry
             self._save_name_device_macs()
+            self._refresh_tap_known_macs()
 
         try:
             dev_instance.handle_name_advertisement(mac, adv_name, rssi,
@@ -1265,6 +1179,7 @@ class DbusBleSensors(object):
         # before the thread starts so nothing unfiltered is ever queued.
         # parse_monitor_frame keeps its own early-drop as the fallback.
         attach_adapter_filter(tap_sock, self._scan_adapter_indices)
+        self._refresh_tap_known_macs()
 
         known_mfg_ids = self._known_mfg_ids
         last_mfg_data = self._last_mfg_data
@@ -1309,7 +1224,8 @@ class DbusBleSensors(object):
                              mfg_filter=known_mfg_ids,
                              ignored_macs=self._tap_ignored_macs,
                              name_prefixes=self._name_prefixes or None,
-                             allowed_adapters=self._scan_adapter_indices)
+                             allowed_adapters=self._scan_adapter_indices,
+                             known_macs=self._tap_known_macs)
             except Exception:
                 logging.exception("HCI monitor tap thread died")
 
@@ -1518,6 +1434,7 @@ class DbusBleSensors(object):
         logging.info("Tap mfg filter updated: %d IDs (%d internal + %d external)",
                      len(self._known_mfg_ids), len(self._internal_mfg_ids),
                      len(external_ids))
+        self._refresh_tap_known_macs()
 
         external_prefixes = self._router.get_registered_name_prefixes()
         desired_prefixes = self._internal_name_prefixes | external_prefixes

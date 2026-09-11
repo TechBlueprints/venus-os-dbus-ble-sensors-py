@@ -60,6 +60,24 @@ def _sensors(allowed_keys):
     s._name_device_macs = {}
     s._save_name_device_macs = lambda: None
     s._dbus_ble_service = _Svc()
+    # Attributes __init__ creates unconditionally that later hooks touch:
+    # the tap's pre-walk MAC gate (refreshed when a name address is
+    # learned), the configured set it is built from, and the router the
+    # name path feeds.  Mirror __init__ here rather than make production
+    # code tolerate their absence.
+    s._tap_known_macs = set()
+    s._configured_macs = set()
+
+    class _Router:
+        def process_name_advertisement(self, *a, **k):
+            return False
+
+        def get_registered_mfg_ids(self):
+            return set()
+
+        def get_registered_macs(self):
+            return set()
+    s._router = _Router()
     # adapter_identity.canonical("hciN") has no backend in tests and
     # degrades to the name itself, so keys here are "hci0", "hci9".
     s._adapter_allowed = lambda key, name: key in allowed_keys

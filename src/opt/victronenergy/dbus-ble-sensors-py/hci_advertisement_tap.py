@@ -185,6 +185,7 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
                           mfg_filter: frozenset[int] | set[int] | None = None,
                           ignored_macs: set[str] | None = None,
                           name_prefixes: 'Iterable[str] | None' = None,
+                          known_macs: 'set[str] | None' = None,
                           ) -> list[TappedAdvertisement]:
     """Parse LE Advertising Report (subevent 0x02).
 
@@ -222,6 +223,16 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
         mac = _format_mac(addr_bytes)
         if ignored_macs is not None and mac in ignored_macs:
             continue
+        # Pre-walk MAC gate.  When the caller supplies a non-empty set of
+        # KNOWN addresses (configured devices, learned name-device
+        # addresses, router-registered addresses), a report from any other
+        # address is dropped here, before the AD walk: with adoption closed
+        # we would refuse to adopt it anyway, so parsing it is pure cost.
+        # This is what makes an accept-all radio affordable -- a stranger
+        # costs the MAC format + one set lookup instead of the TLV walk.
+        # An empty/None set means "no gate" (discovery open: walk all).
+        if known_macs and mac not in known_macs:
+            continue
 
         mfg, name = _walk_ad_structures(ad_data, mfg_filter, name_prefixes)
         if mfg or name:
@@ -240,6 +251,7 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
                             mfg_filter: frozenset[int] | set[int] | None = None,
                             ignored_macs: set[str] | None = None,
                             name_prefixes: 'Iterable[str] | None' = None,
+                            known_macs: 'set[str] | None' = None,
                             ) -> list[TappedAdvertisement]:
     """Parse LE Extended Advertising Report (subevent 0x0D).
 
@@ -293,6 +305,16 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
         mac = _format_mac(addr_bytes)
         if ignored_macs is not None and mac in ignored_macs:
             continue
+        # Pre-walk MAC gate.  When the caller supplies a non-empty set of
+        # KNOWN addresses (configured devices, learned name-device
+        # addresses, router-registered addresses), a report from any other
+        # address is dropped here, before the AD walk: with adoption closed
+        # we would refuse to adopt it anyway, so parsing it is pure cost.
+        # This is what makes an accept-all radio affordable -- a stranger
+        # costs the MAC format + one set lookup instead of the TLV walk.
+        # An empty/None set means "no gate" (discovery open: walk all).
+        if known_macs and mac not in known_macs:
+            continue
 
         mfg, name = _walk_ad_structures(ad_data, mfg_filter, name_prefixes)
         if mfg or name:
@@ -312,6 +334,7 @@ def parse_monitor_frame(raw: bytes,
                         ignored_macs: set[str] | None = None,
                         name_prefixes: 'Iterable[str] | None' = None,
                         allowed_adapters: 'set[int] | None' = None,
+                        known_macs: 'set[str] | None' = None,
                         ) -> list[TappedAdvertisement]:
     """Parse one monitor channel datagram into advertisement(s).
 
@@ -352,10 +375,10 @@ def parse_monitor_frame(raw: bytes,
 
     if subevent == _SUB_ADV_REPORT:
         return _parse_legacy_reports(payload, 3, adapter_idx, mfg_filter,
-                                     ignored_macs, name_prefixes)
+                                     ignored_macs, name_prefixes, known_macs)
     elif subevent == _SUB_EXT_ADV_REPORT:
         return _parse_extended_reports(payload, 3, adapter_idx, mfg_filter,
-                                       ignored_macs, name_prefixes)
+                                       ignored_macs, name_prefixes, known_macs)
 
     return []
 
@@ -441,7 +464,8 @@ def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
                  mfg_filter: frozenset[int] | set[int] | None = None,
                  ignored_macs: set[str] | None = None,
                  name_prefixes: 'Iterable[str] | None' = None,
-                 allowed_adapters: 'set[int] | None' = None):
+                 allowed_adapters: 'set[int] | None' = None,
+                 known_macs: 'set[str] | None' = None):
     """Read monitor frames and invoke callback for each parsed advertisement.
 
     Blocks until stop_event is set.  The callback receives a single
@@ -470,7 +494,8 @@ def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
         if not raw:
             break
         for adv in parse_monitor_frame(raw, mfg_filter, ignored_macs,
-                                       name_prefixes, allowed_adapters):
+                                       name_prefixes, allowed_adapters,
+                                       known_macs):
             try:
                 callback(adv)
             except Exception:
