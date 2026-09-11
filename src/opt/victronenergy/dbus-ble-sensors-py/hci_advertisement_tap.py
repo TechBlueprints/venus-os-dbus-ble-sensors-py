@@ -20,6 +20,7 @@ import os
 import select
 import socket
 import struct
+from typing import Iterable
 import threading
 from dataclasses import dataclass, field
 
@@ -127,7 +128,7 @@ def create_tap_socket() -> socket.socket:
 
 def _walk_ad_structures(data: bytes,
                         mfg_filter: frozenset[int] | set[int] | None = None,
-                        name_prefixes: 'tuple[str, ...] | None' = None,
+                        name_prefixes: 'Iterable[str] | None' = None,
                         ) -> 'tuple[dict[int, bytes], str | None]':
     """Parse AD structures: manufacturer-specific data, plus the local name.
 
@@ -168,7 +169,13 @@ def _walk_ad_structures(data: bytes,
                 decoded = bytes(data[pos + 1 : pos + ad_len]).decode('utf-8')
             except UnicodeDecodeError:
                 decoded = None
-            if decoded and decoded.startswith(name_prefixes):
+            # str.startswith takes a str or a TUPLE, never a set.  The caller
+            # now hands us a live, mutable set (external name_prefix
+            # registrations are folded into it in place), so convert at use.
+            # A named advert is rare (name-routed devices only), so the
+            # per-call tuple() is negligible.  Prod 2026-09-11 13:42Z: a set
+            # here raised TypeError and crash-looped the tap thread.
+            if decoded and decoded.startswith(tuple(name_prefixes)):
                 name = decoded
         pos += ad_len
     return result, name
@@ -177,7 +184,7 @@ def _walk_ad_structures(data: bytes,
 def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
                           mfg_filter: frozenset[int] | set[int] | None = None,
                           ignored_macs: set[str] | None = None,
-                          name_prefixes: 'tuple[str, ...] | None' = None,
+                          name_prefixes: 'Iterable[str] | None' = None,
                           ) -> list[TappedAdvertisement]:
     """Parse LE Advertising Report (subevent 0x02).
 
@@ -232,7 +239,7 @@ def _parse_legacy_reports(payload: bytes, offset: int, adapter_idx: int,
 def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
                             mfg_filter: frozenset[int] | set[int] | None = None,
                             ignored_macs: set[str] | None = None,
-                            name_prefixes: 'tuple[str, ...] | None' = None,
+                            name_prefixes: 'Iterable[str] | None' = None,
                             ) -> list[TappedAdvertisement]:
     """Parse LE Extended Advertising Report (subevent 0x0D).
 
@@ -303,7 +310,7 @@ def _parse_extended_reports(payload: bytes, offset: int, adapter_idx: int,
 def parse_monitor_frame(raw: bytes,
                         mfg_filter: frozenset[int] | set[int] | None = None,
                         ignored_macs: set[str] | None = None,
-                        name_prefixes: 'tuple[str, ...] | None' = None,
+                        name_prefixes: 'Iterable[str] | None' = None,
                         allowed_adapters: 'set[int] | None' = None,
                         ) -> list[TappedAdvertisement]:
     """Parse one monitor channel datagram into advertisement(s).
@@ -433,7 +440,7 @@ def attach_adapter_filter(sock: socket.socket,
 def run_tap_loop(sock: socket.socket, callback, stop_event: threading.Event,
                  mfg_filter: frozenset[int] | set[int] | None = None,
                  ignored_macs: set[str] | None = None,
-                 name_prefixes: 'tuple[str, ...] | None' = None,
+                 name_prefixes: 'Iterable[str] | None' = None,
                  allowed_adapters: 'set[int] | None' = None):
     """Read monitor frames and invoke callback for each parsed advertisement.
 
