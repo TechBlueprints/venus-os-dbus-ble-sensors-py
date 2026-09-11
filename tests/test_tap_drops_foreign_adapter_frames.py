@@ -11,6 +11,7 @@ The adapter-index early-drop discards such a frame in ~1 us.
 from __future__ import annotations
 
 import os
+import re
 import struct
 import sys
 
@@ -58,8 +59,11 @@ def test_drop_happens_before_body_parsing() -> None:
 
 def test_run_tap_loop_forwards_allowed_adapters() -> None:
     src = open(os.path.join(SRC, "hci_advertisement_tap.py")).read()
-    assert "allowed_adapters: 'set[int] | None' = None):" in src
-    assert "name_prefixes, allowed_adapters)" in src
+    assert "allowed_adapters: 'set[int] | None' = None" in src
+    # whitespace-insensitive: the call wraps across lines
+    assert re.search(
+        r"parse_monitor_frame\(raw,\s*mfg_filter,\s*ignored_macs,\s*"
+        r"name_prefixes,\s*allowed_adapters,\s*known_macs\)", src)
 
 
 def test_sensors_py_maintains_and_passes_the_index_set() -> None:
