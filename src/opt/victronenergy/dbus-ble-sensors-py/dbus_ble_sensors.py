@@ -269,6 +269,14 @@ class DbusBleSensors(object):
         # across a reset, a replug, or a reboot.  Each value carries the
         # name and path BlueZ most recently used for that card.
         self._adapters: dict[str, dict] = {}
+        # Indices of the cards we actually scan (derived from _adapters).
+        # The tap thread holds this SAME set object by reference and drops
+        # frames from any other adapter before parsing them, so another
+        # service's discovery scan on a card we don't own costs ~1 us/frame
+        # instead of a full ~67 us parse.  Mutated in place (never
+        # reassigned) so the running tap sees changes; kept in step with
+        # _adapters by _refresh_scan_adapter_indices.
+        self._scan_adapter_indices: set[int] = set()
 
         self._known_mac = DatedDict(ttl=DEVICE_SERVICES_TIMEOUT)
         self._ignored_mac = DatedDict(ttl=IGNORED_DEVICES_TIMEOUT)
@@ -431,6 +439,17 @@ class DbusBleSensors(object):
         record = self._adapters.get(key)
         return record['name'] if record else None
 
+    def _refresh_scan_adapter_indices(self) -> None:
+        """Rebuild _scan_adapter_indices in place from the cards we scan."""
+        indices = set()
+        for rec in self._adapters.values():
+            nm = rec.get('name', '')
+            if nm.startswith('hci') and nm[3:].isdigit():
+                indices.add(int(nm[3:]))
+        if indices != self._scan_adapter_indices:
+            self._scan_adapter_indices.clear()
+            self._scan_adapter_indices.update(indices)
+
     def _adapter_allowed(self, key, name):
         """Whether this adapter may be scanned on.
 
@@ -475,6 +494,7 @@ class DbusBleSensors(object):
             if known is None or known['name'] != name:
                 self._adapters[key] = {'name': name, 'mac': mac,
                                        'path': str(path)}
+                self._refresh_scan_adapter_indices()
                 self._dbus_ble_service.add_ble_adapter(name, mac)
                 self._start_passive_scan(key)
 
@@ -491,6 +511,7 @@ class DbusBleSensors(object):
                 return
             self._dbus_ble_service.remove_ble_adapter(name)
             self._adapters.pop(key, None)
+            self._refresh_scan_adapter_indices()
             # Best-effort: turn off the controller's scanner before
             # bluez tears the adapter down.  If the adapter is already
             # gone the HCI socket open will fail; we swallow that.  Use
@@ -1264,7 +1285,8 @@ class DbusBleSensors(object):
                 run_tap_loop(tap_sock, _on_advertisement, self._tap_stop,
                              mfg_filter=known_mfg_ids,
                              ignored_macs=self._tap_ignored_macs,
-                             name_prefixes=self._name_prefixes or None)
+                             name_prefixes=self._name_prefixes or None,
+                             allowed_adapters=self._scan_adapter_indices)
             except Exception:
                 logging.exception("HCI monitor tap thread died")
 
