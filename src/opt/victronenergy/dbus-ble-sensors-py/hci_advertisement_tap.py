@@ -400,23 +400,92 @@ def parse_monitor_frame(raw: bytes,
 # never dropping one we need.  Proven on dev-cerbo 2026-09-06 with
 # pass-all / drop-all / selective-adapter controls.
 _BPF_LD_B_ABS = 0x30   # A = byte at [k]
+_BPF_LD_H_ABS = 0x28   # A = 16-bit big-endian (as the bytes lie) at [k]
+_BPF_LD_W_ABS = 0x20   # A = 32-bit big-endian (as the bytes lie) at [k]
 _BPF_JMP_JEQ_K = 0x15  # if A == k: pc += jt+1 else pc += jf+1
+_BPF_JMP_JA = 0x05     # pc += k+1 (unconditional, 32-bit offset)
 _BPF_RET_K = 0x06      # return k  (0 = drop, 0xFFFF = accept whole frame)
 _SO_ATTACH_FILTER = 26
 _SO_DETACH_FILTER = 27
+_BPF_MAXINSNS = 4096   # kernel limit on a classic-BPF program
+
+# Address gate (see build_adapter_filter).  Report[0]'s 6-byte address sits
+# at a fixed offset from the frame start for a single-report datagram:
+#   legacy   (subevent 0x02): hdr(6) evt(1) plen(1) sub(1) num(1)
+#                             event_type(1) addr_type(1) -> addr at 12
+#   extended (subevent 0x0D): hdr(6) evt(1) plen(1) sub(1) num(1)
+#                             event_type(2) addr_type(1) -> addr at 13
+_ADDR_OFF_LEGACY = 12
+_ADDR_OFF_EXTENDED = 13
+_INSNS_PER_MAC = 5
+_MAX_KERNEL_MACS = 380  # 2 paths x 5 insns x 380 = 3800, under _BPF_MAXINSNS
 
 
 def _bpf_insn(code: int, jt: int = 0, jf: int = 0, k: int = 0) -> bytes:
     return struct.pack("HBBI", code, jt, jf, k)
 
 
-def build_adapter_filter(allowed: 'set[int] | frozenset[int]') -> bytes:
+def _mac_to_raw(mac: str) -> bytes:
+    """Inverse of _format_mac: the 6 address bytes as they lie in the frame
+    (little-endian on the wire).  Raises ValueError for a malformed MAC."""
+    raw = bytes.fromhex(mac.replace(":", ""))
+    if len(raw) != 6:
+        raise ValueError(f"not a 6-byte address: {mac!r}")
+    return raw[::-1]
+
+
+def _mac_match_block(raw: bytes, addr_off: int) -> list[bytes]:
+    """Five instructions: accept the frame if the address at *addr_off*
+    equals *raw*, else fall through to the next block.  Every jump is
+    local (at most 3 ahead), so the block count is not bounded by the
+    8-bit jt/jf fields.
+
+    The word/halfword loads read the bytes AS THEY LIE, big-endian into A,
+    and the constants are built the same way from the same bytes -- no
+    host-endianness or wire-endianness assumption enters the compare.
+    """
+    word = int.from_bytes(raw[0:4], "big")
+    half = int.from_bytes(raw[4:6], "big")
+    return [
+        _bpf_insn(_BPF_LD_W_ABS, k=addr_off),
+        _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=3, k=word),
+        _bpf_insn(_BPF_LD_H_ABS, k=addr_off + 4),
+        _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=1, k=half),
+        _bpf_insn(_BPF_RET_K, k=0xFFFF),
+    ]
+
+
+def build_adapter_filter(allowed: 'set[int] | frozenset[int]',
+                         known_macs: 'Iterable[str] | None' = None) -> bytes:
     """Classic-BPF program bytes: accept LE-Meta event frames from *allowed*
-    adapter indices, drop everything else.  Deterministic; unit-tested."""
+    adapter indices, drop everything else.  Deterministic; unit-tested.
+
+    With a non-empty *known_macs* (hex strings in _format_mac's spelling)
+    the program adds an ADDRESS GATE: a single-report advertising frame
+    whose report[0] address is not in the set is dropped in the kernel.
+    That is where the accept-all radio's cost really lives -- each stranger
+    datagram costs a select()+recv() wakeup (~200 us on the Cerbo) before
+    Python sees a single byte, so the userspace pre-walk gate cannot make
+    strangers cheap; only not waking can.  The gate is conservative:
+      * a datagram carrying more than one report is ACCEPTED unexamined
+        (a known device could be batched behind a stranger; the userspace
+        gate then judges each report) -- prod cards deliver one report per
+        datagram, so this costs nothing in practice;
+      * any LE-Meta subevent other than the two advertising-report kinds
+        is ACCEPTED (the parser discards it cheaply);
+      * the two report kinds have different address offsets, so each gets
+        its own compare chain, dispatched by subevent.
+    An empty/None *known_macs* builds the adapter-only program, byte for
+    byte what this function produced before the gate existed.
+    """
     idx = sorted(int(i) for i in allowed)
     n = len(idx)
     if n == 0 or n > 200:
         raise ValueError("adapter set must be 1..200 entries")
+    raws = [_mac_to_raw(m) for m in sorted(set(known_macs or ()))]
+    if len(raws) > _MAX_KERNEL_MACS:
+        raise ValueError(f"address gate holds at most {_MAX_KERNEL_MACS} "
+                         f"addresses, got {len(raws)}")
     prog = [
         _bpf_insn(_BPF_LD_B_ABS, k=0),                        # 0: opcode lo
         _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=3 + n, k=_OP_HCI_EVENT_RX),  # 1
@@ -427,13 +496,51 @@ def build_adapter_filter(allowed: 'set[int] | frozenset[int]') -> bytes:
     for j, i in enumerate(idx):                               # 5..5+n-1
         prog.append(_bpf_insn(_BPF_JMP_JEQ_K, jt=n - j, jf=0, k=i))
     prog.append(_bpf_insn(_BPF_RET_K, k=0))                   # 5+n: DROP
-    prog.append(_bpf_insn(_BPF_RET_K, k=0xFFFF))              # 6+n: ACCEPT
+    if not raws:
+        prog.append(_bpf_insn(_BPF_RET_K, k=0xFFFF))          # 6+n: ACCEPT
+        return b"".join(prog)
+
+    # 6+n: adapter accepted -- the address gate.  Offsets below are
+    # relative to this dispatch block (B); the two chains follow it.
+    chain_len = _INSNS_PER_MAC * len(raws) + 1                # + final DROP
+    leg_start = 8                                             # B+8
+    ext_start = leg_start + chain_len
+    prog += [
+        _bpf_insn(_BPF_LD_B_ABS, k=9),                        # B+0 num_reports
+        _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=5, k=1),           # B+1 !=1 -> B+7
+        _bpf_insn(_BPF_LD_B_ABS, k=8),                        # B+2 subevent
+        _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=1, k=_SUB_ADV_REPORT),      # B+3
+        _bpf_insn(_BPF_JMP_JA, k=leg_start - 5),              # B+4 -> legacy
+        _bpf_insn(_BPF_JMP_JEQ_K, jt=0, jf=1, k=_SUB_EXT_ADV_REPORT),  # B+5
+        _bpf_insn(_BPF_JMP_JA, k=ext_start - 7),              # B+6 -> extended
+        _bpf_insn(_BPF_RET_K, k=0xFFFF),                      # B+7 ACCEPT
+    ]
+    for raw in raws:                                          # legacy chain
+        prog += _mac_match_block(raw, _ADDR_OFF_LEGACY)
+    prog.append(_bpf_insn(_BPF_RET_K, k=0))                   # stranger: DROP
+    for raw in raws:                                          # extended chain
+        prog += _mac_match_block(raw, _ADDR_OFF_EXTENDED)
+    prog.append(_bpf_insn(_BPF_RET_K, k=0))                   # stranger: DROP
+    assert len(prog) <= _BPF_MAXINSNS
     return b"".join(prog)
 
 
+def _attach_program(sock: socket.socket, prog: bytes) -> None:
+    buf = ctypes.create_string_buffer(prog)
+    fprog = struct.pack("HL", len(prog) // 8, ctypes.addressof(buf))
+    sock.setsockopt(socket.SOL_SOCKET, _SO_ATTACH_FILTER, fprog)
+
+
 def attach_adapter_filter(sock: socket.socket,
-                          allowed: 'set[int] | frozenset[int] | None') -> bool:
+                          allowed: 'set[int] | frozenset[int] | None',
+                          known_macs: 'Iterable[str] | None' = None) -> bool:
     """Install (or, for an empty/None set, remove) the kernel adapter filter.
+
+    With *known_macs* the program also carries the in-kernel address gate
+    (see build_adapter_filter).  If the gated program is refused -- too
+    many addresses, a malformed one, or the kernel says no -- the
+    adapter-only program is installed instead and the userspace pre-walk
+    gate carries the strangers, so the tap stays correct either way.
 
     Returns True if the kernel accepted the change.  A failure is logged
     and returns False; parse_monitor_frame's own early-drop still applies,
@@ -446,13 +553,23 @@ def attach_adapter_filter(sock: socket.socket,
                             struct.pack("I", 0))
             _log.info("tap kernel adapter filter: removed (no restriction)")
             return True
-        prog = build_adapter_filter(allowed)
-        buf = ctypes.create_string_buffer(prog)
-        fprog = struct.pack("HL", len(prog) // 8, ctypes.addressof(buf))
-        sock.setsockopt(socket.SOL_SOCKET, _SO_ATTACH_FILTER, fprog)
+        macs = sorted(set(known_macs or ()))
+        gate = "open (every report from these cards is delivered)"
+        if macs:
+            try:
+                _attach_program(sock, build_adapter_filter(allowed, macs))
+                gate = (f"closed, {len(macs)} known address(es); "
+                        "strangers dropped in-kernel, never waking the tap")
+            except (OSError, ValueError) as e:
+                _log.warning("tap kernel address gate not applied (%r); "
+                             "adapter-only filter, userspace gate carries "
+                             "the strangers", e)
+                _attach_program(sock, build_adapter_filter(allowed))
+        else:
+            _attach_program(sock, build_adapter_filter(allowed))
         _log.info("tap kernel adapter filter: attached for hci%s "
-                  "(LE-Meta events only; other adapters dropped in-kernel)",
-                  sorted(allowed))
+                  "(LE-Meta events only; other adapters dropped in-kernel); "
+                  "address gate %s", sorted(allowed), gate)
         return True
     except (OSError, ValueError) as e:
         _log.warning("tap kernel adapter filter not applied (%r); "
