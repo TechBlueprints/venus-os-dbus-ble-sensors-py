@@ -26,6 +26,10 @@ import hci_advertisement_tap as tap  # noqa: E402
 
 LDB, JEQ, RET = tap._BPF_LD_B_ABS, tap._BPF_JMP_JEQ_K, tap._BPF_RET_K
 LDH, LDW, JA = tap._BPF_LD_H_ABS, tap._BPF_LD_W_ABS, tap._BPF_JMP_JA
+LDB_X, LDH_X, LDW_X = tap._BPF_LD_B_IND, tap._BPF_LD_H_IND, tap._BPF_LD_W_IND
+LDM, ST, LDX = tap._BPF_LD_MEM, tap._BPF_ST, tap._BPF_LDX_IMM
+ADD_K, ADD_X, SUB_X, TAX = tap._BPF_ALU_ADD_K, tap._BPF_ALU_ADD_X, tap._BPF_ALU_SUB_X, tap._BPF_MISC_TAX
+JGT, JGE = tap._BPF_JMP_JGT_K, tap._BPF_JMP_JGE_K
 
 
 def _decode(prog: bytes):
@@ -34,33 +38,48 @@ def _decode(prog: bytes):
 
 
 def _run(prog: bytes, frame: bytes) -> int:
-    """A tiny classic-BPF interpreter for the opcodes we emit, with the
-    kernel's semantics: word/halfword loads are big-endian as the bytes
-    lie, a load past the end of the packet terminates with 0 (drop),
-    jeq advances pc by jt+1 / jf+1, ja by k+1."""
+    """A classic-BPF interpreter for the opcodes we emit, with the kernel's
+    semantics: word/halfword loads are big-endian as the bytes lie, a load
+    past the end of the packet terminates with 0 (drop), conditional jumps
+    advance pc by jt+1 / jf+1, ja by k+1, ALU is 32-bit unsigned."""
     insns = _decode(prog)
     pc = 0
     A = 0
+    X = 0
+    M = [0] * 16
+    steps = 0
     while True:
         assert 0 <= pc < len(insns), "jump left the program"
+        steps += 1
+        assert steps < 10000, "runaway program"
         code, jt, jf, k = insns[pc]
-        if code == LDB:
-            if k >= len(frame):
+        if code in (LDB, LDH, LDW, LDB_X, LDH_X, LDW_X):
+            size = {LDB: 1, LDH: 2, LDW: 4, LDB_X: 1, LDH_X: 2, LDW_X: 4}[code]
+            off = k + (X if code in (LDB_X, LDH_X, LDW_X) else 0)
+            if off < 0 or off + size > len(frame):
                 return 0
-            A = frame[k]
+            A = int.from_bytes(frame[off:off + size], "big")
             pc += 1
-        elif code == LDH:
-            if k + 2 > len(frame):
-                return 0
-            A = int.from_bytes(frame[k:k + 2], "big")
-            pc += 1
-        elif code == LDW:
-            if k + 4 > len(frame):
-                return 0
-            A = int.from_bytes(frame[k:k + 4], "big")
-            pc += 1
+        elif code == LDM:
+            A = M[k]; pc += 1
+        elif code == ST:
+            M[k] = A; pc += 1
+        elif code == LDX:
+            X = k; pc += 1
+        elif code == ADD_K:
+            A = (A + k) & 0xFFFFFFFF; pc += 1
+        elif code == ADD_X:
+            A = (A + X) & 0xFFFFFFFF; pc += 1
+        elif code == SUB_X:
+            A = (A - X) & 0xFFFFFFFF; pc += 1
+        elif code == TAX:
+            X = A; pc += 1
         elif code == JEQ:
             pc += 1 + (jt if A == k else jf)
+        elif code == JGT:
+            pc += 1 + (jt if A > k else jf)
+        elif code == JGE:
+            pc += 1 + (jt if A >= k else jf)
         elif code == JA:
             pc += 1 + k
         elif code == RET:
@@ -213,7 +232,7 @@ def test_every_jump_in_the_gated_program_stays_inside_and_forward() -> None:
     # the two chains are reachable and the dispatch lands on their heads
     prog = tap.build_adapter_filter({1}, macs)
     assert _run(prog, _legacy_frame(addr_le=tap._mac_to_raw("%012x" % 0x100000000000))) == 0xFFFF
-    assert _run(prog, _extended_frame(addr_le=tap._mac_to_raw("%012x" % (0x100000000000 + 379)))) == 0xFFFF
+    assert _run(prog, _extended_frame(addr_le=tap._mac_to_raw("%012x" % (0x100000000000 + tap._MAX_KERNEL_MACS - 1)))) == 0xFFFF
     assert _run(prog, _legacy_frame(addr_le=bytes(6))) == 0
     assert _run(prog, _extended_frame(addr_le=bytes(6))) == 0
 
@@ -243,19 +262,177 @@ def test_attach_falls_back_to_the_adapter_only_program_when_the_gate_is_refused(
     # gated shape: the adapter-only ACCEPT is replaced by the 8-insn
     # dispatch, then one 5-insn block + DROP per chain
     assert s.attached == [8 + 8 + 2 * (5 + 1)]
+    s = Sock()
+    assert tap.attach_adapter_filter(s, {0, 1}, {"not-a-mac"}, {0x02E1}, {"PM"}) is True
+    assert s.attached[0] > 9, "ids and prefixes survive a refused address block"
 
 
-def test_sensors_py_carries_the_known_set_into_every_attach() -> None:
+def test_sensors_py_attaches_ids_prefixes_and_registered_addresses() -> None:
     src = open(os.path.join(SRC, "dbus_ble_sensors.py")).read()
+    helper = src[src.index("def _attach_kernel_filter"):]
+    helper = helper[:helper.index("\n    def ")]
+    assert "mfg_ids=self._known_mfg_ids" in helper
+    assert "name_prefixes=self._name_prefixes" in helper
+    assert "get_registered_macs()" in helper, "router addr registrations are the only kernel address blocks"
+    assert "self._tap_known_macs" not in helper, "configured/learned addresses are gated in userspace, not the kernel"
+    # every attach with an adapter set goes through the helper (whose own
+    # call is the one occurrence)
+    import re
+    outside = src.replace(helper, "")
+    assert re.search(r"attach_adapter_filter\(\w+, self\._scan_adapter_indices", outside) is None
+    assert src.count("self._attach_kernel_filter(") >= 3
+    # re-attached when registrations change (ids, prefixes, addresses)
+    body = src[src.index("def _on_registrations_changed"):]
+    body = body[:body.index("\n    def ")]
+    assert "self._attach_kernel_filter()" in body
+    # the userspace known-set refresh no longer touches the kernel
     body = src[src.index("def _refresh_tap_known_macs"):]
     body = body[:body.index("\n    def ")]
-    assert "attach_adapter_filter(sock, self._scan_adapter_indices," in body, \
-        "a change to the known set must re-attach the kernel program"
-    # every attach with an adapter set also carries the known set
-    import re
-    calls = re.findall(r"attach_adapter_filter\((\w+), self\._scan_adapter_indices,\s*self\._tap_known_macs\)", src)
-    assert len(calls) == 3, calls
-    assert re.search(r"attach_adapter_filter\(\w+, self\._scan_adapter_indices\)", src) is None
-    # the seed refresh runs before the socket is published so it cannot attach
-    start = src[src.index("tap_sock = create_tap_socket()"):]
-    assert start.index("self._refresh_tap_known_macs()") < start.index("self._tap_sock = tap_sock")
+    assert "attach" not in body
+
+
+# ── The advertisement walk: manufacturer ids and name prefixes ─────────────
+IDS = {0x02E1, 0x0499, 0x0131, 0x0CC0, 0x0F53, 0x0067, 0x089A, 0x0059, 0x000D}
+PFX = {"EasyStart_", "PM", "WD_"}
+
+
+def _ad(*structs: bytes) -> bytes:
+    return b"".join(bytes([len(x)]) + x for x in structs)
+
+
+def _mfg(cid: int, payload: bytes = b"\x10\x02\x00") -> bytes:
+    return bytes([0xFF]) + cid.to_bytes(2, "little") + payload
+
+
+def _name(text: str, short: bool = False) -> bytes:
+    return bytes([0x08 if short else 0x09]) + text.encode()
+
+
+FLAGS = bytes([0x01, 0x06])
+STRANGER = bytes.fromhex("665544332211")
+
+
+def _leg(data: bytes, adapter_idx: int = 1, addr_le: bytes = STRANGER, num: int = 1,
+         rssi: int = 0xC8) -> bytes:
+    body = bytes([0x3E, 0, 0x02, num, 0x03, 0x01]) + addr_le + bytes([len(data)]) + data + bytes([rssi])
+    body = bytearray(body); body[1] = len(body) - 2
+    return struct.pack("<HHH", tap._OP_HCI_EVENT_RX, adapter_idx, len(body)) + bytes(body)
+
+
+def _ext(data: bytes, adapter_idx: int = 1, addr_le: bytes = STRANGER) -> bytes:
+    rep = bytes([0x01, 0x13, 0x00, 0x01]) + addr_le + bytes([1, 0, 0xFF, 0x7F, 0xC8, 0, 0, 0]) \
+        + bytes(6) + bytes([len(data)]) + data
+    body = bytes([0x3E, len(rep) + 1, 0x0D]) + rep
+    return struct.pack("<HHH", tap._OP_HCI_EVENT_RX, adapter_idx, len(body)) + bytes(body)
+
+
+def _walk_prog(macs=None):
+    return tap.build_adapter_filter({0, 1}, macs, IDS, PFX)
+
+
+@pytest.mark.parametrize("mk", [_leg, _ext])
+def test_allowed_manufacturer_ids_pass_and_others_drop(mk) -> None:
+    prog = _walk_prog()
+    for cid in sorted(IDS):
+        assert _run(prog, mk(_ad(FLAGS, _mfg(cid)))) == 0xFFFF, hex(cid)
+    assert _run(prog, mk(_ad(FLAGS, _mfg(0x004C)))) == 0          # Apple
+    assert _run(prog, mk(_ad(FLAGS, _mfg(0xE102)))) == 0          # byte-swapped Victron is NOT Victron
+    assert _run(prog, mk(_ad(FLAGS))) == 0                        # nothing to match
+
+
+@pytest.mark.parametrize("mk", [_leg, _ext])
+def test_name_prefixes_pass_on_complete_and_short_names(mk) -> None:
+    prog = _walk_prog()
+    assert _run(prog, mk(_ad(FLAGS, _name("EasyStart_1234")))) == 0xFFFF
+    assert _run(prog, mk(_ad(FLAGS, _name("EasyStart_1234", short=True)))) == 0xFFFF
+    assert _run(prog, mk(_ad(_name("PM7291")))) == 0xFFFF
+    assert _run(prog, mk(_ad(_name("WD_A1")))) == 0xFFFF
+    assert _run(prog, mk(_ad(_name("EasyStar")))) == 0            # too short for the prefix
+    assert _run(prog, mk(_ad(_name("easystart_1")))) == 0         # case matters, as in userspace
+    assert _run(prog, mk(_ad(_name("Ruuvi 1234")))) == 0
+    assert _run(prog, mk(_ad(_name("P")))) == 0                   # shorter than "PM"
+
+
+def test_a_short_name_never_hides_a_later_matching_structure() -> None:
+    prog = _walk_prog()
+    # the name structure comes first and is too short for every prefix;
+    # the walk must advance past it and find the Victron record
+    assert _run(prog, _leg(_ad(_name("Easy"), _mfg(0x02E1)))) == 0xFFFF
+    assert _run(prog, _leg(_ad(_name("EasyStar"), FLAGS, _mfg(0x0499)))) == 0xFFFF
+    # eighth structure still found; ninth is beyond the walk (documented)
+    seven = [FLAGS] * 7
+    assert _run(prog, _leg(_ad(*seven, _mfg(0x02E1)))) == 0xFFFF
+    assert _run(prog, _ext(_ad(*([FLAGS] * 8), _mfg(0x02E1)))) == 0
+
+
+def test_the_walk_stops_at_the_end_of_the_data_and_on_a_zero_length() -> None:
+    prog = _walk_prog()
+    # legacy: the RSSI byte follows the data; make it look like a plausible
+    # length and put a fake Victron record after it -- must NOT match
+    data = _ad(FLAGS)
+    f = bytearray(_leg(data, rssi=0x04))
+    f += _mfg(0x02E1)                       # bytes beyond the report
+    assert _run(prog, bytes(f)) == 0
+    # a zero-length structure ends the walk
+    assert _run(prog, _leg(_ad(FLAGS) + b"\x00" + _ad(_mfg(0x02E1)))) == 0
+    # a structure whose declared length runs past the data end is NOT
+    # policed by the kernel gate: its company-id bytes are inside the
+    # datagram, so it passes, and the parser (which bounds every
+    # structure) discards it.  The gate is a pre-filter, not the parser.
+    bogus = _leg(bytes([0x1F, 0xFF, 0xE1, 0x02]))
+    assert _run(prog, bogus) == 0xFFFF
+    assert tap.parse_monitor_frame(bogus, IDS, None, PFX, {0, 1}, None) == []
+
+
+def test_registered_addresses_pass_without_any_id_or_name() -> None:
+    prog = _walk_prog(macs={"ec3b5fac52ef"})
+    known = bytes.fromhex("ef52ac5f3bec")
+    assert _run(prog, _leg(_ad(FLAGS), addr_le=known)) == 0xFFFF
+    assert _run(prog, _ext(_ad(FLAGS), addr_le=known)) == 0xFFFF
+    assert _run(prog, _leg(_ad(FLAGS))) == 0
+
+
+def test_walk_program_is_conservative_and_respects_the_adapter_gate() -> None:
+    prog = _walk_prog()
+    assert _run(prog, _leg(_ad(FLAGS), num=2)) == 0xFFFF           # multi-report passes
+    conn = struct.pack("<HHH", tap._OP_HCI_EVENT_RX, 1, 4) + bytes([0x3E, 2, 0x01, 0x00])
+    assert _run(prog, conn) == 0xFFFF                              # non-report subevent passes
+    assert _run(prog, _leg(_ad(_mfg(0x02E1)), adapter_idx=5)) == 0  # foreign card drops
+
+
+def test_walk_program_agrees_with_the_parser_on_real_frames() -> None:
+    """For every frame the parser keeps under the same ids and prefixes,
+    the kernel program must pass it; for every frame it discards, drop
+    -- across a grid of structure orders, both report kinds."""
+    prog = _walk_prog()
+    structs = [FLAGS, _mfg(0x02E1), _mfg(0x004C), _name("EasyStart_9"), _name("Kitchen"),
+               _name("PM1"), bytes([0x03, 0xAA, 0xBB]), _mfg(0x0499, b"\x05")]
+    import itertools
+    for combo in itertools.permutations(structs, 3):
+        data = _ad(*combo)
+        for mk in (_leg, _ext):
+            frame = mk(data)
+            advs = tap.parse_monitor_frame(frame, IDS, None, PFX, {0, 1}, None)
+            want = 0xFFFF if advs else 0
+            assert _run(prog, frame) == want, (combo, mk.__name__)
+
+
+def test_walk_program_jumps_stay_inside_and_forward() -> None:
+    for prog in (_walk_prog(), _walk_prog(macs={"%012x" % i for i in range(200)})):
+        insns = _decode(prog)
+        assert len(insns) <= tap._BPF_MAXINSNS
+        assert insns[-1][0] == RET
+        for pc, (code, jt, jf, k) in enumerate(insns):
+            if code in (JEQ, JGT, JGE):
+                assert pc + 1 + jt < len(insns) and pc + 1 + jf < len(insns), pc
+            if code == JA:
+                assert 0 < pc + 1 + k < len(insns), pc
+
+
+def test_walk_program_size_caps_are_enforced() -> None:
+    with pytest.raises(ValueError):
+        tap.build_adapter_filter({1}, None, set(range(tap._MAX_KERNEL_IDS + 1)), None)
+    with pytest.raises(ValueError):
+        tap.build_adapter_filter({1}, None, None, {"p%d" % i for i in range(tap._MAX_KERNEL_PREFIXES + 1)})
+    with pytest.raises(ValueError):
+        tap.build_adapter_filter({1}, None, None, {"x" * (tap._MAX_PREFIX_LEN + 1)})
