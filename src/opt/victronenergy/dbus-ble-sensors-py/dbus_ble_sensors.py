@@ -83,6 +83,15 @@ SNIF_LOGGER.propagate = False
 # keeps us in passive mode with a worst-case 60 s gap.  See the
 # ``hci_scan_control`` module docstring for the full rationale.
 _SCAN_REENABLE_INTERVAL_S = 60
+# Scan rotation: only ONE scanning card listens at a time and the role
+# moves to the next card every interval.  Accept-all costs the kernel a
+# USB interrupt and a Bluetooth-worker wakeup per advertisement the radio
+# delivers, before any filter of ours runs (measured 2026-09-11: ~38k
+# context switches and ~12 idle points per 30 s with both cards open);
+# one card open at a time halves it.  Every configured device on prod is
+# heard by both cards, so rotation loses no coverage today; the userspace
+# known-address gate and the kernel id/prefix gate are unchanged.
+_SCAN_ROTATION_INTERVAL_S = 60
 
 # Where we persist the ``{mac: address_type}`` cache.  Sits on the
 # ``/data`` partition so it survives reboots — without it, the first
@@ -283,6 +292,10 @@ class DbusBleSensors(object):
         # a stale filter would drop our own card's traffic in-kernel and
         # leave us deaf.  None while no tap is running.
         self._tap_sock = None
+        # Scan rotation: the card currently listening, and how many swaps
+        # have happened (the first full cycle logs at INFO, then DEBUG).
+        self._scan_active_key: 'str | None' = None
+        self._rotation_swaps = 0
         # The tap's pre-walk MAC gate.  EMPTY = discovery open (walk every
         # report so new devices can be adopted); otherwise every address
         # we would act on.  The tap thread holds this same object; it is
@@ -497,16 +510,6 @@ class DbusBleSensors(object):
                 logging.info("Tap MAC gate: closed, %d known address(es) pass "
                              "the walk; strangers dropped before parsing",
                              len(desired))
-            # The same set drives the kernel address gate: a stranger that
-            # the kernel drops never wakes the tap thread at all, which is
-            # where an accept-all radio's cost actually lives.  Re-attach
-            # so the kernel program tracks this set; a failed attach falls
-            # back inside attach_adapter_filter and this userspace gate
-            # still carries the strangers.
-            sock = self._tap_sock
-            if sock is not None and self._scan_adapter_indices:
-                attach_adapter_filter(sock, self._scan_adapter_indices,
-                                      self._tap_known_macs)
 
     def _refresh_scan_adapter_indices(self) -> None:
         """Rebuild _scan_adapter_indices in place from the cards we scan."""
@@ -525,9 +528,91 @@ class DbusBleSensors(object):
                 # the kernel, which for a renumber means dropping our own
                 # card -- so on failure fall back to no kernel filter and let
                 # the userspace early-drop carry it.
-                if not attach_adapter_filter(sock, self._scan_adapter_indices,
-                                             self._tap_known_macs):
+                if not self._attach_kernel_filter(sock):
                     attach_adapter_filter(sock, None)
+
+    def _attach_kernel_filter(self, sock=None) -> bool:
+        """(Re)install the kernel program on the monitor socket.
+
+        The program passes only LE advertising reports from our scanning
+        cards that carry an allowed manufacturer id, an allowed name
+        prefix, or a router-registered address -- the same ids and
+        prefixes the tap's userspace walk keys on, so adoption open or
+        closed makes no difference to it.  Configured and learned
+        addresses are NOT in the kernel program: the userspace pre-walk
+        gate (``_tap_known_macs``) judges those, on the few strangers
+        that share our makers' ids (measured ~50/s on prod, ~1% of a
+        core).  Re-run whenever ids, prefixes or registrations change.
+        """
+        sock = sock if sock is not None else self._tap_sock
+        if sock is None or not self._scan_adapter_indices:
+            return False
+        try:
+            registered = set(self._router.get_registered_macs())
+        except Exception:
+            registered = set()
+        return attach_adapter_filter(sock, self._scan_adapter_indices,
+                                     known_macs=registered,
+                                     mfg_ids=self._known_mfg_ids,
+                                     name_prefixes=self._name_prefixes)
+
+    def _scan_rotation_order(self) -> list:
+        return sorted(self._adapters)
+
+    def _apply_rotation(self, reason: str, advance: bool = False) -> None:
+        """Make exactly one scanning card listen; the rest sit idle.
+
+        *advance* moves the role to the next card in the (sorted) order;
+        otherwise the current card keeps it, or the first card takes it
+        when there is none.  Idle cards keep their claim so no other
+        consumer takes them.  Skipped while throttled: the throttle
+        disabled every card and its release path calls back here.
+        """
+        if self._throttled:
+            return
+        order = self._scan_rotation_order()
+        if not order:
+            self._scan_active_key = None
+            return
+        active = self._scan_active_key
+        if advance and active in order and len(order) > 1:
+            active = order[(order.index(active) + 1) % len(order)]
+        if active not in order:
+            active = order[0]
+        changed = active != self._scan_active_key
+        self._scan_active_key = active
+        quiet = self._rotation_swaps >= len(order)
+        for key in order:
+            if key == active:
+                self._start_passive_scan(key, quiet=quiet)
+            else:
+                self._stop_scan_on(key, quiet=quiet)
+        if changed:
+            self._rotation_swaps += 1
+            idle = [adapter_identity.label(k, self._adapter_name(k))
+                    for k in order if k != active]
+            line = (f"scan rotation ({reason}): "
+                    f"{adapter_identity.label(active, self._adapter_name(active))} "
+                    f"listening; idle: {', '.join(idle) or 'none'}")
+            (logging.debug if quiet else logging.info)(line)
+
+    def _rotation_tick(self) -> bool:
+        self._apply_rotation("rotation", advance=True)
+        return True
+
+    def _stop_scan_on(self, key: str, quiet: bool = False) -> None:
+        """Take a card out of scan for its idle turn, keeping its claim."""
+        idx = adapter_identity.index_for(key)
+        if idx is None:
+            return
+        was_enabled = key in self._scan_enabled_adapters
+        if hci_scan_control.disable_passive_scan(idx):
+            self._scan_enabled_adapters.discard(key)
+            self._scan_claims.hold(key, exclusive=True)
+            if was_enabled:
+                (logging.debug if quiet else logging.info)(
+                    f"{adapter_identity.label(key, self._adapter_name(key))}: "
+                    f"scan idle (rotation)")
 
     def _adapter_allowed(self, key, name):
         """Whether this adapter may be scanned on.
@@ -575,7 +660,7 @@ class DbusBleSensors(object):
                                        'path': str(path)}
                 self._refresh_scan_adapter_indices()
                 self._dbus_ble_service.add_ble_adapter(name, mac)
-                self._start_passive_scan(key)
+                self._apply_rotation("adapter added")
 
     def _on_interfaces_removed(self, path, interfaces):
         if not str(path).startswith('/org/bluez'):
@@ -605,6 +690,9 @@ class DbusBleSensors(object):
             self._scan_claims.release(key)
             adapter_identity.invalidate()
             logging.info(f"{name} ({key}): adapter removed")
+            if key == self._scan_active_key:
+                self._scan_active_key = None
+                self._apply_rotation("adapter removed")
 
     def _save_known_mac_types(self) -> None:
         """Persist ``self._mac_address_types`` to disk.
@@ -704,8 +792,11 @@ class DbusBleSensors(object):
                               "staying passive")
         return hci_scan_control.SCAN_TYPE_PASSIVE
 
-    def _start_passive_scan(self, key: str) -> None:
+    def _start_passive_scan(self, key: str, quiet: bool = False) -> None:
         """Issue HCI commands to put the adapter into passive scan mode.
+
+        *quiet* logs the enable transition at DEBUG: a rotation swap is
+        a transition every interval and would otherwise fill the log.
 
         Replaces the previous BlueZ ``RegisterMonitor`` flow.  The
         controller starts scanning, advertisement reports flow through
@@ -750,7 +841,8 @@ class DbusBleSensors(object):
                 policy_label = self._policy_label(policy)
                 mode = ("active" if self._desired_scan_type()
                         == hci_scan_control.SCAN_TYPE_ACTIVE else "passive")
-                logging.info(f"{label}: {mode} scan enabled via HCI socket ({policy_label})")
+                (logging.debug if quiet else logging.info)(
+                    f"{label}: {mode} scan enabled via HCI socket ({policy_label})")
             else:
                 logging.debug(f"{label}: scan re-applied")
         else:
@@ -827,6 +919,8 @@ class DbusBleSensors(object):
             return True
         desired = self._desired_filter_policy()
         for key in list(self._adapters):
+            if key != self._scan_active_key:
+                continue        # idle cards stay idle until their turn
             idx = adapter_identity.index_for(key)
             if idx is None:
                 continue
@@ -1183,19 +1277,17 @@ class DbusBleSensors(object):
             logging.error(f"Cannot open HCI monitor socket: {exc}")
             logging.error("No advertisement source available — service cannot function")
             return
-        # Seed the known-address set before the socket is published, so the
-        # refresh does not attach on its own; the single attach below then
-        # installs adapter filter and address gate together.
         self._refresh_tap_known_macs()
         self._tap_sock = tap_sock
         # Kernel-side filter: frames from cards we do not scan, anything that
-        # is not an LE Meta event, and (gate closed) single-report frames
-        # from unknown addresses are dropped before they are queued to us --
-        # the tap thread never wakes for them.  Attached before the thread
-        # starts so nothing unfiltered is ever queued.  parse_monitor_frame
-        # keeps its own early-drop and pre-walk gate as the fallback.
-        attach_adapter_filter(tap_sock, self._scan_adapter_indices,
-                              self._tap_known_macs)
+        # is not an LE Meta event, and single-report frames carrying none of
+        # our makers' ids, name prefixes or router-registered addresses are
+        # dropped before they are queued to us -- the tap thread never wakes
+        # for them.  Attached before the thread starts so nothing unfiltered
+        # is ever queued.  parse_monitor_frame keeps its own early-drop and
+        # pre-walk address gate as the fallback and for the strangers that
+        # share our makers' ids.
+        self._attach_kernel_filter(tap_sock)
 
         known_mfg_ids = self._known_mfg_ids
         last_mfg_data = self._last_mfg_data
@@ -1335,6 +1427,8 @@ class DbusBleSensors(object):
         # an active discovery and reset our scan parameters.  Worst-
         # case recovery latency = _SCAN_REENABLE_INTERVAL_S.
         GLib.timeout_add_seconds(_SCAN_REENABLE_INTERVAL_S, self._scan_reenable_tick)
+        # Scan rotation: move the listening role to the next card.
+        GLib.timeout_add_seconds(_SCAN_ROTATION_INTERVAL_S, self._rotation_tick)
         # Bridge the active BMS's charge limits onto local charger roles'
         # /Link paths - systemcalc's DVCC does not drive
         # com.victronenergy.charger services. Runs on its own thread, NOT a
@@ -1414,11 +1508,10 @@ class DbusBleSensors(object):
         # a fresh daemon thread.
         self._start_tap()
 
-        # Eagerly re-enable scanning on each adapter; the periodic
+        # Eagerly put the listening card back on air; the periodic
         # _scan_reenable_tick would also pick this up, but doing it
         # here minimises the recovery gap.
-        for key in list(self._adapters):
-            self._start_passive_scan(key)
+        self._apply_rotation("throttle released")
 
         # Restart the silence clock from here.  The throttled stretch was
         # our own doing, so counting it as "no advertisements received"
@@ -1461,6 +1554,9 @@ class DbusBleSensors(object):
                 "Tap name-prefix filter updated: %d (%d internal + %d external)",
                 len(self._name_prefixes), len(self._internal_name_prefixes),
                 len(external_prefixes))
+
+        # ids, prefixes and router addresses all live in the kernel program
+        self._attach_kernel_filter()
 
         registered_macs = self._router.get_registered_macs()
         if not registered_macs:
@@ -1582,9 +1678,9 @@ class DbusBleSensors(object):
             # periodic _scan_reenable_tick covers this on a 60 s
             # cadence; this is the eager path for the more frequent
             # _prune_tick (30 s).
-            for key in list(self._adapters):
-                if key not in self._scan_enabled_adapters:
-                    self._start_passive_scan(key)
+            if (self._scan_active_key is None
+                    or self._scan_active_key not in self._scan_enabled_adapters):
+                self._apply_rotation("scan lost")
 
             # Silence detection: force a scan re-enable if no ads for 5 min.
             #
