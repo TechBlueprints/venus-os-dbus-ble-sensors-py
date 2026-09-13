@@ -1,7 +1,11 @@
 # Passive scan: scan everything, filter early — a plan to remove the device limit
 
-**Status:** proposal, 2026-09-06. Nothing here is implemented. Measurements
-in this document were taken on prod and dev-cerbo the same day.
+**Status:** proposal, 2026-09-06, since acted on. Phase 1 (PR #24/#25),
+Phase 2 (PR #28) and the kernel BPF (PR #26, #29, #30) are on main; the
+radio-side answer that Phase 2 left open became the scan rotation of PR
+#30. What runs today is described in
+[hci-tap-architecture.md](hci-tap-architecture.md). Measurements in this
+document were taken on prod and dev-cerbo on 2026-09-06.
 
 ## 1. Where we are, and how we got here (from the commit history)
 

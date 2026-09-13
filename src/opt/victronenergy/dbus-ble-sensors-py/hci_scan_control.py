@@ -196,9 +196,15 @@ def _send_and_wait_complete(s: socket.socket, ogf: int, ocf: int,
 
 
 # Default scan parameters.  Interval and Window are in units of 0.625 ms.
-# 0x0010 == 16 * 0.625 = 10 ms.  With interval == window, the controller
-# scans continuously — same as the bluez "background passive scan"
-# defaults.  These match what hcitool's ``lescan --passive`` requests.
+# 0x0010 == 16 * 0.625 = 10 ms.  With interval == window the controller
+# listens 100% of the time while scanning; the interval then only sets
+# how fast it cycles the three advertising channels.  These are the
+# values hcitool's ``lescan --passive`` requests.  They are NOT the
+# kernel's own background-scan defaults (60 ms interval / 30 ms window,
+# a 50% duty cycle that shares the radio with connections).  The report
+# count is set by what is on the air, not by the interval; only a window
+# shorter than the interval would reduce it.  See
+# docs/hci-tap-architecture.md section 1.
 _DEFAULT_SCAN_INTERVAL = 0x0010
 _DEFAULT_SCAN_WINDOW = 0x0010
 
