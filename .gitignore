@@ -27,3 +27,8 @@ src/opt/victronenergy/dbus-ble-sensors-py/ext/victron_ble/**/*.pyc
 *.code-workspace
 sample-driver/
 .venv-test/
+
+# Design drafts that are not being implemented (kept locally, never committed).
+# The accept-list / survey "open card" plan of 2026-09-12 lives here; the
+# scan-rotation experiment (PR #30) met the load target without it.
+docs/drafts/
