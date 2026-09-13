@@ -1,6 +1,6 @@
 # The advertisement pipeline: radio, kernel, userspace, distribution
 
-**Status:** describes what runs on prod as of main `a5ecd93` (2026-09-12).
+**Status:** describes what runs on prod as of main (2026-09-13).
 Numbers are measurements from prod on 2026-09-11/12 unless stated.
 
 The service hears Bluetooth LE advertisements without BlueZ. It programs
@@ -28,21 +28,33 @@ The parameters are:
 |---|---|---|
 | scan type | passive (0x00) | listen only; never send scan requests, so a device is never asked for its scan response |
 | filter policy | accept-all (0x00) | the controller reports every advertiser it hears |
-| interval | 0x0010 = 10 ms | how often the scanner starts a listening window and moves to the next advertising channel |
-| window | 0x0010 = 10 ms | how long each window lasts |
+| interval | 0x0060 = 60 ms | how often the scanner starts a listening window and moves to the next advertising channel |
+| window | 0x0060 = 60 ms | how long each window lasts |
 
 Interval equal to window means the card listens 100% of the time while
 it is on; the interval then only sets how fast the scanner cycles through
-the three advertising channels (37, 38, 39). The 10 ms pair is what
-`hcitool lescan --passive` uses. It is *not* the kernel's own default for
-its background scan, which is 60 ms interval / 30 ms window, a 50% duty
-cycle chosen to share the radio with connections. An advertiser sends
-each advertising event on all three channels within a few milliseconds,
-so a continuously listening scanner catches it on whichever channel it
-is sitting on; the interval value barely changes capture, and it does
-not change the number of reports (that is set by what is on the air).
-The lever that would change the report count is the duty cycle (window
-shorter than interval), which is not used.
+the three advertising channels (37, 38, 39). Every hop costs the
+controller a retune during which it is deaf: Nordic documents 760 us per
+window on its SoftDevice, and a measurement paper on real chipsets found
+a fixed ~1.1 ms gap per interval. At the 10 ms / 10 ms this service ran
+from May 2026 to September 2026 (the default hcitool, ESP-IDF and
+Silicon Labs all ship) that is about 10% of the time; at 60 ms it is
+about 2%, and the curve is flat past ~100 ms. 60 / 60 is the kernel's
+own profile for a card that scans while it may also carry connections;
+Nordic's guidance is the same: equal values, kept short, on a card that
+holds links, because its scheduler skips a whole scan window that
+collides with a connection event. hci1 carries our GATT links, so the
+one value used for every card is the one that is right for hci1. Longer
+windows (Android's low-latency mode uses 5 s, Nordic suggests ~10 s for
+a scan-only device) are deliberately not used: one value for every card.
+
+An advertiser sends each advertising event on all three channels within
+a few milliseconds, so a continuously listening scanner catches it on
+whichever channel it is sitting on. The interval does not change the
+number of reports, which is set by what is on the air; the lever that
+would is the duty cycle (window shorter than interval), which is not
+used. The kernel's own background profile is 60 ms / 30 ms, a 50% duty
+cycle chosen to share the radio and save power.
 
 There is **no hardware accept list**. Phase 2 (PR #28) retired it; the
 radio delivers every advertiser and filtering happens downstream.
@@ -304,7 +316,7 @@ zero trip-class load dumps and zero throttle trips, box context switches
 
 | constant | value | purpose |
 |---|---|---|
-| `_DEFAULT_SCAN_INTERVAL` / `_DEFAULT_SCAN_WINDOW` (`hci_scan_control.py`) | 0x0010 / 0x0010 (10 ms) | continuous listening while a card is on |
+| `_DEFAULT_SCAN_INTERVAL` / `_DEFAULT_SCAN_WINDOW` (`hci_scan_control.py`) | 0x0060 / 0x0060 (60 ms) | continuous listening while a card is on; 60 ms hops cost ~2% retune time vs ~10% at 10 ms |
 | `_SCAN_ROTATION_INTERVAL_S` | 60 | the listening role moves to the next card |
 | `_SCAN_REENABLE_INTERVAL_S` | 60 | re-issue the enable on the listening card (recovery from a foreign scan reset) |
 | `NAME_ADV_MIN_INTERVAL` | 5 s | per-address rate limit for name-only advertisements crossing to the main loop |

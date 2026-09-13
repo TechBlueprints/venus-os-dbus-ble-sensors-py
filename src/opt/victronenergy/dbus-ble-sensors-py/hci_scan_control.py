@@ -196,17 +196,25 @@ def _send_and_wait_complete(s: socket.socket, ogf: int, ocf: int,
 
 
 # Default scan parameters.  Interval and Window are in units of 0.625 ms.
-# 0x0010 == 16 * 0.625 = 10 ms.  With interval == window the controller
+# 0x0060 == 96 * 0.625 = 60 ms.  With interval == window the controller
 # listens 100% of the time while scanning; the interval then only sets
-# how fast it cycles the three advertising channels.  These are the
-# values hcitool's ``lescan --passive`` requests.  They are NOT the
-# kernel's own background-scan defaults (60 ms interval / 30 ms window,
-# a 50% duty cycle that shares the radio with connections).  The report
-# count is set by what is on the air, not by the interval; only a window
-# shorter than the interval would reduce it.  See
+# how often it hops to the next of the three advertising channels, and
+# every hop costs the controller a retune during which it is deaf
+# (Nordic documents 760 us per window; measured real chipsets show a
+# fixed ~1.1 ms gap per interval).  At the 10 ms / 10 ms that hcitool,
+# ESP-IDF and Silicon Labs default to, that is ~10% of the time; at
+# 60 ms it is ~2%, and the curve is flat past ~100 ms.  60 / 60 is the
+# kernel's own profile for a card that scans while it may also carry
+# connections (DISCOV_LE_SCAN_INT_CONN / WIN_CONN): equal values keep
+# listening continuous, and a short window lets connection events run
+# in the gaps on a card that also holds GATT links (hci1 does).  Longer
+# windows (Android uses 5 s, Nordic suggests ~10 s) suit scan-only
+# cards but are not used here: one value for every card, on purpose.
+# The report count is set by what is on the air, not by the interval;
+# only a window shorter than the interval would reduce it.  See
 # docs/hci-tap-architecture.md section 1.
-_DEFAULT_SCAN_INTERVAL = 0x0010
-_DEFAULT_SCAN_WINDOW = 0x0010
+_DEFAULT_SCAN_INTERVAL = 0x0060
+_DEFAULT_SCAN_WINDOW = 0x0060
 
 # Scan_Type values (Core Spec Vol 4 Part E §7.8.10).
 SCAN_TYPE_PASSIVE = 0x00
