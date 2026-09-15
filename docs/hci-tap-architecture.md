@@ -1,7 +1,8 @@
 # The advertisement pipeline: radio, kernel, userspace, distribution
 
-**Status:** describes what runs on prod as of main (2026-09-13).
-Numbers are measurements from prod on 2026-09-11/12 unless stated.
+**Status:** describes what runs on prod as of main (2026-09-15).
+Numbers are measurements from prod on 2026-09-11/12 unless stated;
+the radio layout changed on 2026-09-15 (see section 1).
 
 The service hears Bluetooth LE advertisements without BlueZ. It programs
 the scanning cards itself over raw HCI sockets, reads every HCI packet
@@ -43,8 +44,9 @@ about 2%, and the curve is flat past ~100 ms. 60 / 60 is the kernel's
 own profile for a card that scans while it may also carry connections;
 Nordic's guidance is the same: equal values, kept short, on a card that
 holds links, because its scheduler skips a whole scan window that
-collides with a connection event. hci1 carries our GATT links, so the
-one value used for every card is the one that is right for hci1. Longer
+collides with a connection event. When this value was chosen hci1 also
+carried our GATT links; since the 2026-09-15 layout no scanning card
+carries links, and the value stays because it is right either way. Longer
 windows (Android's low-latency mode uses 5 s, Nordic suggests ~10 s for
 a scan-only device) are deliberately not used: one value for every card.
 
@@ -93,10 +95,17 @@ and protects the wrong radio the moment the numbering changes.
 
 ### Rotation: one card listens at a time
 
-Two cards are in the scan set on prod: hci0 (68:4E:05:44:77:B0, a
-Realtek WLAN+BT combo on the internal USB) and hci1 (00:01:95:CC:32:F7,
-a CSR dongle on the external hub). hci9 is deliberately kept out of the
-scan set for GATT work and the SmartSolar poll.
+Two cards are in the scan set on prod (`adapter-allowlist.conf`, by
+MAC): hci1 (00:01:95:CC:32:F7) and hci2 (00:01:95:CC:2C:53), both CSR
+dongles on the external hub. Neither carries GATT links: our connect
+pool (`ble-connect.conf`) is hci4 (00:01:95:CC:33:0B) and hci0
+(68:4E:05:44:77:B0, the Realtek WLAN+BT combo), so a connection never
+has to share a radio with the scan, and the kernel's connection setup
+(which disables scanning on its card) never blinds the listener. This
+is the 2026-09-15 layout, one owner per radio; until then hci0 and hci1
+scanned and the pool included hci1 and the since-removed hci9. Measured
+on 2026-09-15: hci1 and hci2 each deliver ~260 reports/s during their
+turn and hear ~95 distinct addresses with near-total overlap.
 
 `_apply_rotation` in `dbus_ble_sensors.py` makes exactly one card scan
 and disables the rest; a 60 s timer (`_SCAN_ROTATION_INTERVAL_S`) moves
@@ -112,15 +121,21 @@ delivers (section 2), and with both cards open that was ~38k context
 switches and ~12 idle points per 30 s, enough to trip the load throttle
 three times in the first eight hours of Phase 2. One card at a time
 halves it. Every configured device advertising in a 60 s census was
-heard on both cards, so rotation loses no coverage today; hci1 alone
-delivers about 260 reports/s, hci0 alone about 130.
+heard on both cards, so rotation loses no coverage; on the pre-09-15
+pair hci1 alone delivered about 260 reports/s and hci0 about 130.
+
+One consequence of rotation, seen on 2026-09-13: when the kernel sets up
+a GATT connection on the listening card it disables that card's scan
+and never re-enables ours, so the listener is dark until the next 60 s
+tick, and with one card listening nothing covers the gap. The 09-15
+layout removes the cause by keeping links off the scanning cards.
 
 ## 2. Kernel
 
 ### What every advertisement costs before any filter of ours
 
 The controller sends each report up USB as an HCI event. The USB
-interrupt fires (ehci for hci1, musb for hci0), the kernel's Bluetooth
+interrupt fires (ehci for the hub dongles, musb for hci0), the kernel's Bluetooth
 receive worker (`kworker/u9:*-hciN`) wakes and processes the event, and
 the event is copied to the monitor channel. Measured across a throttle
 suspension with both radios off, that is roughly four context switches
@@ -152,7 +167,7 @@ program attached with `SO_ATTACH_FILTER`. `build_adapter_filter` in
 `hci_advertisement_tap.py` assembles it with a small label assembler:
 
 1. opcode must be event-rx; event must be LE Meta; adapter index must be
-   one of ours (hci0, hci1). Everything else, including the other eight
+   one of ours (the scan set). Everything else, including the other
    cards' traffic, is dropped here.
 2. A datagram with more than one report, or an LE Meta subevent other
    than the two advertising-report kinds, is **accepted** unexamined;
@@ -295,8 +310,8 @@ or address registration is folded into the kernel program instead.
 connection manager, which ranks cards by their claims, and the link runs
 on BlueZ. Scanning and an established LE connection are independent
 controller states: a rotation swap disables a card's scan and drops no
-link. On hci1 the scan shares radio time with the links it carries, as
-it has since May.
+link. Since the 2026-09-15 layout the scanning cards carry no links at
+all.
 
 ## 5. Where the cost sits today
 

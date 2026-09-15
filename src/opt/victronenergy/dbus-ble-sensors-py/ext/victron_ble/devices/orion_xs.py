@@ -94,5 +94,13 @@ class OrionXS(Device):
             "output_current": output_current / 10 if output_current != 0xFFFF else None,
             "input_voltage": input_voltage / 100 if input_voltage != 0xFFFF else None,
             "input_current": input_current / 10 if input_current != 0xFFFF else None,
-            "off_reason": OffReason(off_reason),
+            # 0xFFFFFFFF is the "not available" sentinel, as for the other
+            # fields above; a value outside the enum must not raise and
+            # take the whole record with it (local modification, see
+            # VENDORED.md).
+            "off_reason": (
+                OffReason(off_reason)
+                if off_reason in OffReason._value2member_map_
+                else None
+            ),
         }

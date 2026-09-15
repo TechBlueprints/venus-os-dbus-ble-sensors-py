@@ -97,5 +97,11 @@ class SmartBatteryProtect(Device):
             "output_voltage": (
                 output_voltage / 100 if output_voltage != 0xFFFF else None
             ),
-            "off_reason": OffReason(off_reason),
+            # See orion_xs.py: unknown / all-ones off_reason is None, not
+            # an exception (local modification, see VENDORED.md).
+            "off_reason": (
+                OffReason(off_reason)
+                if off_reason in OffReason._value2member_map_
+                else None
+            ),
         }

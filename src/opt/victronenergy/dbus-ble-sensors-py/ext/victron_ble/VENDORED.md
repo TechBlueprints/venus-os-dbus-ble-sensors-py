@@ -28,6 +28,18 @@ In production the Victron payload always fits in a single block after the key-ch
 
 The same patch has been submitted upstream as [keshavdv/victron-ble#94](https://github.com/keshavdv/victron-ble/pull/94).  When that lands and ships in a release, we can revert `ext/victron_ble/` to the unmodified upstream tarball and remove this `## Local modification` section.
 
+## Second local modification: tolerant `off_reason`
+
+`devices/orion_xs.py` and `devices/smart_battery_protect.py` built the
+`off_reason` field with `OffReason(value)`, which raises `ValueError` for
+any value the enum does not list.  On 2026-09-15 an Orion-TR on prod
+advertised `off_reason = 0xFFFFFFFF`, the same "not available" sentinel
+the parsers already map to `None` for voltage and current, and the
+`ValueError` discarded the whole record (`ble_device_orion_tr` logs it as
+"Orion advertisement decode error").  Both parsers now yield `None` for a
+value outside the enum; callers already treat `None` as "no reason".
+Not yet submitted upstream.
+
 ## License
 
 `victron-ble` is released under the [Unlicense](https://unlicense.org/) (public domain).  See `LICENSE` in this directory.
