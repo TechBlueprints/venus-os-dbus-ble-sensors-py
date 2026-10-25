@@ -48,6 +48,7 @@ import time
 from gi.repository import GLib
 
 import adapter_identity
+import ble_catcher
 import ble_async_loop
 import ble_gatt_link
 import easystart_protocol as proto
@@ -84,6 +85,47 @@ MAX_POLL_FAILURES = 3
 # evidence disproves it, the same way the rotating-MAC claim was.)
 SESSION_COOLDOWN_S = 30.0
 SESSION_COOLDOWN_MAX_S = 600.0
+
+
+def link_adapter_key(heard_key: 'str | None', pool_keys: 'list[str]',
+                     present) -> 'str | None':
+    """The card to open the link on.
+
+    *heard_key* is the identity of the card whose scan heard the
+    advertisement; *pool_keys* the GATT pool from ``ble-connect.conf`` in
+    config order (empty when unconfigured); *present(key)* says whether a
+    card is enumerated right now.
+
+    Since the 2026-09-15 layout the scanning cards carry no links: a
+    connection on a listening card makes the kernel disable that card's
+    scan and leave it off until the next rotation tick, and the connect
+    pool exists precisely so links land elsewhere.  So: an unconfigured
+    pool keeps the old behaviour (the card that heard it); a pool that
+    names the heard card uses it; otherwise the first configured pool
+    card that is present.  A configured pool with no card present falls
+    back to the heard card rather than refusing to connect at all.
+    """
+    if not pool_keys:
+        return heard_key
+    if heard_key in pool_keys:
+        return heard_key
+    for key in pool_keys:
+        if present(key):
+            return key
+    return heard_key
+
+
+def _pool_keys() -> 'list[str]':
+    """``ble-connect.conf`` adapters as identity keys, config order."""
+    try:
+        entries, _ = ble_catcher.catcher_options()
+    except Exception:
+        return []
+    keys = []
+    for entry in entries:
+        _, sep, adapter = entry.rpartition("@")
+        keys.append(adapter_identity.canonical(adapter if sep else entry))
+    return keys
 
 # Overall bound on one session-establishment attempt (resolve, which may
 # include a bounded discovery, plus connect with retries).
@@ -312,19 +354,33 @@ class BleDeviceEasyStart(BleDevice):
         different radio — one that likely cannot hear a device with 1-2 m
         of range, and that another service may have been promised.  Same
         rule the scan path follows; see :mod:`adapter_identity`.
+
+        Which card: the link goes on a card from the GATT pool
+        (``ble-connect.conf``), not on the card that heard the
+        advertisement, unless the pool is unconfigured or names that
+        card.  The scanning cards carry no links (see
+        :func:`link_adapter_key`); the pool cards sit on the same hub and
+        hear a device 1-2 m away just as well.
         """
         from bleak.backends.bluezdbus.manager import get_global_bluez_manager
         from dbus_fast import Message, Variant
         from dbus_fast.constants import MessageType
 
-        index = adapter_identity.index_for(self._adapter_key)
+        key = link_adapter_key(self._adapter_key, _pool_keys(),
+                               lambda k: adapter_identity.index_for(k) is not None)
+        if key != self._adapter_key:
+            logging.info(
+                f"{self._plog} connecting via "
+                f"{adapter_identity.label(key)} (link pool) rather than "
+                f"{adapter_identity.label(self._adapter_key)} that heard "
+                f"it: scanning cards carry no links")
+        index = adapter_identity.index_for(key)
         if index is None:
             # The card that heard it is gone.  Unreachable *through this
             # route*, not a defect: the next advertisement arrives on
             # whichever radio is alive and carries that card's identity.
             raise ble_gatt_link.DeviceNotFound(
-                f"{address}: adapter "
-                f"{adapter_identity.label(self._adapter_key)} that heard "
+                f"{address}: adapter {adapter_identity.label(key)} for "
                 f"this device is no longer present")
 
         manager = await get_global_bluez_manager()
@@ -345,7 +401,7 @@ class BleDeviceEasyStart(BleDevice):
             if reply.error_name != 'org.bluez.Error.AlreadyExists':
                 raise ble_gatt_link.DeviceNotFound(
                     f"{address}: ConnectDevice on "
-                    f"{adapter_identity.label(self._adapter_key)} "
+                    f"{adapter_identity.label(key)} "
                     f"failed: {reply.error_name} {reply.body!r}")
         elif reply.body:
             dev_path = str(reply.body[0])
