@@ -258,6 +258,9 @@ def test_role_declares_what_systemcalc_reads() -> None:
     for p in ("/Pv/Power", "/Yield/Power", "/Load/I", "/Dc/0/Voltage", "/Dc/0/Current",
               "/State", "/ErrorCode", "/History/Daily/0/Yield", "/NrOfTrackers"):
         assert f'"{p}"' in src, p
+    # gui-v2 only reads /History/Daily/0/Yield once DaysAvailable > 0;
+    # without it the Solar list shows "--" for Yield Today (seen on prod).
+    assert 's.add_path("/History/Overall/DaysAvailable", 1)' in src
     assert 'NAME = "solarcharger"' in src
 
 
@@ -268,3 +271,95 @@ def test_routing_prefers_the_exact_detector_and_prefix_is_owned() -> None:
         "is_smartshunt_manufacturer_data(man_data)")
     svc = open(os.path.join(SRC, "dbus_ble_service.py")).read()
     assert '"smartsolar"' in svc.split("OWNED_PREFIXES")[1].split(")")[0]
+
+
+# ---------------------------------------------------------------------------
+# PV-side HEX poll (IP22-shaped).  Measured on prod 2026-09-05: the 75/15
+# answers 0xEDBB/0xEDBC/0xEDB3 on device instance 3 after GetDevices +
+# subscribe, unauthenticated; instance 0 returns error 1 for everything.
+# ---------------------------------------------------------------------------
+
+class _PvWriter(_Writer):
+    def __init__(self):
+        super().__init__(); self.reads = []; self.busy = False
+    def read_instance_pushes(self, mac, passkey, register_ids, on_done, prefer_adapter=None, window_s=6.0):
+        self.reads.append((mac, tuple(register_ids), prefer_adapter, window_s)); self.on_read_done = on_done
+
+
+def _pv_device(ss, monkeypatch, enabled=True):
+    dev, _w, stored = _device(ss, monkeypatch, enabled=enabled)
+    w = _PvWriter(); monkeypatch.setattr(ss, "_gatt", lambda: w)
+    dev._adv_key_hex = "ab" * 16; role = _Role(); dev._role_services = {"solarcharger": role}
+    dev._tick_history = lambda *a, **k: None
+    return dev, w, stored, role
+
+
+_PV_SAMPLE = {0xEDBB: bytes.fromhex("7e06"), 0xEDBC: bytes.fromhex("a23e0000"), 0xEDB3: b"\x02"}
+
+
+def test_pv_poll_is_one_session_per_interval_not_one_per_frame(ss, monkeypatch) -> None:
+    dev, w, _stored, _role = _pv_device(ss, monkeypatch)
+    now = [1000.0]; monkeypatch.setattr(ss.time, "monotonic", lambda: now[0])
+    assert dev._maybe_poll_pv() is True
+    assert dev._maybe_poll_pv() is True, "in flight: report busy, do not start another"
+    assert len(w.reads) == 1
+    mac, regs, prefer, _win = w.reads[0]
+    assert mac == "C1:20:D5:4F:71:25" and set(regs) == {0xEDBB, 0xEDBC, 0xEDB3}
+    assert prefer == "AA:BB:CC:DD:EE:01", "the stored adapter preference steers lookup_device"
+    w.on_read_done(True, dict(_PV_SAMPLE), "hci1")
+    assert dev._maybe_poll_pv() is False, "inside the interval nothing new starts"
+    now[0] += ss._PV_POLL_INTERVAL_S + 1
+    assert dev._maybe_poll_pv() is True and len(w.reads) == 2
+
+
+def test_pv_poll_result_fills_pv_v_and_mpp_mode_and_remembers_the_card(ss, monkeypatch) -> None:
+    dev, w, stored, role = _pv_device(ss, monkeypatch)
+    dev._maybe_poll_pv()
+    w.on_read_done(True, dict(_PV_SAMPLE), "hci1")
+    assert role.values["/Pv/V"] == 16.62
+    assert role.values["/MppOperationMode"] == 2
+    assert "/Pv/Power" not in role.values, "PV power keeps coming from the live advertisement"
+    assert stored.get("adapter") == "hci1"
+    # A second success on the same card is not a second settings write.
+    stored.pop("adapter"); dev._pv_poll_busy = False
+    dev._on_pv_poll_done(True, dict(_PV_SAMPLE), "hci1")
+    assert "adapter" not in stored
+
+
+def test_pv_values_are_withdrawn_when_the_poll_goes_stale(ss, monkeypatch) -> None:
+    dev, w, _stored, role = _pv_device(ss, monkeypatch)
+    now = [5000.0]; monkeypatch.setattr(ss.time, "monotonic", lambda: now[0])
+    dev._maybe_poll_pv(); w.on_read_done(True, dict(_PV_SAMPLE), "hci1")
+    record = {"device_state": 3, "charger_error": 0, "battery_voltage": 13.4,
+              "battery_current": 4.0, "yield_today_kwh": 0.3, "solar_power": 60,
+              "load_current": 0.0, "model_name": "x"}
+    dev._publish(record)
+    assert role.values["/Pv/V"] == 16.62, "fresh value rides along on the advertisement"
+    now[0] += ss._PV_STALE_S + 1
+    dev._publish(record)
+    assert role.values["/Pv/V"] is None and role.values["/MppOperationMode"] is None, (
+        "a stale PV voltage under a live power would show a fabricated current")
+
+
+def test_pv_poll_without_a_voltage_publishes_nothing_and_frees_the_flag(ss, monkeypatch) -> None:
+    dev, w, _stored, role = _pv_device(ss, monkeypatch)
+    dev._maybe_poll_pv()
+    w.on_read_done(False, {}, None)
+    assert dev._pv_poll_busy is False
+    assert "/Pv/V" not in role.values
+    # A 0xFFFF "not available" is not a voltage either.
+    dev._maybe_poll_pv = lambda: True
+    dev._on_pv_poll_done(True, {0xEDBB: b"\xff\xff"}, "hci1")
+    assert "/Pv/V" not in role.values
+
+
+def test_pv_poll_waits_for_a_busy_writer_and_a_disabled_device_never_polls(ss, monkeypatch) -> None:
+    dev, w, _stored, _role = _pv_device(ss, monkeypatch)
+    w.busy = True
+    scheduled = []
+    monkeypatch.setattr(ss.GLib, "timeout_add", lambda ms, fn: scheduled.append((ms, fn)) or 0)
+    assert dev._maybe_poll_pv() is True and w.reads == []
+    assert len(scheduled) == 1 and scheduled[0][0] == int(ss._PV_POLL_RETRY_S * 1000)
+    assert dev._maybe_poll_pv() is True and len(scheduled) == 1, "one retry pending at a time"
+    dev2, w2, _s2, _r2 = _pv_device(ss, monkeypatch, enabled=False)
+    assert dev2._maybe_poll_pv() is False and w2.reads == []

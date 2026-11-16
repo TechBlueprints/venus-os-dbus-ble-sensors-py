@@ -11,8 +11,45 @@ bus" to "publishing yield", including the parts that cost the most time.
   `/Pv/Power`, `/Yield/Power`, `/History/Daily/0/Yield`, `/Load/I`,
   `/State`, `/ErrorCode`.
 * Recovers its own Instant Readout key over **one** paired HEX session
-  (VREG `0xEC65`), then never opens a GATT link again.  Bounded to five
-  attempts per process.
+  (VREG `0xEC65`).  Bounded to five attempts per process.
+* Polls the PV side over a short GATT session every two minutes and
+  publishes `/Pv/V` and `/MppOperationMode` — see "The PV poll" below.
+* Declares `/History/Overall/DaysAvailable = 1`.  gui-v2's Solar list
+  (`TrackerSolarInput::daysAvailableChanged`) does not subscribe to
+  `/History/Daily/0/Yield` until that count is above zero, so without it
+  "Yield Today" reads `--` while the value is on the bus.
+
+## The PV poll — where Voltage and Current on the Solar list come from
+
+gui-v2 shows `/Pv/V` as *Voltage* and computes *Current* as
+`/Yield/Power` ÷ `/Pv/V`.  The advertisement carries battery V/A, PV
+power, today's yield and load current, but no PV voltage (VREG `0xEDBB`
+is HEX-only), so on advertisements alone both columns read `--`.  Every
+`_PV_POLL_INTERVAL_S` (120 s) an enabled, keyed unit that has just
+advertised gets one session through the family's single-slot writer
+(`AsyncGATTWriter.read_instance_pushes`).  A value older than three
+intervals is withdrawn to `None`: a stale voltage under a live power
+reading would show a fabricated current.  `/Pv/I` stays `None` — the
+75/15 answers "unknown register" for `0xEDBD`.
+
+Measured on the 75/15, 2026-09-05:
+
+* **Instance 0 is wrong for this unit.**  Every GetValue on instance 0
+  returns error 1 "unknown register", the known-good `0xED8D` included.
+  GetDevices lists `[0, 1, 3]`; once those are subscribed the unit
+  Pushes its live registers on instance 3 unasked, and a
+  definite-dialect GetValue on 3 is answered.  `read_registers` (the
+  IP22/Orion path) asks instance 0 in the indefinite form and gets
+  nothing, which is why the poll has its own session shape.
+* **No PIN needed.**  The same registers came back on an
+  unauthenticated bonded link and matched the authenticated run and the
+  live advertisement.
+* **Keep the poll off a scanning card.**  A GATT session tears down the
+  passive scan on the card it uses for the session's length, and the
+  poll stores whichever card its last success used as
+  `PreferredAdapter`.  On a scanning card that is a 30–40 s hole in
+  advertisement intake every cycle.  The unit's bond and its
+  `PreferredAdapter` belong on a GATT-pool card that does not scan.
 
 ## The CBOR array dialect — read this before debugging silence
 
