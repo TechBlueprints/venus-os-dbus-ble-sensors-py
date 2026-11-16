@@ -230,9 +230,10 @@ class BleDeviceEasyStart(BleDevice):
         *mac* is colon-separated uppercase — the address to connect to
         right now.  *address_type* and *adapter_index* come from the same
         HCI report, and together they let the connect skip discovery
-        entirely: BlueZ is handed the address, its type, and the card
-        that provably heard it (range is 1-2 m, so the card that heard
-        the advertisement is the card that can reach it).
+        entirely: BlueZ is handed the address and its type directly.
+        The card that heard it is recorded too, but the link itself goes
+        on a GATT-pool card rather than the hearing card — see
+        :meth:`_resolve_without_scanning` for that rule.
 
         The adapter index is converted to the card's identity (its MAC)
         here and resolved back to a number only at the moment of the
