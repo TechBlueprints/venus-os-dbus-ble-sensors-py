@@ -82,9 +82,15 @@ un-registrations that never free their connection.
   17 hours on excursions of a few tenths and rotated the interesting
   dumps away within hours; dev idles near 0.3, where 4.0 is a real event.
   The reason recorded in each dump says which bound applied;
-- 5-minute ≥ 6.0 or 15-minute ≥ 5.5 — the exact thresholds the BLE service
+- 5-minute ≥ 9.0 or 15-minute ≥ 5.5 — the exact thresholds the BLE service
   derives from `/etc/watchdog.conf`, imported from it, so a dump lands beside
-  the throttle line;
+  the throttle line. Each arm follows the watchdog's own limit for its window
+  (stock `max-load-5 = 10` → trip 9.0, release 8.0; `max-load-15 = 6` → trip
+  5.5, release 5.0); an arm whose limit is unset or 0 is off, as it is for the
+  watchdog. Until 2026-11 the 5-minute arm was taken from `max-load-15` (6.0)
+  and fired 129 times on prod between 10-17 and 11-26 on 5-minute readings the
+  watchdog never acts on. The values are imported once at start, so a deploy of
+  `load_throttle.py` needs load-forensics restarted as well;
 - the service's own `load_throttle: tripped` line, tailed from `current`
   only (rotated logs are never read).
 An event closes after two consecutive samples under the release levels.

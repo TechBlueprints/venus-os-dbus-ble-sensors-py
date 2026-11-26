@@ -48,8 +48,9 @@ daemon's accepted sockets is one bus connection.  When that interface is
 unavailable the per-process count is reported as unknown, never as zero.
 
 Triggers: own 1-minute crossing (early catch) and the same 5m/15m
-thresholds dbus-ble-sensors-py derives from ``/etc/watchdog.conf``, so a
-dump lands beside the throttle line; optionally the service's own
+thresholds dbus-ble-sensors-py derives from ``/etc/watchdog.conf`` (stock:
+5m >= 9.0 from ``max-load-5 = 10``, 15m >= 5.5 from ``max-load-15 = 6``),
+so a dump lands beside the throttle line; optionally the service's own
 ``load_throttle: tripped`` log line, tailed from ``current`` only.
 
 Prohibitions, each of which has itself caused load on this box: no Venus
@@ -70,6 +71,7 @@ import argparse
 import collections
 import glob
 import logging
+import math
 import os
 import signal
 import socket
@@ -167,13 +169,22 @@ TRIP_LINE = "load_throttle: tripped"
 _SENSORS_PY_DIR = "/data/apps/dbus-ble-sensors-py/src/opt/victronenergy/dbus-ble-sensors-py"
 
 
+# What the service derives from the stock Venus /etc/watchdog.conf
+# (max-load-5 = 10, max-load-15 = 6): trip 15m>=5.5 or 5m>=9.0, release
+# 15m<5.0 and 5m<8.0.  Used only if the service's module cannot be imported.
+STOCK_THRESHOLDS = (5.5, 9.0, 5.0, 8.0)    # trip_15m, trip_5m, release_15m, release_5m
+
+
 def sensors_py_thresholds() -> tuple[float, float, float, float]:
     """(trip_15m, trip_5m, release_15m, release_5m) exactly as the service derives them.
 
     Imports the service's own derivation from ``/etc/watchdog.conf`` so a
-    dump lands beside the throttle line.  If the service has moved on, fall
-    back to its historical defaults rather than dying: the forensics tool
-    must outlive the service's refactors.
+    dump lands beside the throttle line.  An arm the watchdog does not
+    enforce comes back as ``inf`` on both sides, which never triggers and
+    never holds an event open.  If the service has moved on, fall back to
+    the stock derivation rather than dying: the forensics tool must outlive
+    the service's refactors.  The values are read once, at start: a
+    deploy of ``load_throttle.py`` needs this process restarted too.
     """
     try:
         if _SENSORS_PY_DIR not in sys.path:
@@ -182,8 +193,9 @@ def sensors_py_thresholds() -> tuple[float, float, float, float]:
         return (load_throttle.TRIP_15M, load_throttle.TRIP_5M,
                 load_throttle.RELEASE_15M, load_throttle.RELEASE_5M)
     except Exception as e:  # noqa: BLE001
-        log.warning("could not import the service's thresholds (%r); using 5.5/6.0/5.0/5.0", e)
-        return (5.5, 6.0, 5.0, 5.0)
+        log.warning("could not import the service's thresholds (%r); using %s", e,
+                    "/".join("%g" % v for v in STOCK_THRESHOLDS))
+        return STOCK_THRESHOLDS
 
 
 # ------------------------------------------------------------- /proc reads ---
@@ -742,11 +754,11 @@ class Sampler:
 class Thresholds:
     trip_1m: float = TRIGGER_1M                     # absolute floor for the early catch
     trip_1m_over_5m: float = TRIGGER_1M_OVER_5M     # ...or this far above the 5-min baseline
-    trip_5m: float = 6.0
-    trip_15m: float = 5.5
+    trip_5m: float = STOCK_THRESHOLDS[1]            # inf = the service's 5m arm is off
+    trip_15m: float = STOCK_THRESHOLDS[0]
     release_below_bar: float = RELEASE_1M_BELOW_BAR
-    release_5m: float = 5.0
-    release_15m: float = 5.0
+    release_5m: float = STOCK_THRESHOLDS[3]
+    release_15m: float = STOCK_THRESHOLDS[2]
 
     def early_bar(self, l5: float) -> float:
         """The 1-minute level that counts as an excursion on THIS box."""
@@ -987,6 +999,21 @@ class Forensics:
         self._last_beat = self.started_at
         self._last_dump_at: dict = {}          # class -> when we last wrote one
 
+    def thresholds_text(self) -> str:
+        """The triggers and release levels for the startup line.  An arm the
+        service runs without (``inf``) is named as off, not printed as inf."""
+        th = self.th
+        trig = ["1m>=max(%.1f, 5m+%.1f)" % (th.trip_1m, th.trip_1m_over_5m)]
+        rel = ["1m below that bar by %.1f" % th.release_below_bar]
+        for name, trip, release in (("5m", th.trip_5m, th.release_5m),
+                                    ("15m", th.trip_15m, th.release_15m)):
+            if math.isinf(trip):
+                trig.append("%s off" % name)
+            else:
+                trig.append("%s>=%.1f" % (name, trip))
+                rel.append("%s<%.1f" % (name, release))
+        return "%s (release %s)" % (" | ".join(trig), ", ".join(rel))
+
     def step(self, now: Optional[float] = None, deep: bool = True) -> Optional[str]:
         """One sample; returns the dump path if an event opened."""
         now = time.time() if now is None else now
@@ -1032,13 +1059,10 @@ class Forensics:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stop", True))
         peers_ok = read_unix_peers() is not None
         log.info("load-forensics started: interval %.0f s, ring %d min, triggers "
-                 "1m>=max(%.1f, 5m+%.1f) | 5m>=%.1f | "
-                 "15m>=%.1f (release 1m below that bar by %.1f, 5m<%.1f 15m<%.1f), dumps -> %s "
+                 "%s, dumps -> %s "
                  "(keep %d early / %d trip, separate pools; early cooldown %.0f s), "
                  "per-process bus count via unix_diag: %s, mDNS counter: %s, watch: %s",
-                 self.interval, RING_MINUTES, self.th.trip_1m, self.th.trip_1m_over_5m,
-                 self.th.trip_5m, self.th.trip_15m,
-                 self.th.release_below_bar, self.th.release_5m, self.th.release_15m, self.dump_dir,
+                 self.interval, RING_MINUTES, self.thresholds_text(), self.dump_dir,
                  DUMP_KEEP[CLASS_EARLY], DUMP_KEEP[CLASS_TRIP], COOLDOWN_S[CLASS_EARLY],
                  "available" if peers_ok else "UNAVAILABLE (reported as '?')",
                  "listening on %s:%d" % (MDNS_GROUP, MDNS_PORT) if (self.mdns and self.mdns.available)

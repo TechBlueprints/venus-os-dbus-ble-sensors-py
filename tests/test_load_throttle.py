@@ -14,10 +14,14 @@ effects via lambdas — no D-Bus, no real /proc, no GLib.
 
 from __future__ import annotations
 
+import builtins
+import importlib.util
 import logging
+import math
 
 import pytest
 
+import load_throttle
 from load_throttle import (
     LoadThrottle,
     TRIP_5M,
@@ -28,6 +32,24 @@ from load_throttle import (
     _derive_thresholds,
     _read_watchdog_max_load_15,
 )
+
+
+# Prod's /etc/watchdog.conf (Venus v3.79, read 2026-11-26), verbatim.
+PROD_WATCHDOG_CONF = """\
+watchdog-device = /dev/watchdog
+
+log-dir = /var/volatile/log/watchdog
+min-memory = 2500
+max-load-5 = 10
+max-load-15 = 6
+repair-binary = /usr/sbin/store_watchdog_error.sh
+test-prescaler = 60
+retry-timeout = 0
+"""
+
+# What the stock config derives to: 15m arm at limit-0.5 / release limit-1.0,
+# 5m arm at max-load-5 - 1.0 / release max-load-5 - 2.0.
+STOCK = dict(trip_15m=5.5, trip_5m=9.0, release_15m=5.0, release_5m=8.0)
 
 
 def _write_loadavg(path, *, l1=1.0, l5=2.0, l15=3.0):
@@ -46,6 +68,11 @@ def _make(tmp_path, *, trip_calls=None, release_calls=None, **kwargs):
     if release_calls is None:
         release_calls = []
 
+    # Pin the stock thresholds rather than the module constants, which
+    # depend on whatever /etc/watchdog.conf the test host has (none, on
+    # a Mac).
+    for k, v in STOCK.items():
+        kwargs.setdefault(k, v)
     t = LoadThrottle(
         on_trip=lambda l5, l15: trip_calls.append((l5, l15)),
         on_release=lambda l5, l15: release_calls.append((l5, l15)),
@@ -53,6 +80,38 @@ def _make(tmp_path, *, trip_calls=None, release_calls=None, **kwargs):
         **kwargs,
     )
     return t, loadavg
+
+
+def _module_reading(tmp_path, conf_text):
+    """A fresh copy of load_throttle whose import-time read of
+    ``/etc/watchdog.conf`` sees ``conf_text`` (or no file, if None).
+
+    This is the path prod actually runs: the module constants are
+    derived once at import and every ``LoadThrottle()`` defaults to them.
+    """
+    conf = tmp_path / "watchdog.conf"
+    if conf_text is not None:
+        conf.write_text(conf_text)
+    real_open = builtins.open
+
+    def fake_open(file, *a, **k):
+        if file == "/etc/watchdog.conf":
+            file = str(conf)
+        return real_open(file, *a, **k)
+
+    spec = importlib.util.spec_from_file_location(
+        "load_throttle_under_test", load_throttle.__file__)
+    m = importlib.util.module_from_spec(spec)
+    builtins.open = fake_open
+    try:
+        spec.loader.exec_module(m)
+    finally:
+        builtins.open = real_open
+    return m
+
+
+def _consts(m):
+    return (m.TRIP_15M, m.TRIP_5M, m.RELEASE_15M, m.RELEASE_5M)
 
 
 # ── trip thresholds ────────────────────────────────────────────────────────
@@ -70,24 +129,24 @@ class TestTrip:
     def test_15m_at_threshold_trips(self, tmp_path):
         trips: list = []
         t, lf = _make(tmp_path, trip_calls=trips)
-        _write_loadavg(lf, l5=2.0, l15=TRIP_15M)
+        _write_loadavg(lf, l5=2.0, l15=STOCK["trip_15m"])
         t.tick()
         assert t.is_throttled
-        assert trips == [(2.0, TRIP_15M)]
+        assert trips == [(2.0, STOCK["trip_15m"])]
 
     def test_15m_above_threshold_trips(self, tmp_path):
         trips: list = []
         t, lf = _make(tmp_path, trip_calls=trips)
-        _write_loadavg(lf, l5=2.0, l15=TRIP_15M + 0.1)
+        _write_loadavg(lf, l5=2.0, l15=STOCK["trip_15m"] + 0.1)
         t.tick()
         assert t.is_throttled
-        assert trips and trips[0][1] == pytest.approx(TRIP_15M + 0.1)
+        assert trips and trips[0][1] == pytest.approx(STOCK["trip_15m"] + 0.1)
 
     def test_5m_at_threshold_trips_even_if_15m_safe(self, tmp_path):
         """The OR condition fires on the 5-min signal alone."""
         trips: list = []
         t, lf = _make(tmp_path, trip_calls=trips)
-        _write_loadavg(lf, l5=TRIP_5M, l15=2.0)
+        _write_loadavg(lf, l5=STOCK["trip_5m"], l15=2.0)
         t.tick()
         assert t.is_throttled
 
@@ -99,10 +158,10 @@ class TestTrip:
         assert not t.is_throttled
         assert trips == []
 
-    def test_5m_just_below_6_0_does_not_trip(self, tmp_path):
+    def test_5m_just_below_9_0_does_not_trip(self, tmp_path):
         trips: list = []
         t, lf = _make(tmp_path, trip_calls=trips)
-        _write_loadavg(lf, l5=5.99, l15=2.0)
+        _write_loadavg(lf, l5=8.99, l15=2.0)
         t.tick()
         assert not t.is_throttled
 
@@ -129,7 +188,7 @@ class TestRelease:
         assert t.is_throttled
 
         # 15-min dropped but 5-min still high → still throttled
-        _write_loadavg(lf, l5=5.5, l15=4.0)
+        _write_loadavg(lf, l5=8.5, l15=4.0)
         t.tick()
         assert t.is_throttled
         assert releases == []
@@ -153,7 +212,7 @@ class TestRelease:
         _write_loadavg(lf, l5=7.0, l15=7.0)
         t.tick()
 
-        _write_loadavg(lf, l5=RELEASE_5M, l15=RELEASE_15M)
+        _write_loadavg(lf, l5=STOCK["release_5m"], l15=STOCK["release_15m"])
         t.tick()
         assert t.is_throttled
 
@@ -228,6 +287,7 @@ class TestCallbackResilience:
         t = LoadThrottle(
             on_trip=bad,
             loadavg_path=str(tmp_path / "loadavg"),
+            **STOCK,
         )
         _write_loadavg(tmp_path / "loadavg", l5=10.0, l15=10.0)
         with caplog.at_level(logging.ERROR, logger="load_throttle"):
@@ -245,6 +305,7 @@ class TestCallbackResilience:
         t = LoadThrottle(
             on_release=bad,
             loadavg_path=str(loadavg),
+            **STOCK,
         )
         t.tick()
         _write_loadavg(loadavg, l5=1.0, l15=1.0)
@@ -314,24 +375,180 @@ class TestWatchdogConfParsing:
 
 
 class TestDeriveThresholds:
-    def test_stock_value_matches_legacy_constants(self):
-        """With ``max-load-15 = 6`` (the stock Venus image value) the
-        derivation must reproduce the original hard-coded thresholds
-        (5.5, 6.0, 5.0, 5.0) so behaviour for existing installs is
-        unchanged."""
-        assert _derive_thresholds(6.0) == (5.5, 6.0, 5.0, 5.0)
+    def test_stock_config(self):
+        """Venus ships ``max-load-5 = 10`` and ``max-load-15 = 6``: the
+        15-minute arm keeps its old (5.5, 5.0) and the 5-minute arm
+        moves to its own limit's (9.0, 8.0)."""
+        assert _derive_thresholds(max_load_5=10.0, max_load_15=6.0) == (5.5, 9.0, 5.0, 8.0)
 
-    def test_raised_value_shifts_all_four(self):
-        """If a sysadmin loosens the watchdog to ``max-load-15 = 8``,
-        all four self-throttle thresholds shift up by the same delta
-        so the 0.5 / 1.0 safety margins are preserved."""
-        assert _derive_thresholds(8.0) == (7.5, 8.0, 7.0, 7.0)
+    def test_each_arm_follows_its_own_limit(self):
+        assert _derive_thresholds(max_load_5=12.0, max_load_15=8.0) == (7.5, 11.0, 7.0, 10.0)
+        assert _derive_thresholds(max_load_5=7.5, max_load_15=6.5) == (6.0, 6.5, 5.5, 5.5)
 
-    def test_fractional_input(self):
-        assert _derive_thresholds(6.5) == (6.0, 6.5, 5.5, 5.5)
+    def test_5m_arm_is_not_borrowed_from_max_load_15(self):
+        """Changing only max-load-15 must not move the 5-minute arm."""
+        a = _derive_thresholds(max_load_5=10.0, max_load_15=6.0)
+        b = _derive_thresholds(max_load_5=10.0, max_load_15=8.0)
+        assert a[1] == b[1] == 9.0 and a[3] == b[3] == 8.0
+
+    def test_no_limit_means_the_arm_is_off(self):
+        """The watchdog daemon skips a limit of 0; so do we.  'Off' is
+        infinity on both sides: ``x >= inf`` never trips and ``x < inf``
+        never blocks a release."""
+        t15, t5, r15, r5 = _derive_thresholds(max_load_5=0.0, max_load_15=6.0)
+        assert (t15, r15) == (5.5, 5.0)
+        assert t5 == math.inf and r5 == math.inf
 
     def test_module_level_constants_match_derivation(self):
         """The module-level ``TRIP_15M`` etc. should be whatever
         :func:`_derive_thresholds` says given the file we read."""
-        expected = _derive_thresholds(_read_watchdog_max_load_15())
+        m5, m15 = load_throttle._MAX_LOAD_5, load_throttle._MAX_LOAD_15
+        expected = _derive_thresholds(max_load_5=m5, max_load_15=m15)
         assert (TRIP_15M, TRIP_5M, RELEASE_15M, RELEASE_5M) == expected
+
+
+# ── end to end: the module as prod imports it ──────────────────────────────
+
+
+class TestProdConfig:
+    """``/etc/watchdog.conf`` → module constants → ``LoadThrottle()``
+    with no arguments, exactly as ``dbus_ble_sensors.py`` builds it."""
+
+    def test_constants_from_prod_conf(self, tmp_path):
+        m = _module_reading(tmp_path, PROD_WATCHDOG_CONF)
+        assert _consts(m) == (5.5, 9.0, 5.0, 8.0)
+
+    @pytest.mark.parametrize("l5,l15", [
+        (6.5, 5.4),     # the shape of every prod trip since 10-17
+        (6.55, 5.45),   # the highest 5m and 15m prod saw at a trip
+        (8.99, 5.49),
+    ])
+    def test_prod_trips_no_longer_fire(self, tmp_path, l5, l15):
+        m = _module_reading(tmp_path, PROD_WATCHDOG_CONF)
+        loadavg = tmp_path / "loadavg"
+        _write_loadavg(loadavg, l5=l5, l15=l15)
+        t = m.LoadThrottle(loadavg_path=str(loadavg))
+        t.tick()
+        assert not t.is_throttled
+
+    def test_5m_at_9_trips(self, tmp_path, caplog):
+        m = _module_reading(tmp_path, PROD_WATCHDOG_CONF)
+        loadavg = tmp_path / "loadavg"
+        _write_loadavg(loadavg, l5=9.0, l15=3.0)
+        t = m.LoadThrottle(loadavg_path=str(loadavg))
+        with caplog.at_level(logging.WARNING):
+            t.tick()
+        assert t.is_throttled
+        # load-forensics tails this prefix (its TRIP_LINE)
+        assert any(r.getMessage().startswith("load_throttle: tripped (15m=3.00, 5m=9.00 >= 9.00)")
+                   for r in caplog.records)
+
+    def test_15m_at_5_5_still_trips(self, tmp_path):
+        m = _module_reading(tmp_path, PROD_WATCHDOG_CONF)
+        loadavg = tmp_path / "loadavg"
+        _write_loadavg(loadavg, l5=2.0, l15=5.5)
+        t = m.LoadThrottle(loadavg_path=str(loadavg))
+        t.tick()
+        assert t.is_throttled
+
+    def test_5m_release_hysteresis(self, tmp_path):
+        m = _module_reading(tmp_path, PROD_WATCHDOG_CONF)
+        loadavg = tmp_path / "loadavg"
+        t = m.LoadThrottle(loadavg_path=str(loadavg))
+        _write_loadavg(loadavg, l5=9.5, l15=3.0)
+        t.tick()
+        assert t.is_throttled
+        _write_loadavg(loadavg, l5=8.5, l15=3.0)    # under the trip, above the release
+        t.tick()
+        assert t.is_throttled
+        _write_loadavg(loadavg, l5=8.0, l15=3.0)    # release is strict
+        t.tick()
+        assert t.is_throttled
+        _write_loadavg(loadavg, l5=7.99, l15=3.0)
+        t.tick()
+        assert not t.is_throttled
+
+    def test_15m_release_hysteresis(self, tmp_path):
+        m = _module_reading(tmp_path, PROD_WATCHDOG_CONF)
+        loadavg = tmp_path / "loadavg"
+        t = m.LoadThrottle(loadavg_path=str(loadavg))
+        _write_loadavg(loadavg, l5=3.0, l15=5.6)
+        t.tick()
+        assert t.is_throttled
+        _write_loadavg(loadavg, l5=3.0, l15=5.0)
+        t.tick()
+        assert t.is_throttled
+        _write_loadavg(loadavg, l5=3.0, l15=4.99)
+        t.tick()
+        assert not t.is_throttled
+
+    def test_startup_line_names_both_limits(self, tmp_path, caplog):
+        m = _module_reading(tmp_path, PROD_WATCHDOG_CONF)
+        with caplog.at_level(logging.INFO):
+            m.LoadThrottle(loadavg_path=str(tmp_path / "loadavg"))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert ("load_throttle: thresholds derived from /etc/watchdog.conf "
+                "(max-load-5=10, max-load-15=6): "
+                "trip 15m>=5.5 or 5m>=9.0, release 15m<5.0 and 5m<8.0") in msgs
+
+
+class TestNo5mLimit:
+    """When the watchdog enforces no 5-minute limit, neither do we."""
+
+    @pytest.mark.parametrize("line", [
+        "",                      # absent
+        "max-load-5 = 0\n",      # zero: the daemon skips it
+        "max-load-5 = lots\n",   # garbage
+    ])
+    def test_5m_arm_off(self, tmp_path, line):
+        m = _module_reading(tmp_path, line + "max-load-15 = 6\n")
+        assert (m.TRIP_15M, m.RELEASE_15M) == (5.5, 5.0)
+        assert m.TRIP_5M == math.inf and m.RELEASE_5M == math.inf
+
+        loadavg = tmp_path / "loadavg"
+        t = m.LoadThrottle(loadavg_path=str(loadavg))
+        _write_loadavg(loadavg, l5=50.0, l15=3.0)
+        t.tick()
+        assert not t.is_throttled, "no 5-minute limit: a 5m spike alone never trips"
+
+        _write_loadavg(loadavg, l5=50.0, l15=5.6)
+        t.tick()
+        assert t.is_throttled, "the 15-minute arm still works"
+        _write_loadavg(loadavg, l5=50.0, l15=4.9)
+        t.tick()
+        assert not t.is_throttled, "an off 5m arm never blocks a release"
+
+    def test_startup_line_says_the_arm_is_off(self, tmp_path, caplog):
+        m = _module_reading(tmp_path, "max-load-15 = 6\n")
+        with caplog.at_level(logging.INFO):
+            m.LoadThrottle(loadavg_path=str(tmp_path / "loadavg"))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert ("load_throttle: thresholds derived from /etc/watchdog.conf "
+                "(max-load-5 unset, max-load-15=6): "
+                "trip 15m>=5.5 (5m arm off), release 15m<5.0") in msgs
+
+    def test_max_load_1_supplies_max_load_5_as_the_daemon_does(self, tmp_path):
+        """watchdog's read_config: ``if (maxload1 && !maxload5)
+        maxload5 = maxload1 * 3 / 4`` (integer arithmetic)."""
+        m = _module_reading(tmp_path, "max-load-1 = 10\nmax-load-15 = 6\n")
+        assert m._MAX_LOAD_5 == 7.0
+        assert _consts(m) == (5.5, 6.0, 5.0, 5.0)
+
+    def test_missing_file_assumes_the_stock_image(self, tmp_path):
+        """No readable config at all: assume what the stock Venus image
+        ships, as the 15-minute arm always has."""
+        m = _module_reading(tmp_path, None)
+        assert _consts(m) == (5.5, 9.0, 5.0, 8.0)
+
+
+def test_max_load_15_zero_turns_the_15m_arm_off(tmp_path):
+    """A 0 limit is "no check" to the daemon.  Taken literally it would
+    put our trip at -0.5 and leave the service throttled for good."""
+    m = _module_reading(tmp_path, "max-load-5 = 10\nmax-load-15 = 0\n")
+    assert m.TRIP_15M == math.inf and m.RELEASE_15M == math.inf
+    assert (m.TRIP_5M, m.RELEASE_5M) == (9.0, 8.0)
+    loadavg = tmp_path / "loadavg"
+    _write_loadavg(loadavg, l5=1.0, l15=1.0)
+    t = m.LoadThrottle(loadavg_path=str(loadavg))
+    t.tick()
+    assert not t.is_throttled

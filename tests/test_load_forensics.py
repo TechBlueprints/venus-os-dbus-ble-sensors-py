@@ -355,8 +355,8 @@ def test_event_is_one_dump_with_hysteresis(lf):
     assert ev.update(5.0, 3.0, 2.0, False, 60) is None                # still open: no second dump
     assert ev.update(1.0, 2.0, 2.0, False, 90) is None and ev.active  # one quiet sample: not yet
     assert ev.update(1.0, 2.0, 2.0, False, 120) is None and not ev.active  # two quiet: closed
-    assert ev.update(1.0, 6.5, 1.0, False, 150) == ("5m>=6.0", lf.CLASS_TRIP)   # a NEW event opens
-    assert ev.peak[1] == 6.5
+    assert ev.update(1.0, 9.5, 1.0, False, 150) == ("5m>=9.0", lf.CLASS_TRIP)   # a NEW event opens
+    assert ev.peak[1] == 9.5
 
 
 def test_the_early_catch_is_relative_to_the_box_it_runs_on(lf):
@@ -404,15 +404,73 @@ def test_an_early_event_that_becomes_a_real_trip_dumps_again(lf):
     because the early catch had already opened the event."""
     ev = lf.EventState(lf.Thresholds())
     assert ev.update(4.2, 2.0, 1.0, False, 0) == ("1m>=4.00 (floor)", lf.CLASS_EARLY)
-    res = ev.update(4.5, 6.2, 2.0, False, 30)
+    res = ev.update(4.5, 9.2, 2.0, False, 30)
     assert res is not None and res[1] == lf.CLASS_TRIP, "the escalation must be captured"
-    assert ev.update(4.5, 6.3, 2.1, False, 60) is None, "but only once"
+    assert ev.update(4.5, 9.3, 2.1, False, 60) is None, "but only once"
+
+
+def test_thresholds_default_to_the_stock_derivation(lf):
+    """Venus ships max-load-5 = 10, max-load-15 = 6: trip 15m>=5.5 or
+    5m>=9.0, release 15m<5.0 and 5m<8.0 -- the service's own numbers."""
+    th = lf.Thresholds()
+    assert (th.trip_15m, th.trip_5m, th.release_15m, th.release_5m) == (5.5, 9.0, 5.0, 8.0)
+
+
+def test_a_5m_reading_under_the_watchdog_limit_is_not_a_trip(lf):
+    """Every prod throttle trip since 10-17 was a 5-minute reading near 6.5
+    with the 15-minute under 5.5; none of them is a threshold event now."""
+    ev = lf.EventState(lf.Thresholds())
+    assert ev.update(1.0, 6.55, 5.45, False, 0) is None
+
+
+def test_sensors_py_thresholds_come_from_the_service(lf, monkeypatch):
+    import load_throttle
+    monkeypatch.setattr(load_throttle, "TRIP_15M", 1.5)
+    monkeypatch.setattr(load_throttle, "TRIP_5M", 2.5)
+    monkeypatch.setattr(load_throttle, "RELEASE_15M", 3.5)
+    monkeypatch.setattr(load_throttle, "RELEASE_5M", 4.5)
+    assert lf.sensors_py_thresholds() == (1.5, 2.5, 3.5, 4.5)
+
+
+def test_sensors_py_thresholds_match_the_service_derivation(lf):
+    import load_throttle
+    assert lf.sensors_py_thresholds() == (
+        load_throttle.TRIP_15M, load_throttle.TRIP_5M,
+        load_throttle.RELEASE_15M, load_throttle.RELEASE_5M)
+
+
+def test_sensors_py_thresholds_fallback_is_the_stock_derivation(lf, monkeypatch):
+    monkeypatch.setitem(sys.modules, "load_throttle", None)   # import now raises
+    assert lf.sensors_py_thresholds() == (5.5, 9.0, 5.0, 8.0)
+
+
+def test_an_off_5m_arm_never_trips_and_never_blocks_release(lf):
+    """With no max-load-5 the service's 5m thresholds are infinity."""
+    inf = float("inf")
+    ev = lf.EventState(lf.Thresholds(trip_5m=inf, release_5m=inf), release_samples=1)
+    assert ev.update(1.0, 50.0, 1.0, False, 0) is None, "a 5m reading alone opens nothing"
+    assert ev.update(1.0, 50.0, 5.6, False, 30) == ("15m>=5.5", lf.CLASS_TRIP)
+    assert ev.update(1.0, 50.0, 4.9, False, 60) is None and not ev.active, \
+        "the off arm does not hold the event open"
+
+
+def test_startup_line_says_an_off_5m_arm_is_off(lf, tmp_path, caplog):
+    import logging
+    inf = float("inf")
+    fx = lf.Forensics(root=str(tmp_path / "proc"), dump_dir=str(tmp_path / "d"),
+                      th=lf.Thresholds(trip_5m=inf, release_5m=inf),
+                      sensors_log=str(tmp_path / "nolog"), peers_reader=lambda: PEERS)
+    assert "5m off" in fx.thresholds_text() and "inf" not in fx.thresholds_text()
+    fx2 = lf.Forensics(root=str(tmp_path / "proc"), dump_dir=str(tmp_path / "d"),
+                       th=lf.Thresholds(), sensors_log=str(tmp_path / "nolog"),
+                       peers_reader=lambda: PEERS)
+    assert "5m>=9.0" in fx2.thresholds_text() and "5m<8.0" in fx2.thresholds_text()
 
 
 def test_classification_puts_a_real_threshold_above_the_early_catch(lf):
     c = lf.EventState.classify
     assert c(["1m>=4.00 (floor)"]) == lf.CLASS_EARLY
-    assert c(["1m>=4.50 (5m+1.5)", "5m>=6.0"]) == lf.CLASS_TRIP
+    assert c(["1m>=4.50 (5m+1.5)", "5m>=9.0"]) == lf.CLASS_TRIP
     assert c(["1m>=4.50 (5m+1.5)"]) == lf.CLASS_EARLY, "the tag names 5m but the rule is the early one"
     assert c(["15m>=5.5"]) == lf.CLASS_TRIP
     assert c(["sensors-py tripped"]) == lf.CLASS_TRIP
@@ -439,7 +497,7 @@ def test_write_dump_records_the_ring_and_its_own_cost(lf, tmp_path):
     sm = lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS)
     ring = [sm.sample(now=float(i)) for i in range(3)]
     d = str(tmp_path / "dumps")
-    path = lf.write_dump(ring, "5m>=6.0", d, deep=False, proc_root=root, started_at=1.0,
+    path = lf.write_dump(ring, "5m>=9.0", d, deep=False, proc_root=root, started_at=1.0,
                          cls=lf.CLASS_TRIP)
     assert path.endswith("-trip.txt"), "the class is in the filename, so pools can be capped apart"
     text = open(path).read()
@@ -456,7 +514,7 @@ def test_an_early_catch_burst_cannot_evict_a_trip_dump(lf, tmp_path):
     ring = [lf.Sampler(root, clk_tck=100, peers_reader=lambda: PEERS).sample(now=0.0)]
     d = str(tmp_path / "dumps")
     keep = lf.DUMP_KEEP[lf.CLASS_EARLY]
-    trip = lf.write_dump(ring, "5m>=6.0", d, deep=False, proc_root=root, cls=lf.CLASS_TRIP)
+    trip = lf.write_dump(ring, "5m>=9.0", d, deep=False, proc_root=root, cls=lf.CLASS_TRIP)
     trip_name = "dump-20260101T000000Z-trip.txt"
     os.rename(trip, os.path.join(d, trip_name))
     for i in range(keep + 5):
@@ -484,7 +542,7 @@ def test_early_catch_cooldown_holds_but_a_real_trip_never_waits(lf, tmp_path):
     assert fx.step(now=1090.0, deep=False) is None, "inside the cooldown: event opens, no dump"
     assert fx.dumps == 1
     # a REAL trip during that same cooldown is never withheld
-    make_proc(root, _procs_v1(), load="4.50 6.50 2.00 2/300 1")
+    make_proc(root, _procs_v1(), load="4.50 9.50 2.00 2/300 1")
     assert fx.step(now=1120.0, deep=False), "a threshold trip ignores the early cooldown"
     assert fx.dumps == 2
 
