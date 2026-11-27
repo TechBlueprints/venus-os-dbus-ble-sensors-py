@@ -448,6 +448,14 @@ class BleDevice(object):
         # never appear in the parse-time regs table.  The reg's
         # ``sensor_type`` still wins when both exist.
         sensor_types = self.info.get('sensor_types', {})
+        # A reg (or, for derived values, ``info['deadbands']``) may name
+        # a ``deadband``: the value is then published only when it has
+        # moved at least that far from the value last published, instead
+        # of whenever its rounded form changes.  For slow, noisy values
+        # whose noise straddles a rounding boundary (a Ruuvi temperature,
+        # a Mopeka battery voltage one LSB either side of x.x05), rounded
+        # equality publishes on every flicker.  See SensorPublisher.publish.
+        deadbands = self.info.get('deadbands', {})
         with role_service:
             for name, value in sensor_data.items():
                 reg = regs_by_name.get(name, {})
@@ -457,6 +465,7 @@ class BleDevice(object):
                         role_service, name, value,
                         sensor_type=sensor_type,
                         override=reg.get('round'),
+                        deadband=reg.get('deadband', deadbands.get(name)),
                     )
                 else:
                     # Fallback for tests / pre-init: skip rounding & dedup.

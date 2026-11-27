@@ -1,5 +1,6 @@
 from ve_types import *
 from ble_device import BleDevice
+from sensor_rounding import DEADBAND_COIN_CELL_VOLTAGE
 import logging
 from dbus_role_service import DbusRoleService
 
@@ -155,6 +156,7 @@ class BleDeviceMopeka(BleDevice):
                     'bits': 7,
                     'scale': 32,
                     'sensor_type': 'voltage',
+                    'deadband': DEADBAND_COIN_CELL_VOLTAGE,
                     # .format	= &veUnitVolt2Dec,
                 },
                 {

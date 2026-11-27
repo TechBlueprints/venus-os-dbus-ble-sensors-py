@@ -1,6 +1,10 @@
 from __future__ import annotations
 from ve_types import *
 from ble_device import BleDevice
+from sensor_rounding import (
+    DEADBAND_COIN_CELL_VOLTAGE, DEADBAND_HUMIDITY, DEADBAND_PRESSURE,
+    DEADBAND_TEMPERATURE,
+)
 import logging
 import math
 from dbus_role_service import DbusRoleService
@@ -52,6 +56,7 @@ class BleDeviceRuuvi(BleDevice):
                     'roles': ['temperature'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
                     'sensor_type': 'temperature',  # 0.1 °C display
+                    'deadband': DEADBAND_TEMPERATURE,
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {
@@ -63,6 +68,7 @@ class BleDeviceRuuvi(BleDevice):
                     'roles': ['temperature'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
                     'sensor_type': 'humidity',     # 0.1 %
+                    'deadband': DEADBAND_HUMIDITY,
                     # .format	= &veUnitPercentage,
                 },
                 {
@@ -75,6 +81,7 @@ class BleDeviceRuuvi(BleDevice):
                     'roles': ['temperature'],
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
                     'sensor_type': 'pressure',     # 1 hPa
+                    'deadband': DEADBAND_PRESSURE,
                     # .format	= &veUnitHectoPascal,
                 },
                 {
@@ -121,6 +128,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0x3ff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
                     'sensor_type': 'voltage',       # 0.01 V
+                    'deadband': DEADBAND_COIN_CELL_VOLTAGE,
                     # .format	= &veUnitVolt2Dec,
                 },
                 {
@@ -190,6 +198,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0x8000,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
                     'sensor_type': 'temperature',
+                    'deadband': DEADBAND_TEMPERATURE,
                     # .format	= &veUnitCelsius1Dec,
                 },
                 {
@@ -200,6 +209,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0xffff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
                     'sensor_type': 'humidity',
+                    'deadband': DEADBAND_HUMIDITY,
                     # .format	= &veUnitPercentage,
                 },
                 {
@@ -211,6 +221,7 @@ class BleDeviceRuuvi(BleDevice):
                     'inval': 0xffff,
                     'flags': ['REG_FLAG_BIG_ENDIAN', 'REG_FLAG_INVALID'],
                     'sensor_type': 'pressure',
+                    'deadband': DEADBAND_PRESSURE,
                     # .format	= &veUnitHectoPascal,
                 },
                 {
