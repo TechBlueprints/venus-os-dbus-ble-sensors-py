@@ -22,19 +22,54 @@ class BleDeviceRuuvi(BleDevice):
 
     MANUFACTURER_ID = 0x0499 # 'Ruuvi Innovations Ltd.'
 
-    @staticmethod
-    def _get_low_battery_state(role_service: DbusRoleService) -> int:
-        level = 2.5
-        if (temperature := role_service['temperature']) is not None:
-            if temperature < -20:
-                level = 2.0
-            elif temperature < 0:
-                level = 2.2
+    # Low-battery alarm, as upstream dbus-ble-sensors has it (ruuvi.c
+    # ruuvi_lowbat; ble-dbus.c alarm_level/update_alarm): the level depends
+    # on the temperature, because a coin cell's voltage sags in the cold,
+    # and while the alarm is active the level is raised by the hysteresis,
+    # so it clears only once the voltage has recovered that far.
+    LOW_BATTERY_LEVEL_WARM = 2.5        # V, T >= 0 °C
+    LOW_BATTERY_LEVEL_COLD = 2.3        # V, -20 <= T < 0 °C
+    LOW_BATTERY_LEVEL_VERY_COLD = 2.0   # V, T < -20 °C
+    LOW_BATTERY_HYSTERESIS = 0.4        # V
 
-        if role_service['/Alarms/LowBattery'] is True:
-            level += 0.4
+    @classmethod
+    def _low_battery_level(cls, temperature: 'float | None') -> float:
+        if temperature is None:
+            return cls.LOW_BATTERY_LEVEL_WARM
+        if temperature < -20:
+            return cls.LOW_BATTERY_LEVEL_VERY_COLD
+        if temperature < 0:
+            return cls.LOW_BATTERY_LEVEL_COLD
+        return cls.LOW_BATTERY_LEVEL_WARM
 
-        return int(role_service['BatteryVoltage'] < level)
+    def _get_low_battery_state(self, role_service: DbusRoleService) -> int:
+        # Both inputs are the *published* values, as upstream reads its
+        # items.  PR #36 gates them by deadband (0.1 V, 0.1 °C), so they
+        # lag the reading by at most one band or one heartbeat: nothing,
+        # against a battery that falls over months and levels 0.2 V and
+        # 20 °C apart.  What they buy is that the alarm agrees with the
+        # /BatteryVoltage the user sees.  Chatter is not a risk either way:
+        # the 0.4 V hysteresis is wider than the band plus the measured
+        # noise (0.074 V) and than any step between levels (0.2 / 0.3 V).
+        active = bool(role_service['/Alarms/LowBattery'])
+        voltage = role_service['BatteryVoltage']
+        if voltage is None:
+            # Upstream skips an alarm whose item is not valid.
+            return int(active)
+
+        # The movement role service carries BatteryVoltage and this alarm
+        # but not /Temperature: read the tag's temperature from its
+        # temperature role service, so both services use the same level.
+        temperature = role_service['Temperature']
+        if temperature is None:
+            temp_service = self._role_services.get('temperature')
+            if temp_service is not None:
+                temperature = temp_service['Temperature']
+
+        level = self._low_battery_level(temperature)
+        if active:
+            level += self.LOW_BATTERY_HYSTERESIS
+        return int(voltage < level)
 
     @staticmethod
     def _xlate_lum(value: int) -> int:
@@ -179,12 +214,8 @@ class BleDeviceRuuvi(BleDevice):
                     # .format	= &veUnitNone,
                 },
             ],
-            'alarms': [
-                {
-                    'name': '/Alarms/LowBattery',
-                    'update': _get_low_battery_state
-                }
-            ]
+            # 'alarms' is set in configure(): the low-battery alarm is a
+            # bound method, because it reads this tag's other role service.
         },
         6: {  # Format 6
             'device_name': 'Ruuvi Air',
@@ -305,6 +336,13 @@ class BleDeviceRuuvi(BleDevice):
 
         self.manufacturer_data_length = 24 if model_id == 5 else 20
         self.info.update(model_info)
+        if model_id == 5:
+            self.info['alarms'] = [
+                {
+                    'name': '/Alarms/LowBattery',
+                    'update': self._get_low_battery_state,
+                },
+            ]
 
     def check_manufacturer_data(self, manufacturer_data: bytes) -> bool:
         if (length := self.manufacturer_data_length) is None:

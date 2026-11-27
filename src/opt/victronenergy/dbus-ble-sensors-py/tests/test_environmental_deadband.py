@@ -255,7 +255,7 @@ def test_ruuvi_low_battery_alarm_does_not_chatter_at_threshold(clock):
     for i, v in enumerate([2.503, 2.495, 2.501, 2.497, 2.503, 2.494] * 5):
         clock[0] += 1
         feed(dev, svc, ruuvi_frame(14.4, 30.3, 873.0, v, seq=i), 'temperature')
-        states.append(BleDeviceRuuvi._get_low_battery_state(svc))
+        states.append(dev._get_low_battery_state(svc))
     assert len(set(states)) == 1
 
 
