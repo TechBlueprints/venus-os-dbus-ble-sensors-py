@@ -302,7 +302,7 @@ that keep a fixed offset from the kernel's sample.
 
 Predicted effects are estimates from the per-signal cost above (0.15-0.2 on the 15-minute
 average for each signal per second removed, by the kernel's own samples) and from the state
-shares; none has been deployed. After any deploy, re-run
+shares, made on 11-26 before any fix was deployed. After any deploy, re-run
 `loadavg_sampler_vs_publisher.py 720 all` and `--sampled`: it prints the signal rate and the
 mean the kernel sampled, the same instrument before and after, and compare the daily medians
 of the `alive:` lines.
