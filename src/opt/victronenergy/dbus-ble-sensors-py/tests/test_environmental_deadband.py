@@ -9,9 +9,9 @@ rounded to a new value, so every flicker was a signal, and every signal
 wakes nine processes on the box (docs/LOAD-AVERAGE-BURSTS.md).
 
 These tests drive the real drivers (parse -> update_data -> publish)
-through a role service that counts signals the way vedbus does: one per
-advertisement in which any path changed.  The readings are the values
-captured on prod in that window.
+through a role service that counts signals the way the box emits them: one per
+changed path (that is what the box does; see SignalCountingService).
+The readings are the values captured on prod in that window.
 """
 import os
 import sys
@@ -47,12 +47,17 @@ class FakeSettings:
 
 
 class SignalCountingService:
-    """Role service that counts D-Bus signals the way vedbus emits them.
+    """Role service that counts D-Bus signals the way this service emits them.
 
     ``DbusRoleService._set_value`` drops a write equal to the current
-    value; vedbus coalesces the writes inside one ``with`` block into
-    one ``ItemsChanged``.  So: one signal per outermost ``with`` block
-    in which at least one path took a new value.
+    value, and otherwise opens its own ``with self._dbus_service`` block,
+    so every changed path is its own ``ItemsChanged``: the outer
+    ``with role_service:`` in ``_update_dbus_data`` batches nothing
+    (vedbus batches only writes made through the ServiceContext that its
+    ``__enter__`` returns, which DbusRoleService discards).  Prod shows
+    it: ruuvi_f0ad5dba8b9d's 195 signals in the 15-minute capture are
+    exactly its 113 + 54 + 16 + 12 path changes.  So: one signal per
+    changed write.
     """
 
     class _Role:
@@ -64,18 +69,11 @@ class SignalCountingService:
         self.values = dict(settings)
         self.signals = 0
         self.writes = {}          # path -> number of changed writes
-        self._depth = 0
-        self._dirty = False
 
     def __enter__(self):
-        self._depth += 1
         return self
 
     def __exit__(self, *exc):
-        self._depth -= 1
-        if self._depth == 0 and self._dirty:
-            self.signals += 1
-            self._dirty = False
         return False
 
     def __setitem__(self, path, value):
@@ -83,10 +81,7 @@ class SignalCountingService:
             return
         self.values[path] = value
         self.writes[path] = self.writes.get(path, 0) + 1
-        if self._depth:
-            self._dirty = True
-        else:
-            self.signals += 1
+        self.signals += 1
 
     def __getitem__(self, path):
         return self.values.get(path)
@@ -179,21 +174,26 @@ def _cycle(seq, i):
     return seq[i % len(seq)]
 
 
-def test_ruuvi_replay_of_prod_noise_is_one_signal(clock):
-    """Forty adverts of the f0ad tag's real noise: one signal, the first.
+def test_ruuvi_replay_of_prod_noise_is_silent_after_the_first_advert(clock):
+    """Forty adverts of the f0ad tag's real noise: after the first advert
+    (which publishes every path once), not one signal.
 
-    Under rounded equality every one of them crossed a boundary on some
-    path (873.5 hPa, 30.35 %, 14.45 °C, 2.665 V) and was a signal.
+    Under rounded equality nearly every one of them crossed a boundary
+    on some path (873.5 hPa, 30.35 %, 14.45 °C, 2.665 V) and signalled.
     """
     dev, svc = ruuvi(), SignalCountingService()
-    for i in range(40):
+    clock[0] += 1
+    feed(dev, svc, ruuvi_frame(F0AD_TEMPERATURE[0], F0AD_HUMIDITY[0],
+                               F0AD_PRESSURE[0], F0AD_BATTERY[0]), 'temperature')
+    first = svc.signals
+    for i in range(1, 40):
         clock[0] += 1
         feed(dev, svc, ruuvi_frame(_cycle(F0AD_TEMPERATURE, i),
                                    _cycle(F0AD_HUMIDITY, i),
                                    _cycle(F0AD_PRESSURE, i),
                                    _cycle(F0AD_BATTERY, i), seq=i),
              'temperature')
-    assert svc.signals == 1
+    assert svc.signals == first
 
 
 def test_mopeka_battery_replay_of_prod_noise_is_one_signal(clock):
@@ -268,7 +268,7 @@ def test_ruuvi_real_temperature_step_publishes_on_the_next_advert(clock):
     clock[0] += 1
     feed(dev, svc, ruuvi_frame(15.43, 30.3, 873.0, 2.67), 'temperature')
     assert svc['Temperature'] == pytest.approx(15.43)
-    assert svc.signals == 2
+    assert svc.writes['Temperature'] == 2
 
 
 def test_ruuvi_slow_noisy_drift_is_tracked_within_one_band(clock):
@@ -316,7 +316,7 @@ def test_returning_device_publishes_at_once(clock):
     clock[0] += 60
     feed(dev, returned, ruuvi_frame(14.45, 30.3, 873.0, 2.67), 'temperature')
     assert returned['Temperature'] == pytest.approx(14.45)
-    assert returned.signals == 1
+    assert returned.writes['Temperature'] == 1
 
 
 def test_movement_service_battery_is_gated_too(clock):
