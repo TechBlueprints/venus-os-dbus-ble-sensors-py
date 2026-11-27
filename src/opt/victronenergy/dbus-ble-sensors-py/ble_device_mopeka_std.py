@@ -1,5 +1,6 @@
 from ve_types import *
 from ble_device import BleDevice
+from sensor_rounding import DEADBAND_COIN_CELL_VOLTAGE
 import logging
 from dbus_role_service import DbusRoleService
 
@@ -96,6 +97,12 @@ class BleDeviceMopekaStd(BleDevice):
                 'Temperature':    'temperature',
                 'BatteryVoltage': 'voltage',
                 'RawValue':       'distance',   # cm; rounded to 0.1 cm
+            },
+            # Same gap for deadbands: the derived battery voltage (1/128 V
+            # steps) is gated like the Pro line's, by distance from the
+            # value last published rather than by its rounded form.
+            'deadbands': {
+                'BatteryVoltage': DEADBAND_COIN_CELL_VOLTAGE,
             },
             'regs': [
                 # byte 1: sensor type (low 6 bits + high 2; bits 4-5 reserved)

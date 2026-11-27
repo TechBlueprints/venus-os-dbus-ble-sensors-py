@@ -50,6 +50,29 @@ DEFAULTS: dict[str, tuple[int, int, int]] = {
     'percent':           (1, 0, 3),   # 0.1 %  (generic fallback)
 }
 
+# Deadbands for slow environmental values (see SensorPublisher.publish,
+# deadband mode).  A reg that names one is published when it has moved at
+# least this far from the value last published, not whenever its rounded
+# form changes.  Rounded equality fails for these because their noise is
+# a few LSBs wide and straddles a rounding boundary, so every flicker is
+# a "change".  Measured on prod 2026-11-27 16:13:43-16:28:43Z (15 min):
+# this service emitted 654 signals (0.73/s), nearly all of them such
+# flickers on Ruuvi and Mopeka paths, e.g. a Mopeka
+# battery walking four adjacent 1/32 V codes (1.9375..2.03125 V) and a
+# Ruuvi pressure at 873.47..873.56 hPa across the 873.5 boundary.
+#
+# Each band is wider than the noise span measured for that quantity and
+# no wider than a person or an automation would care about.  The anchor
+# is the last *published* value, so a slow drift accumulates and is
+# published once it crosses the band; the heartbeat below republishes
+# the current precise value regardless, so no published value is older
+# than HeartbeatSeconds or further than one band from the truth.
+DEADBAND_TEMPERATURE = 0.1        # °C;  Ruuvi noise span <= 0.07 °C
+DEADBAND_HUMIDITY = 0.5           # %RH; noise <= 0.07 %, sensor accuracy ±2 %
+DEADBAND_PRESSURE = 0.5           # hPa; noise 0.09 hPa, display resolution 1 hPa
+DEADBAND_COIN_CELL_VOLTAGE = 0.1  # V;   Ruuvi noise span up to 0.074 V,
+                                  #      Mopeka 3 LSB = 0.094 V (1/32 V steps)
+
 # The republish-heartbeat: maximum interval (s) between ItemsChanged
 # emits for a stable value.  Drives both the byte-level dedup in
 # ``dbus_ble_sensors.py`` (early reject of identical raw blobs) and the

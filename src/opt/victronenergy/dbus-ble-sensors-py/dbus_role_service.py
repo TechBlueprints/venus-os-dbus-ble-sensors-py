@@ -240,10 +240,13 @@ class DbusRoleService(object):
         self._delete_item(path)
 
     def __enter__(self):
-        # Delegate to the underlying ``VeDbusService`` so callers can
-        # batch many ``__setitem__`` calls into a single
-        # ``PropertiesChanged`` emit.  ``VeDbusService`` is refcounted,
-        # so nested ``with`` blocks compose correctly.
+        # This batches nothing.  vedbus collects only the writes made
+        # through the ``ServiceContext`` its ``__enter__`` returns, and
+        # that context is discarded here; ``_set_value`` then opens and
+        # flushes a context of its own per write, so every changed path
+        # is its own ``ItemsChanged`` (prod 2026-11-27: a Ruuvi's 195
+        # signals in 15 min were exactly its 113 + 54 + 16 + 12 path
+        # changes).  Batching is a separate fix, not yet made.
         self._dbus_service.__enter__()
         return self
 
