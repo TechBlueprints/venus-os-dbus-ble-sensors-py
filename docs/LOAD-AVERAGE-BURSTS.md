@@ -323,6 +323,21 @@ Fixes 1, 2, 4, 5 and 6 are code Clint controls and add up to roughly âˆ’0.4 to â
 VE.Direct services 3.9/s, systemcalc 1.0-1.3/s) waking seven Victron subscribers, and that part
 is by design.
 
+Where the fixes stood on 2026-11-27 (deploy times as reported by the sessions that did them):
+
+| # | state |
+|---|---|
+| 1 | TechBlueprints/venus-os_dbus-serialbattery#550, on prod from 11-27 16:22Z |
+| 2 | dbus-aggregate-batteries `integration/all` 864150f, on prod from 11-27 17:08Z; the subscription half is also TechBlueprints/dbus-aggregate-batteries#181 |
+| 3 | both services stopped on prod 11-27 16:36Z |
+| 4 | #36, on prod from 11-27 17:07Z; one `ItemsChanged` per publish block instead of per path is #39 |
+| 5 | TechBlueprints/dbus-power-watchdog#13, open |
+| 6 | not started |
+
+The after-measurement uses the same instruments as above: `loadavg_sampler_vs_publisher.py
+720 all` with `--sampled`, the phase fold, and whole days of `alive:` medians after the last
+deploy.
+
 What does not help the 15-minute figure: moving bursts apart. Giving services different
 `HOSTNAME` values would spread the GLib seconds-timers, and restarting a `vedirect-dbus` would
 move its burst, but the same tasks would be runnable for the same time.
