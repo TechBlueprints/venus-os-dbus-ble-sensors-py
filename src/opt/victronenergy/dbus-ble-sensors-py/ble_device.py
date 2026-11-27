@@ -436,9 +436,10 @@ class BleDevice(object):
         # for edge cases.  Regs that lack both pass through unrounded
         # — but still benefit from change-detection + heartbeat dedup.
         #
-        # The outer ``with role_service:`` keeps the existing batched-
-        # PropertiesChanged behavior: if multiple paths actually changed
-        # within this ad, vedbus coalesces them into one ItemsChanged.
+        # The outer ``with role_service:`` does not coalesce: each path
+        # that changed in this ad is its own ItemsChanged (see
+        # DbusRoleService.__enter__), so every path of a noisy service
+        # has to be gated for that service to go quiet.
         publisher = SensorPublisher.get()
         regs_by_name = self._regs_by_name()
         # ``info['sensor_types']`` is a fallback map for values that
