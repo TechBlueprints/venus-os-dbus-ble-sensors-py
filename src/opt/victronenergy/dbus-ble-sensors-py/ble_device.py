@@ -436,10 +436,10 @@ class BleDevice(object):
         # for edge cases.  Regs that lack both pass through unrounded
         # — but still benefit from change-detection + heartbeat dedup.
         #
-        # The outer ``with role_service:`` does not coalesce: each path
-        # that changed in this ad is its own ItemsChanged (see
-        # DbusRoleService.__enter__), so every path of a noisy service
-        # has to be gated for that service to go quiet.
+        # The ``with role_service:`` batches: every path that changed in
+        # this ad goes out in one ItemsChanged (see
+        # DbusRoleService.__enter__).  Inside handle_manufacturer_data it
+        # joins the outer batch there, which also carries the alarms.
         publisher = SensorPublisher.get()
         regs_by_name = self._regs_by_name()
         # ``info['sensor_types']`` is a fallback map for values that
@@ -530,22 +530,26 @@ class BleDevice(object):
             if not DbusBleService.get().is_device_role_enabled(self.info, role_service.ble_role.NAME) is True:
                 logging.debug(f"{self._plog} role {role_service.ble_role.NAME!r} not enabled, skipping")
                 continue
-            # Filtering data
-            role_data = sensor_data[role_service.ble_role.NAME]
-            if role_data:
-                # Device-level transform first (e.g. Mopeka xlate scaling),
-                # then role-level computation (e.g. tank Level from RawValue).
-                self.update_data(role_service, role_data)
-                role_service.ble_role.update_data(role_service, role_data)
+            # One batch per role service per advertisement: the values and
+            # the alarm states that changed in this ad go out in a single
+            # ItemsChanged when the block exits, before connect() below.
+            with role_service:
+                # Filtering data
+                role_data = sensor_data[role_service.ble_role.NAME]
+                if role_data:
+                    # Device-level transform first (e.g. Mopeka xlate scaling),
+                    # then role-level computation (e.g. tank Level from RawValue).
+                    self.update_data(role_service, role_data)
+                    role_service.ble_role.update_data(role_service, role_data)
 
-                # Update Dbus with new data
-                self._update_dbus_data(role_service, role_data)
+                    # Update Dbus with new data
+                    self._update_dbus_data(role_service, role_data)
 
-            # Update alarm states
-            for alarm in role_service.ble_role.info['alarms']:
-                role_service.update_alarm(alarm)
-            for alarm in self.info['alarms']:
-                role_service.update_alarm(alarm)
+                # Update alarm states
+                for alarm in role_service.ble_role.info['alarms']:
+                    role_service.update_alarm(alarm)
+                for alarm in self.info['alarms']:
+                    role_service.update_alarm(alarm)
 
             # Start service if needed
             role_service.connect()

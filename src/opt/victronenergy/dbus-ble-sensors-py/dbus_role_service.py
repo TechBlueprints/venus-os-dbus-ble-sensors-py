@@ -1,4 +1,5 @@
 import logging
+import threading
 import dbus
 from dbus_bus import get_bus, release_bus
 from dbus_settings_service import DbusSettingsService
@@ -10,7 +11,21 @@ from vedbus import VeDbusService, VeDbusItemImport, VeDbusItemExport
 class DbusRoleService(object):
     """
     Role service class. Responsible for holding and sharing data through a dedicated dbus service.
+
+    ``with role_service:`` batches: every path written inside the block
+    goes out in one ``ItemsChanged`` when the outermost block exits, and
+    a write outside any block goes out on its own at once.  See
+    ``__enter__``.
     """
+
+    # The open batch, if any: the vedbus ``ServiceContext`` that writes
+    # go through, how many ``with`` blocks deep we are, and the thread
+    # that opened it.  Class-level defaults so an instance built with
+    # ``__new__`` (tests) starts with no batch open, as a constructed
+    # one does.
+    _batch = None
+    _batch_depth: int = 0
+    _batch_thread = None
 
     def __init__(self, ble_device, ble_role: BleRole, dev_id: str = None):
         """Construct a role service for *ble_device* fulfilling *ble_role*.
@@ -209,26 +224,55 @@ class DbusRoleService(object):
             return item.local_get_value()
         return None
 
+    def _open_batch(self):
+        """The ``ServiceContext`` of the batch open on this thread, or None.
+
+        Every writer runs on the GLib main thread today (GATT drivers hand
+        their results over with ``GLib.idle_add`` or a main-thread
+        callback).  A write from any other thread would land in a batch
+        it cannot see the end of, so it publishes on its own instead.
+        """
+        if self._batch is not None and self._batch_thread == threading.get_ident():
+            return self._batch
+        return None
+
+    @staticmethod
+    def _write(service, plog: str, service_name: str, clean_path: str, value: object):
+        """One write through a vedbus ``ServiceContext``.
+
+        A new path is created (and announced, with its value, in the
+        context's ``ItemsChanged``); an existing path whose value is
+        unchanged is not written, so it adds nothing to the signal.
+        """
+        if clean_path not in service:
+            logging.debug(
+                f"{plog} creating item {service_name!r}@{clean_path!r} to {value!r}")
+            service.add_path(clean_path, value, writeable=True)
+        elif service[clean_path] != value:
+            logging.debug(
+                f"{plog} updating item {service_name!r}@{clean_path!r} to {value!r}")
+            service[clean_path] = value
+
     def _set_value(self, path: str, value: object):
         clean_path = self._clear_path(path)
+        if (batch := self._open_batch()) is not None:
+            self._write(batch, self._ble_device._plog, self._service_name, clean_path, value)
+            return
         with self._dbus_service as service:
-            if clean_path not in service:
-                logging.debug(
-                    f"{self._ble_device._plog} creating item {self._service_name!r}@{clean_path!r} to {value!r}")
-                service.add_path(clean_path, value, writeable=True)
-            elif service[clean_path] != value:
-                logging.debug(
-                    f"{self._ble_device._plog} updating item {self._service_name!r}@{clean_path!r} to {value!r}")
-                service[clean_path] = value
+            self._write(service, self._ble_device._plog, self._service_name, clean_path, value)
 
     def _delete_item(self, path: str):
         clean_path = self._clear_path(path)
         if self._dbus_service._dbusobjects.get(clean_path, None) is None:
             logging.error(f"Can not delete non-existing {clean_path!r}")
-        else:
-            logging.debug(f"Deleting item {self._service_name!r}@{clean_path!r}")
-            with self._dbus_service as service:
-                del service[clean_path]
+            return
+        logging.debug(f"Deleting item {self._service_name!r}@{clean_path!r}")
+        if (batch := self._open_batch()) is not None:
+            # Drops any change to this path still waiting in the batch.
+            del batch[clean_path]
+            return
+        with self._dbus_service as service:
+            del service[clean_path]
 
     def __getitem__(self, path: str) -> object:  # int, float, str, None
         return self._get_value(path)
@@ -240,18 +284,38 @@ class DbusRoleService(object):
         self._delete_item(path)
 
     def __enter__(self):
-        # This batches nothing.  vedbus collects only the writes made
-        # through the ``ServiceContext`` its ``__enter__`` returns, and
-        # that context is discarded here; ``_set_value`` then opens and
-        # flushes a context of its own per write, so every changed path
-        # is its own ``ItemsChanged`` (prod 2026-11-27: a Ruuvi's 195
-        # signals in 15 min were exactly its 113 + 54 + 16 + 12 path
-        # changes).  Batching is a separate fix, not yet made.
-        self._dbus_service.__enter__()
+        """Open a batch: the paths written until the outermost ``with``
+        exits go out together in one ``ItemsChanged``.
+
+        vedbus collects only the writes made through the
+        ``ServiceContext`` its own ``__enter__`` returns.  Until
+        2026-11-27 this method threw that context away and ``_set_value``
+        opened a fresh one per write, so every changed path was its own
+        signal (prod: a Ruuvi's 195 signals in 15 minutes were exactly its
+        113 + 54 + 16 + 12 path changes).  Now the context is kept and
+        ``_set_value`` writes through it.
+
+        Nested blocks join the outer one; only the outermost exit
+        flushes.  The block is synchronous code (no ``await`` inside any
+        caller), so the batch closes within the same main-loop callback
+        that opened it: nothing waits for a batch to fill.
+        """
+        if self._batch_depth == 0:
+            self._batch = self._dbus_service.__enter__()
+            self._batch_thread = threading.get_ident()
+        self._batch_depth += 1
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        return self._dbus_service.__exit__(exc_type, exc_val, exc_tb)
+        self._batch_depth -= 1
+        if self._batch_depth > 0:
+            return False
+        self._batch = None
+        self._batch_thread = None
+        # Flushes even when the block raised: the writes already made are
+        # the local values a GetValue returns, so they are announced.
+        self._dbus_service.__exit__(exc_type, exc_val, exc_tb)
+        return False
 
     def _set_proxy_callback(self, item_path: str, setting_item: VeDbusItemImport, callback=None):
         def _callback(change_path, new_value):
