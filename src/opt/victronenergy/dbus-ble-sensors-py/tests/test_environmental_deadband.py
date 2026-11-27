@@ -9,9 +9,13 @@ rounded to a new value, so every flicker was a signal, and every signal
 wakes nine processes on the box (docs/LOAD-AVERAGE-BURSTS.md).
 
 These tests drive the real drivers (parse -> update_data -> publish)
-through a role service that counts signals the way the box emits them: one per
-changed path (that is what the box does; see SignalCountingService).
-The readings are the values captured on prod in that window.
+through a role service that records each changed write per path
+(``writes``) and counts signals the way the box emits them since the
+batching fix: one per ``with role_service:`` block that changed anything
+(see SignalCountingService).  The readings are the values captured on
+prod in that window; in it the box still sent one signal per changed
+path, which is why the per-path ``writes`` are what the gating is judged
+by.
 """
 import os
 import sys
@@ -50,14 +54,13 @@ class SignalCountingService:
     """Role service that counts D-Bus signals the way this service emits them.
 
     ``DbusRoleService._set_value`` drops a write equal to the current
-    value, and otherwise opens its own ``with self._dbus_service`` block,
-    so every changed path is its own ``ItemsChanged``: the outer
-    ``with role_service:`` in ``_update_dbus_data`` batches nothing
-    (vedbus batches only writes made through the ServiceContext that its
-    ``__enter__`` returns, which DbusRoleService discards).  Prod shows
-    it: ruuvi_f0ad5dba8b9d's 195 signals in the 15-minute capture are
-    exactly its 113 + 54 + 16 + 12 path changes.  So: one signal per
-    changed write.
+    value.  Inside ``with role_service:`` the changed writes are batched
+    and go out as one ``ItemsChanged`` when the outermost block exits; a
+    write outside any block is its own signal.  That is the real
+    service's behaviour, pinned against real vedbus in
+    test_role_service_batching.py.  (Before that fix every changed path
+    was its own signal: ruuvi_f0ad5dba8b9d's 195 signals in the 15-minute
+    capture were exactly its 113 + 54 + 16 + 12 path changes.)
     """
 
     class _Role:
@@ -69,11 +72,18 @@ class SignalCountingService:
         self.values = dict(settings)
         self.signals = 0
         self.writes = {}          # path -> number of changed writes
+        self._depth = 0
+        self._pending = False     # a changed write waits in the open batch
 
     def __enter__(self):
+        self._depth += 1
         return self
 
     def __exit__(self, *exc):
+        self._depth -= 1
+        if self._depth == 0 and self._pending:
+            self._pending = False
+            self.signals += 1
         return False
 
     def __setitem__(self, path, value):
@@ -81,7 +91,10 @@ class SignalCountingService:
             return
         self.values[path] = value
         self.writes[path] = self.writes.get(path, 0) + 1
-        self.signals += 1
+        if self._depth:
+            self._pending = True
+        else:
+            self.signals += 1
 
     def __getitem__(self, path):
         return self.values.get(path)
