@@ -73,9 +73,11 @@ class BleDeviceSeeLevelBTP7(BleDeviceSeeLevel):
                 continue
 
             sensor_data = self._build_tank_sensor_data(level, role_service)
-            self._update_dbus_data(role_service, sensor_data)
-            for alarm in role_service.ble_role.info.get('alarms', []):
-                role_service.update_alarm(alarm)
+            # Level and alarm states in one ItemsChanged.
+            with role_service:
+                self._update_dbus_data(role_service, sensor_data)
+                for alarm in role_service.ble_role.info.get('alarms', []):
+                    role_service.update_alarm(alarm)
             role_service.connect()
 
         if self._is_indexed_role_enabled('battery', 8):

@@ -115,9 +115,11 @@ class BleDeviceSeeLevelBTP3(BleDeviceSeeLevel):
         if role_type == 'tank':
             level = max(0, min(100, sensor_value))
             sensor_data = self._build_tank_sensor_data(level, role_service)
-            self._update_dbus_data(role_service, sensor_data)
-            for alarm in role_service.ble_role.info.get('alarms', []):
-                role_service.update_alarm(alarm)
+            # Level and alarm states in one ItemsChanged.
+            with role_service:
+                self._update_dbus_data(role_service, sensor_data)
+                for alarm in role_service.ble_role.info.get('alarms', []):
+                    role_service.update_alarm(alarm)
 
         elif role_type == 'temperature':
             temp_c = round((sensor_value - 32.0) * 5.0 / 9.0, 1)
