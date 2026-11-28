@@ -19,12 +19,13 @@ depend on where in the second the kernel happens to take its sample, and that in
 | Every `BusItem` signal is delivered to the same 9 processes (13 threads) | proven: read from the bus daemon's match rules |
 | Each signal is followed by a burst of 9-11 runnable tasks | proven: signal-triggered average, including senders at random phases; natural on/off at a fixed phase |
 | The kernel's own samples are high exactly when a signal precedes them | proven: [see below](#what-the-kernels-own-samples-show) |
-| The sharp bursts in the phase fold are the five VE.Direct services | proven for "who"; what fixes their phase is inferred (process start), not tested by a restart |
+| The sharp bursts in the phase fold are the five VE.Direct services | proven for "who"; what fixes their phase is not known: two of them moved on 11-27 without a restart ([see below](#after-the-fixes-2026-11-27)) |
 | GLib `timeout_add_seconds` puts every seconds-timer on the whole monotonic second | proven as a mechanism on dev; a minor contributor on prod (two services) |
 | systemcalc's 1 Hz publish drifts through the second at the kernel sampler's rate | measured: period 1.0015 s over 5 min and 1.0020 s over 12 min, against 5.0100 s / 5 |
 | That co-movement is what produces the minutes-long excursions that trip the throttle | hypothesis: fits the trip dumps, never caught in a capture |
 | The 2026-10-17 step is the rig coming back into use | timing and mechanism fit; no before/after signal census exists, so not proven |
 | A kernel worker (`kworker/0:0-events`, ~300 wakeups/s) is the largest single item outside the fan-out | measured: in state R in 24 % of samples, somewhere between 0.1 and 0.25 of a load point; what feeds it is not identified (this kernel has no ftrace) |
+| The 11-27 fixes lowered the load average by about 1.0 | measured in one 12-minute window on each side (2.63 → 1.59 by the kernel's own samples); whole days from 11-28 decide |
 
 ## How the load average is built here
 
@@ -177,8 +178,9 @@ What sets each phase:
 - **VE.Direct services.** Five different devices hold their publish phase to within 1 ms over
   22 minutes. Five independent crystals cannot do that (1 ms in 1300 s is under 1 ppm), so the
   once-a-second cadence is `vedirect-dbus`'s own, on the Cerbo's clock. The phases differ per
-  process and have not changed since the 10-25 boot, which points at process start. Not tested:
-  restarting one `vedirect-dbus` should move its burst, and that is a write on prod.
+  process. On 11-26 that pointed at process start, but on 11-27 both solar chargers moved
+  together without a restart ([after the fixes](#after-the-fixes-2026-11-27)), so something else
+  can reset a phase, and what sets one is not known.
 - **GLib seconds timers.** `g_timeout_add_seconds` rounds every seconds-granularity timer to one
   phase per machine, hashed from `DBUS_SESSION_BUS_ADDRESS`, else `HOSTNAME`, else zero. No
   daemon on prod has either variable in its environment (read from each daemon's own
@@ -323,20 +325,20 @@ Fixes 1, 2, 4, 5 and 6 are code Clint controls and add up to roughly −0.4 to �
 VE.Direct services 3.9/s, systemcalc 1.0-1.3/s) waking seven Victron subscribers, and that part
 is by design.
 
-Where the fixes stood on 2026-11-27 (deploy times as reported by the sessions that did them):
+Where the fixes stood at the end of 2026-11-27 (deploy times as reported by the sessions that did
+them, except 5):
 
 | # | state |
 |---|---|
 | 1 | TechBlueprints/venus-os_dbus-serialbattery#550, on prod from 11-27 16:22Z |
 | 2 | dbus-aggregate-batteries `integration/all` 864150f, on prod from 11-27 17:08Z; the subscription half is also TechBlueprints/dbus-aggregate-batteries#181 |
 | 3 | both services stopped on prod 11-27 16:36Z |
-| 4 | #36, on prod from 11-27 17:07Z; one `ItemsChanged` per publish block instead of per path is #39 |
-| 5 | TechBlueprints/dbus-power-watchdog#13, open |
+| 4 | #36, on prod from 11-27 17:07Z; one `ItemsChanged` per publish block instead of per path is #39, on prod from 21:19Z |
+| 5 | TechBlueprints/dbus-power-watchdog#13, on prod from 11-27 21:40Z: grid 0.61 → 0.08 signals/s (180 s before and after) |
 | 6 | not started |
 
-The after-measurement uses the same instruments as above: `loadavg_sampler_vs_publisher.py
-720 all` with `--sampled`, the phase fold, and whole days of `alive:` medians after the last
-deploy.
+`dbus-ble-sensors-py` was also restarted at 20:59Z for #37, a Ruuvi alarm fix with no bearing on
+the load. The measurement after all of them is the next section.
 
 What does not help the 15-minute figure: moving bursts apart. Giving services different
 `HOSTNAME` values would spread the GLib seconds-timers, and restarting a `vedirect-dbus` would
@@ -354,6 +356,81 @@ Which paths churn, from `dbus_publisher_phase.py --paths`, 16:13:52-16:14:22Z:
 | `grid.power_watchdog_…` | 0.67 | `/UpdateIndex` 0.67/s, `/Ac/Power` 0.40/s, `/Ac/L1/Current` 0.33/s |
 | `tank.mopeka_cb157d296144` | 0.23 | `/BatteryVoltage` |
 | five Ruuvi services | 0.03-0.07 each | `/Humidity`, `/Pressure`, `/Temperature`, `/BatteryVoltage` |
+
+## After the fixes (2026-11-27)
+
+The same three instruments, one at a time, from 21:45Z, five minutes after the last deploy
+(fixes 1-5 above):
+
+| | before (11-26) | after (11-27) |
+|---|---|---|
+| `loadavg_sampler_vs_publisher.py 720 all` window | 16:01:10-16:13:12Z | 21:45:08-21:57:12Z |
+| `BusItem` signals/s, bus-wide | 10.7 | 8.7 |
+| kernel samples | 141 | 143 |
+| mean count the kernel sampled | **2.63** | **1.59** |
+| with a signal in the 30 ms before the sample | 6.47 (49 samples) | 4.00 (32 samples) |
+| without | 0.58 (92) | 0.90 (111) |
+| share of the total carried by samples after a signal | 86 % | 56 % |
+| phase fold, 20 s, mean runnable (a scheduled sampler, so it reads low) | 2.22 (15:17:51Z) | 1.39 (21:57:13Z) |
+| fold peaks at monotonic 10-20 ms / 160-180 ms | 10.0 / 11.2 | 5.55 / 5.49 |
+
+By the kernel's own samples the drop is 1.04, at the top of the −0.55 to −1.1 predicted with
+fix 3; the fold, a different instrument, drops 0.83. Most of it is in the samples after a
+signal: there are fewer of them (49 → 32) and each is lower (6.47 → 4.00), which is what fewer
+signals and fewer recipients per signal predict. The samples with no signal before them rose
+(0.58 → 0.90). That is everything else on the box; one window cannot say why it moved.
+
+- A read-only check by another session ran on the box at 21:45:25-30Z, inside the window. The
+  kernel samples around it read about zero, so leaving out the one to five nearest raises the
+  mean to 1.60-1.62: the check did not flatter the result.
+- systemcalc published 719 times in the window and again never in the 30 ms before a kernel
+  sample (about 1 % likely by chance: 3 % of the time is inside such a window, over 143
+  samples). The co-movement described above held through the fixes.
+- The recipient set was not read again from the bus daemon. With `hub4control` and
+  `dbus-fronius` stopped and the aggregator subscribing per pack it should be six processes for
+  most senders, not nine, but that is inferred from the changes, not measured.
+
+Who still publishes, from `dbus_publisher_phase.py` over 900 s, 21:57:34-22:12:34Z (8189
+signals, 9.10/s, 49.5 items/s):
+
+| service | before (11-26) | after (11-27) |
+|---|---|---|
+| `vebus.ttyS4` (MultiPlus) | 2.5 | 2.46 |
+| `system` (systemcalc) | 1.2-1.3 | 1.30 |
+| five VE.Direct services | 3.9 | 4.33 |
+| two BLE packs (`dbus-serialbattery`) | 1.6-1.9 | 0.55 |
+| `battery.aggregate` | 0.1-0.6 | 0.21 |
+| `grid.power_watchdog_…` | 0.67-0.7 | 0.09 |
+| `dcsystem.virtual` | 0.2 | 0.07 |
+| `dbus-ble-sensors-py`, all its services | 0.6-1.1 | 0.03 |
+
+Victron's own publishers are now 8.1 of the 9.10 signals/s (the MultiPlus, systemcalc, the five
+VE.Direct services and 0.04 from `platform`, `settings` and `logger`); Clint's services together
+are 0.98. Fixes 7 and 8, on Victron's side, are what is left for the bus. The before column is
+the 11-26 captures in [the phase table](#the-bursts-in-the-phase-fold-and-what-sets-each-phase);
+`dcsystem.virtual` was not changed and publishes when its inputs do.
+
+**Two VE.Direct phases moved without a restart.** Mode phase of each service's publishes on the
+monotonic clock, from every capture saved on 11-26 and 11-27:
+
+| capture start | `battery.ttyS6` | `battery.ttyS5` | `alternator.ttyUSB0` | `solarcharger.ttyS7` | `solarcharger.ttyUSB1` |
+|---|---|---|---|---|---|
+| 11-26 15:28:13Z, 16:13:52Z | 10 ms | 160-170 | 330-340 | 460 | 160-180 |
+| 11-27 16:13:43Z, 17:07:14Z | 10 | 160-170 | 330-340 | 470 | 180 |
+| 11-27 17:08:43Z and the five after it, to 21:57:34Z | 0-10 | 160 | 330-340 | 820 | 810 |
+
+The two solar chargers moved together between 17:07:44Z, when the 30-second capture ended, and
+17:08:43Z. Their `vedirect-dbus` processes kept the same pids (2612 and 2693) in every capture,
+so neither restarted. That minute holds the `dbus-aggregate-batteries` restart at 17:08:40Z.
+That is a timing match, not a mechanism: the aggregator may have nothing to do with it. It means
+process start is not the only thing that sets a VE.Direct phase, and the two chargers' bursts
+now coincide at 810-820 ms where they were 300 ms apart. By the arithmetic above that does not
+change the 15-minute figure.
+
+**What this does not show.** It is one 12-minute window on each side, a day apart, at different
+times of day and with the rig doing different things. The daily medians of the 15-minute
+average decide: from the `alive:` lines, whole UTC days from 11-28 against the 2.48-2.98 of
+10-26 to 11-26. Three or more whole days below 2.48 is the first real evidence.
 
 ## Instruments, and what they cannot say
 
@@ -402,3 +479,12 @@ box's own rule, a second or two each.
 session deployed the corrected throttle thresholds at 15:31:22Z, which restarted
 `dbus-ble-sensors-py` (pid 6247 → 17506) and `load-forensics`; captures before and after that
 moment agree on every figure quoted here.
+
+## Measurement log (UTC, 2026-11-27)
+
+Samplers on prod for the after-measurement: 21:36:51-21:39:51 and 21:41:09-21:44:09 (publishers,
+before and after the Power Watchdog deploy), 21:45:07-21:57:13 (all-signal listener, passive),
+21:57:13-21:57:33 (fold), 21:57:33-22:12:36 (publishers). Other sessions' captures used in the
+phase table: 16:13:43-16:28:43, 17:07:14-17:07:44, 17:08:43-17:23:43, 21:03:48-21:18:48 and
+21:20:31-21:35:31 (publishers). `dump-20261127T213108Z` and `dump-20261127T220438Z` fall inside
+these windows; label them measurement-induced.
