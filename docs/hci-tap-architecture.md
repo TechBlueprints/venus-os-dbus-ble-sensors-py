@@ -321,7 +321,7 @@ all.
 | monitor-channel copy + BPF | the kernel, per report, cheap | 389/s in, 112/s out with both cards on |
 | tap wakeup + parse | our tap thread | ~200 us per datagram; ~2% of a core under rotation |
 | dedup + main-loop hop | tap thread, then main loop | main thread ~2% |
-| load throttle | samples `/proc/loadavg` every 30 s | trips at 5-min >= 6.0 or 15-min >= 5.5, derived from the watchdog's limit; release below 5.0 on both; a sub-30 s crossing can be missed |
+| load throttle | samples `/proc/loadavg` every 30 s | trips at 5-min >= 9.0 or 15-min >= 5.5, each derived from the watchdog's limit for that window (`max-load-5 = 10`, `max-load-15 = 6`); releases at 5-min < 8.0 and 15-min < 5.0; a sub-30 s crossing can be missed |
 
 The rotation's acceptance run (2026-09-12 14:38Z to 2026-09-13 05:16Z):
 zero trip-class load dumps and zero throttle trips, box context switches
